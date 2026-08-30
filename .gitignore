@@ -1,0 +1,27 @@
+## Android and Gradle build products
+/.gradle/
+/.kotlin/
+/.idea/
+/build/
+/app/build/
+/java.base/
+local.properties
+*.iml
+
+## Local verification output and recoverable source archives
+/artifacts/
+/backups/
+
+## Credentials, private signing material, and encrypted user exports
+.env
+.env.*
+*.jks
+*.keystore
+*.p12
+*.pem
+*.key
+*.rtbackup
+
+## Distribution artifacts are published as release assets, never committed
+*.apk
+*.aab

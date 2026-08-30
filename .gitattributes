@@ -1,0 +1,3 @@
+# Markdown uses two trailing spaces for deliberate hard line breaks in the
+# historical Chinese development documents. Do not report those as code errors.
+*.md whitespace=-trailing-space
