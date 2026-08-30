@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        Android 12+ reads these platform launch-window attributes before Compose draws.
+        The installed offline SDK does not expose Theme.SplashScreen/postSplashScreenTheme,
+        so MainActivity switches to Theme.RelayTester before its normal content is created.
+    -->
+    <style name="Theme.RelayTester.Starting" parent="Theme.RelayTester">
+        <item name="android:windowSplashScreenBackground">@color/startup_window_background</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/av_splash_brand_mark</item>
+    </style>
+</resources>
