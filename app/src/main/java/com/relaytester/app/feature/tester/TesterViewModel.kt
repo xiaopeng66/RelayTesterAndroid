@@ -24,6 +24,10 @@ import com.relaytester.app.core.model.SupplierProfile
 import com.relaytester.app.core.model.TestRunSummary
 import com.relaytester.app.core.model.TestSettings
 import com.relaytester.app.core.model.TestStatus
+import com.relaytester.app.core.model.matchesAnyModelFilterTerm
+import com.relaytester.app.core.model.mergeModelFilterTerms
+import com.relaytester.app.core.model.normalizeQuickFilterTerms
+import com.relaytester.app.core.model.parseModelFilterTerms
 import com.relaytester.app.core.network.BalanceApi
 import com.relaytester.app.core.network.RelayApi
 import com.relaytester.app.core.security.KeystoreSecretStore
@@ -96,6 +100,7 @@ data class SupplierDraft(
     val concurrency: String,
     val prompt: String,
     val keyword: String,
+    val quickFilterTerms: List<String>,
     val maxTokens: String,
     val retryCount: String,
     val delayMinSeconds: String,
@@ -122,6 +127,7 @@ data class SupplierDraft(
             concurrency = concurrency.toIntOr(2).coerceIn(1, 20),
             prompt = prompt.trim().ifBlank { "ping" },
             keyword = keyword.trim(),
+            quickFilterTerms = normalizeQuickFilterTerms(quickFilterTerms),
             maxTokens = maxTokens.toIntOr(4).coerceIn(1, 64),
             retryCount = retryCount.toIntOr(0).coerceIn(0, 5),
             delayMinMs = delayMinSeconds.toMilliseconds(500).coerceIn(0, 10_000),
@@ -146,6 +152,7 @@ data class SupplierDraft(
             concurrency = profile.testSettings.concurrency.toString(),
             prompt = profile.testSettings.prompt,
             keyword = profile.testSettings.keyword,
+            quickFilterTerms = profile.testSettings.quickFilterTerms,
             maxTokens = profile.testSettings.maxTokens.toString(),
             retryCount = profile.testSettings.retryCount.toString(),
             delayMinSeconds = profile.testSettings.delayMinMs.toSecondsText(),
@@ -180,6 +187,8 @@ data class TesterUiState(
     val filter: ResultFilter = ResultFilter.ALL,
     val sort: ResultSort = ResultSort.LATENCY,
     val resultQuery: String = "",
+    /** Current one-tap filters for the active supplier; they are intentionally not global. */
+    val selectedQuickFilterTerms: Set<String> = emptySet(),
     val errors: FormErrors = FormErrors(),
     val message: String? = null,
     val isMessageError: Boolean = false,
@@ -484,6 +493,52 @@ class TesterViewModel(
         }
     }
 
+    fun toggleQuickFilterTerm(term: String) {
+        if (runningOrInitializing()) return
+        val configuredTerm = _uiState.value.draft
+            ?.quickFilterTerms
+            ?.firstOrNull { it.equals(term, ignoreCase = true) }
+            ?: return
+        _uiState.update { state ->
+            val selected = state.selectedQuickFilterTerms
+            state.copy(
+                selectedQuickFilterTerms = if (configuredTerm in selected) {
+                    selected - configuredTerm
+                } else {
+                    selected + configuredTerm
+                },
+            )
+        }
+    }
+
+    fun addQuickFilterTerms(value: String) {
+        if (runningOrInitializing()) return
+        val additions = parseModelFilterTerms(value)
+        if (additions.isEmpty()) {
+            showMessage("请输入至少一个快捷筛选词", isError = true)
+            return
+        }
+        updateDraft {
+            copy(quickFilterTerms = normalizeQuickFilterTerms(quickFilterTerms + additions))
+        }
+        viewModelScope.launch { persistDraft() }
+    }
+
+    fun removeQuickFilterTerm(term: String) {
+        if (runningOrInitializing()) return
+        updateDraft {
+            copy(quickFilterTerms = quickFilterTerms.filterNot { it.equals(term, ignoreCase = true) })
+        }
+        _uiState.update { state ->
+            state.copy(
+                selectedQuickFilterTerms = state.selectedQuickFilterTerms
+                    .filterNot { it.equals(term, ignoreCase = true) }
+                    .toSet(),
+            )
+        }
+        viewModelScope.launch { persistDraft() }
+    }
+
     fun clearMessage() {
         _uiState.update { it.copy(message = null) }
     }
@@ -663,24 +718,16 @@ class TesterViewModel(
             if (persistDraft() == null) return@launch
             val activeId = activeSupplierId ?: return@launch
             val previousTemplateId = profiles.firstOrNull { it.id == activeId }?.balanceTemplateId
+            val nextSnapshots = _balanceUiState.value.balanceSnapshots - activeId
             assignBalanceTemplateToActiveSupplier(id)
-            if (!saveProfiles()) {
+            if (!saveProfiles(nextSnapshots)) {
                 assignBalanceTemplateToActiveSupplier(previousTemplateId)
                 return@launch
             }
             _balanceUiState.update { state ->
-                val selectedId = activeSupplierId
                 state.copy(
-                    balanceSnapshots = if (selectedId == null) {
-                        state.balanceSnapshots
-                    } else {
-                        state.balanceSnapshots - selectedId
-                    },
-                    balanceErrors = if (selectedId == null) {
-                        state.balanceErrors
-                    } else {
-                        state.balanceErrors - selectedId
-                    },
+                    balanceSnapshots = nextSnapshots,
+                    balanceErrors = state.balanceErrors - activeId,
                     message = "已切换余额查询模板",
                     isMessageError = false,
                 )
@@ -785,6 +832,10 @@ class TesterViewModel(
         viewModelScope.launch {
             val previousTemplates = balanceTemplates.toMutableList()
             val previousProfiles = profiles.toMutableList()
+            val affectedSupplierIds = previousProfiles
+                .filter { it.balanceTemplateId == templateId }
+                .mapTo(mutableSetOf()) { it.id }
+            val nextSnapshots = _balanceUiState.value.balanceSnapshots - affectedSupplierIds
             balanceTemplates.removeAll { it.id == templateId }
             val fallbackId = balanceTemplates.firstOrNull()?.id
             profiles = profiles.map { profile ->
@@ -794,7 +845,7 @@ class TesterViewModel(
                     profile
                 }
             }.toMutableList()
-            if (!saveProfiles()) {
+            if (!saveProfiles(nextSnapshots)) {
                 balanceTemplates = previousTemplates
                 profiles = previousProfiles
                 return@launch
@@ -810,18 +861,9 @@ class TesterViewModel(
                 )
             }
             _balanceUiState.update { state ->
-                val selectedId = activeSupplierId
                 state.copy(
-                    balanceSnapshots = if (selectedId == null) {
-                        state.balanceSnapshots
-                    } else {
-                        state.balanceSnapshots - selectedId
-                    },
-                    balanceErrors = if (selectedId == null) {
-                        state.balanceErrors
-                    } else {
-                        state.balanceErrors - selectedId
-                    },
+                    balanceSnapshots = nextSnapshots,
+                    balanceErrors = state.balanceErrors - affectedSupplierIds,
                     message = "已删除余额模板",
                     isMessageError = false,
                 )
@@ -868,6 +910,7 @@ class TesterViewModel(
                     summary = null,
                     progressDone = 0,
                     progressTotal = 0,
+                    selectedQuickFilterTerms = emptySet(),
                     errors = FormErrors(),
                 )
             }
@@ -895,6 +938,7 @@ class TesterViewModel(
                     activeSupplierId = profile.id,
                     results = emptyList(),
                     summary = null,
+                    selectedQuickFilterTerms = emptySet(),
                     message = "已添加供应商",
                     isMessageError = false,
                 )
@@ -914,10 +958,11 @@ class TesterViewModel(
             val removed = profiles.firstOrNull { it.id == id } ?: return@launch
             val previousProfiles = profiles.toMutableList()
             val previousActiveSupplierId = activeSupplierId
+            val nextSnapshots = _balanceUiState.value.balanceSnapshots - id
             profiles.removeAll { it.id == id }
             val next = profiles.first()
             activeSupplierId = next.id
-            if (!saveProfiles()) {
+            if (!saveProfiles(nextSnapshots)) {
                 profiles = previousProfiles
                 activeSupplierId = previousActiveSupplierId
                 return@launch
@@ -936,13 +981,14 @@ class TesterViewModel(
                     activeSupplierId = next.id,
                     results = emptyList(),
                     summary = null,
+                    selectedQuickFilterTerms = emptySet(),
                     message = "已删除供应商",
                     isMessageError = false,
                 )
             }
             _balanceUiState.update { state ->
                 state.copy(
-                    balanceSnapshots = state.balanceSnapshots - id,
+                    balanceSnapshots = nextSnapshots,
                     balanceErrors = state.balanceErrors - id,
                     credentialErrors = BalanceCredentialsErrors(),
                 )
@@ -1041,7 +1087,11 @@ class TesterViewModel(
                 }
             }
 
-            val targets = request.profile.models.filterBy(request.profile.testSettings.keyword)
+            val filterTerms = mergeModelFilterTerms(
+                expression = request.profile.testSettings.keyword,
+                selectedQuickTerms = _uiState.value.selectedQuickFilterTerms,
+            )
+            val targets = request.profile.models.filterBy(filterTerms)
             if (targets.isEmpty()) {
                 showMessage("没有与模型名过滤条件匹配的模型", isError = true)
                 return@launch
@@ -1105,6 +1155,10 @@ class TesterViewModel(
 
     fun visibleResults(): List<ModelTestResult> {
         val state = _uiState.value
+        val filterTerms = mergeModelFilterTerms(
+            expression = state.resultQuery,
+            selectedQuickTerms = state.selectedQuickFilterTerms,
+        )
         return state.results
             .asSequence()
             .filter {
@@ -1114,7 +1168,7 @@ class TesterViewModel(
                     ResultFilter.FAILED -> it.status == TestStatus.FAILED
                 }
             }
-            .filter { state.resultQuery.isBlank() || it.model.contains(state.resultQuery, ignoreCase = true) }
+            .filter { it.model.matchesAnyModelFilterTerm(filterTerms) }
             .sortedWith(
                 when (state.sort) {
                     ResultSort.NAME -> compareBy<ModelTestResult> { it.model.lowercase(Locale.ROOT) }
@@ -1196,6 +1250,8 @@ class TesterViewModel(
         val activeId = activeSupplierId
         val previousTemplateId = activeId
             ?.let { id -> profiles.firstOrNull { it.id == id }?.balanceTemplateId }
+        val nextSnapshots = activeId?.let { _balanceUiState.value.balanceSnapshots - it }
+            ?: _balanceUiState.value.balanceSnapshots
         val index = balanceTemplates.indexOfFirst { it.id == template.id }
         if (index >= 0) {
             balanceTemplates[index] = template
@@ -1203,27 +1259,18 @@ class TesterViewModel(
             balanceTemplates += template
         }
         assignBalanceTemplateToActiveSupplier(template.id)
-        if (!saveProfiles()) {
+        if (!saveProfiles(nextSnapshots)) {
             balanceTemplates = previousTemplates
             profiles = previousProfiles
             assignBalanceTemplateToActiveSupplier(previousTemplateId)
             return null
         }
         _balanceUiState.update { state ->
-            val selectedId = activeSupplierId
             state.copy(
                 editor = null,
                 errors = BalanceTemplateErrors(),
-                balanceSnapshots = if (selectedId == null) {
-                    state.balanceSnapshots
-                } else {
-                    state.balanceSnapshots - selectedId
-                },
-                balanceErrors = if (selectedId == null) {
-                    state.balanceErrors
-                } else {
-                    state.balanceErrors - selectedId
-                },
+                balanceSnapshots = nextSnapshots,
+                balanceErrors = activeId?.let { state.balanceErrors - it } ?: state.balanceErrors,
                 message = "余额模板已保存",
                 isMessageError = false,
             )
@@ -1268,6 +1315,7 @@ class TesterViewModel(
                             isMessageError = false,
                         )
                     }
+                    persistBalanceSnapshots()
                 }
 
                 is BalanceQueryResult.Failure -> {
@@ -1411,6 +1459,9 @@ class TesterViewModel(
                 },
                 isMessageError = false,
             )
+        }
+        if (succeeded > 0) {
+            persistBalanceSnapshots()
         }
     }
 
@@ -1654,6 +1705,7 @@ class TesterViewModel(
             suppliers = profiles.toList(),
             activeSupplierId = activeSupplierId,
             templates = balanceTemplates.toList(),
+            balanceSnapshots = startup.balanceSnapshots,
             credentials = BalanceCredentialsDraft.from(active, ""),
         )
         if (needsSecretsHydration) {
@@ -1721,10 +1773,18 @@ class TesterViewModel(
         val restoredActiveId = stored.activeSupplierId?.takeIf { storedId ->
             restoredProfiles.any { it.id == storedId }
         } ?: restoredProfiles.first().id
+        val supplierIds = restoredProfiles.mapTo(mutableSetOf()) { it.id }
+        val templateIds = restoredTemplates.mapTo(mutableSetOf()) { it.id }
+        val restoredSnapshots = stored.balanceSnapshots.filter { (supplierId, snapshot) ->
+            supplierId == snapshot.supplierId &&
+                supplierId in supplierIds &&
+                snapshot.templateId in templateIds
+        }
         return StartupSnapshot(
             profiles = restoredProfiles,
             activeSupplierId = restoredActiveId,
             templates = restoredTemplates,
+            balanceSnapshots = restoredSnapshots,
             storageLoaded = storageLoaded,
         )
     }
@@ -1969,11 +2029,14 @@ class TesterViewModel(
         return false
     }
 
-    private suspend fun saveProfiles(): Boolean {
+    private suspend fun saveProfiles(
+        balanceSnapshots: Map<String, BalanceSnapshot> = _balanceUiState.value.balanceSnapshots,
+    ): Boolean {
         val stateToSave = SupplierStoreState(
             suppliers = profiles.toList(),
             activeSupplierId = activeSupplierId,
             balanceTemplates = balanceTemplates.toList(),
+            balanceSnapshots = balanceSnapshots,
         )
         try {
             withContext(Dispatchers.IO) { supplierStore.save(stateToSave) }
@@ -1989,6 +2052,28 @@ class TesterViewModel(
         }
         publishBalanceState()
         return true
+    }
+
+    /**
+     * Stores successful balance responses independently from credentials. This
+     * runs after the UI update so a storage failure never hides a fresh result.
+     */
+    private suspend fun persistBalanceSnapshots(): Boolean {
+        val stateToSave = SupplierStoreState(
+            suppliers = profiles.toList(),
+            activeSupplierId = activeSupplierId,
+            balanceTemplates = balanceTemplates.toList(),
+            balanceSnapshots = _balanceUiState.value.balanceSnapshots,
+        )
+        return try {
+            withContext(Dispatchers.IO) { supplierStore.save(stateToSave) }
+            true
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Throwable) {
+            showBalanceMessage("余额已更新，但本地结果未能保存", isError = true)
+            false
+        }
     }
 
     private fun publishBalanceState(isInitializing: Boolean = _balanceUiState.value.isInitializing) {
@@ -2138,6 +2223,7 @@ class TesterViewModel(
         val profiles: List<SupplierProfile>,
         val activeSupplierId: String,
         val templates: List<BalanceQueryTemplate>,
+        val balanceSnapshots: Map<String, BalanceSnapshot>,
         val storageLoaded: Boolean,
     )
 
@@ -2165,11 +2251,8 @@ class TesterViewModel(
         val total: Int,
     )
 
-    private fun List<String>.filterBy(keyword: String): List<String> = if (keyword.isBlank()) {
-        this
-    } else {
-        filter { it.contains(keyword, ignoreCase = true) }
-    }
+    private fun List<String>.filterBy(terms: Collection<String>): List<String> =
+        filter { model -> model.matchesAnyModelFilterTerm(terms) }
 
     private fun ModelTestResult.toJson(): JSONObject = JSONObject()
         .put("model", model)

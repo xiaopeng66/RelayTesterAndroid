@@ -148,6 +148,8 @@ data class TestSettings(
     val concurrency: Int = 2,
     val prompt: String = "ping",
     val keyword: String = "",
+    /** User-defined one-tap model filters. Selections remain screen-local. */
+    val quickFilterTerms: List<String> = emptyList(),
     val maxTokens: Int = 4,
     val retryCount: Int = 0,
     val delayMinMs: Long = 500,
@@ -155,6 +157,41 @@ data class TestSettings(
     val batchSize: Int = 10,
     val batchPauseMs: Long = 3_000,
 )
+
+private const val MAX_MODEL_FILTER_TERM_LENGTH = 128
+private const val MAX_QUICK_FILTER_TERMS = 16
+
+/**
+ * Splits the model-search expression into OR terms. `|` is the documented
+ * separator; accepting its full-width form keeps pasted Chinese input usable.
+ */
+fun parseModelFilterTerms(value: String): List<String> = value
+    .split('|', '｜')
+    .asSequence()
+    .map(String::trim)
+    .filter(String::isNotEmpty)
+    .map { it.take(MAX_MODEL_FILTER_TERM_LENGTH) }
+    .distinctBy { it.lowercase() }
+    .take(MAX_QUICK_FILTER_TERMS)
+    .toList()
+
+/** Normalizes persisted one-tap filters without treating their labels as expressions. */
+fun normalizeQuickFilterTerms(values: Iterable<String>): List<String> = values
+    .asSequence()
+    .map(String::trim)
+    .filter(String::isNotEmpty)
+    .map { it.take(MAX_MODEL_FILTER_TERM_LENGTH) }
+    .distinctBy { it.lowercase() }
+    .take(MAX_QUICK_FILTER_TERMS)
+    .toList()
+
+fun mergeModelFilterTerms(
+    expression: String,
+    selectedQuickTerms: Iterable<String> = emptyList(),
+): List<String> = normalizeQuickFilterTerms(parseModelFilterTerms(expression) + selectedQuickTerms)
+
+fun String.matchesAnyModelFilterTerm(terms: Collection<String>): Boolean =
+    terms.isEmpty() || terms.any { term -> contains(term, ignoreCase = true) }
 
 @Immutable
 data class BatchTestConfig(

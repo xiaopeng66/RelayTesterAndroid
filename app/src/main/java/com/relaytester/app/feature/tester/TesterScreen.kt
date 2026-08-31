@@ -33,6 +33,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Download
@@ -43,6 +44,7 @@ import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.StopCircle
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CardDefaults
@@ -53,6 +55,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.InputChip
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -63,6 +66,7 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -96,6 +100,8 @@ import com.relaytester.app.core.model.ModelTestResult
 import com.relaytester.app.core.model.RelayProtocol
 import com.relaytester.app.core.model.SupplierProfile
 import com.relaytester.app.core.model.TestStatus
+import com.relaytester.app.core.model.matchesAnyModelFilterTerm
+import com.relaytester.app.core.model.mergeModelFilterTerms
 import com.relaytester.app.ui.navigation.AppDestination
 import com.relaytester.app.ui.components.RelayAppHeader
 import java.io.OutputStreamWriter
@@ -195,12 +201,16 @@ fun TesterScreen(
                     state.filter,
                     state.sort,
                     state.resultQuery,
+                    state.selectedQuickFilterTerms,
                 ) { viewModel.visibleResults() },
                 onNameChange = viewModel::updateName,
                 onBaseUrlChange = viewModel::updateBaseUrl,
                 onProtocolChange = viewModel::updateProtocol,
                 onApiKeyChange = viewModel::updateApiKey,
                 onSettingChange = viewModel::updateSetting,
+                onToggleQuickFilter = viewModel::toggleQuickFilterTerm,
+                onAddQuickFilters = viewModel::addQuickFilterTerms,
+                onRemoveQuickFilter = viewModel::removeQuickFilterTerm,
                 onSaveSupplier = viewModel::saveCurrentSupplier,
                 onSelectSupplier = viewModel::selectSupplier,
                 onAddSupplier = viewModel::addSupplier,
@@ -239,6 +249,9 @@ private fun TesterContent(
     onProtocolChange: (RelayProtocol) -> Unit,
     onApiKeyChange: (String) -> Unit,
     onSettingChange: (SettingField, String) -> Unit,
+    onToggleQuickFilter: (String) -> Unit,
+    onAddQuickFilters: (String) -> Unit,
+    onRemoveQuickFilter: (String) -> Unit,
     onSaveSupplier: () -> Unit,
     onSelectSupplier: (String) -> Unit,
     onAddSupplier: () -> Unit,
@@ -258,15 +271,18 @@ private fun TesterContent(
 ) {
     val draft = requireNotNull(state.draft)
     val disabled = state.isRunning || state.isFetchingModels || state.isSecretsHydrating
+    val modelFilterTerms = remember(draft.keyword, state.selectedQuickFilterTerms) {
+        mergeModelFilterTerms(draft.keyword, state.selectedQuickFilterTerms)
+    }
     val filteredModels by produceState(
         initialValue = FilteredModelsState(values = emptyList(), isLoading = true),
         key1 = draft.models,
-        key2 = draft.keyword,
+        key2 = modelFilterTerms,
     ) {
         value = withContext(Dispatchers.Default) {
             FilteredModelsState(
                 values = draft.models.filter {
-                    draft.keyword.isBlank() || it.contains(draft.keyword, ignoreCase = true)
+                    it.matchesAnyModelFilterTerm(modelFilterTerms)
                 },
                 isLoading = false,
             )
@@ -313,6 +329,10 @@ private fun TesterContent(
                     errors = state.errors,
                     enabled = !disabled,
                     onSettingChange = onSettingChange,
+                    selectedQuickFilters = state.selectedQuickFilterTerms,
+                    onToggleQuickFilter = onToggleQuickFilter,
+                    onAddQuickFilters = onAddQuickFilters,
+                    onRemoveQuickFilter = onRemoveQuickFilter,
                     onFetchModels = onFetchModels,
                     onStartTest = onStartTest,
                     onCancel = onCancelRun,
@@ -607,6 +627,10 @@ private fun TestSettingsCard(
     errors: FormErrors,
     enabled: Boolean,
     onSettingChange: (SettingField, String) -> Unit,
+    selectedQuickFilters: Set<String>,
+    onToggleQuickFilter: (String) -> Unit,
+    onAddQuickFilters: (String) -> Unit,
+    onRemoveQuickFilter: (String) -> Unit,
     onFetchModels: () -> Unit,
     onStartTest: () -> Unit,
     onCancel: () -> Unit,
@@ -614,6 +638,8 @@ private fun TestSettingsCard(
     isRunning: Boolean,
 ) {
     var showAdvanced by rememberSaveable(draft.id) { mutableStateOf(false) }
+    var showQuickFilterDialog by rememberSaveable(draft.id) { mutableStateOf(false) }
+    var quickFilterInput by rememberSaveable(draft.id) { mutableStateOf("") }
     ElevatedCard {
         Column(
             modifier = Modifier.fillMaxWidth().padding(16.dp),
@@ -661,10 +687,76 @@ private fun TestSettingsCard(
             AppTextField(
                 value = draft.keyword,
                 onValueChange = { onSettingChange(SettingField.KEYWORD, it) },
-                label = "模型名过滤（可选）",
-                placeholder = "例如 gpt、claude",
+                label = "模型名过滤（OR）",
+                placeholder = "例如 gpt|claude",
                 enabled = enabled,
             )
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            "快捷筛选",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            "多选和输入框中的 | 均为 OR",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    IconButton(
+                        onClick = { showQuickFilterDialog = true },
+                        enabled = enabled,
+                        modifier = Modifier.size(48.dp),
+                    ) {
+                        Icon(Icons.Outlined.Add, contentDescription = "添加快捷筛选词")
+                    }
+                }
+                if (draft.quickFilterTerms.isEmpty()) {
+                    Text(
+                        "添加常用模型词后，可一键组合筛选。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        draft.quickFilterTerms.forEach { term ->
+                            InputChip(
+                                selected = term in selectedQuickFilters,
+                                onClick = { onToggleQuickFilter(term) },
+                                label = {
+                                    Text(
+                                        term,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                },
+                                trailingIcon = {
+                                    IconButton(
+                                        onClick = { onRemoveQuickFilter(term) },
+                                        enabled = enabled,
+                                        modifier = Modifier.size(48.dp),
+                                    ) {
+                                        Icon(Icons.Outlined.Close, contentDescription = "删除快捷筛选词 $term")
+                                    }
+                                },
+                                enabled = enabled,
+                                modifier = Modifier
+                                    .widthIn(max = 200.dp)
+                                    .heightIn(min = 48.dp)
+                                    .semantics { contentDescription = "模型快捷筛选词：$term" },
+                            )
+                        }
+                    }
+                }
+            }
             OutlinedButton(
                 onClick = { showAdvanced = !showAdvanced },
                 enabled = enabled,
@@ -747,6 +839,38 @@ private fun TestSettingsCard(
                 }
             }
         }
+    }
+
+    if (showQuickFilterDialog) {
+        AlertDialog(
+            onDismissRequest = { showQuickFilterDialog = false },
+            title = { Text("添加快捷筛选词") },
+            text = {
+                AppTextField(
+                    value = quickFilterInput,
+                    onValueChange = { quickFilterInput = it },
+                    label = "模型词",
+                    placeholder = "例如 gpt|claude",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onAddQuickFilters(quickFilterInput)
+                        quickFilterInput = ""
+                        showQuickFilterDialog = false
+                    },
+                    enabled = quickFilterInput.trim().isNotEmpty(),
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) { Text("添加") }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { showQuickFilterDialog = false },
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) { Text("取消") }
+            },
+        )
     }
 }
 
@@ -1011,8 +1135,8 @@ private fun ResultFilters(
         AppTextField(
             value = state.resultQuery,
             onValueChange = onQueryChange,
-            label = "搜索测试结果",
-            placeholder = "输入模型名",
+            label = "搜索测试结果（OR）",
+            placeholder = "例如 gpt|claude",
             leadingIcon = {
                 Icon(Icons.Outlined.Search, contentDescription = null)
             },
