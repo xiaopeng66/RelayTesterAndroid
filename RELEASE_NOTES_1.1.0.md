@@ -22,4 +22,10 @@
 - versionCode：`10100`
 - 优化体验包：`app-optimized.apk`（debug 签名，包名 `com.relaytester.app.debug`）
 
-构建与模拟器验证结果将在发布前补充到 GitHub Release。正式 release APK 仍未使用发布签名密钥，因此不会作为 Release 附件上传。
+## 验证
+
+- `compileDebugKotlin`、`lintDebug`、`testDebugUnitTest`、`assembleDebug`、`assembleOptimized` 均通过；项目当前没有测试源码，因此单元测试任务为 `NO-SOURCE`。
+- `app-optimized.apk` 已在隔离的 `RelayTesterApi35` API 35 模拟器上通过 `adb install -r` 覆盖安装，主界面和余额查询页均正常渲染。
+- 连续 5 次冷启动耗时为 359–470 ms，崩溃缓冲为空，未发现 ANR；验证未调用真实模型或余额 API，也未导入、导出或清除数据。
+- 优化 APK 大小为 1,602,377 bytes，SHA-256：`80B2A7188822EC9F1878FDB9A17A98F9484874B4427C8ADBEE79847D133D1DA0`。
+- 正式 release APK 仍未使用发布签名密钥，因此不会作为 Release 附件上传。
