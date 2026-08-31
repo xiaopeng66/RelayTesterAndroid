@@ -101,7 +101,7 @@ import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
 
-private val BALANCE_SUPPLIER_CARD_HEIGHT = 132.dp
+private val BALANCE_SUPPLIER_CARD_HEIGHT = 124.dp
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -502,11 +502,11 @@ private fun BalanceSupplierCard(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(12.dp),
-            verticalArrangement = Arrangement.SpaceBetween,
+            verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.Top,
+                verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 Text(
@@ -518,24 +518,19 @@ private fun BalanceSupplierCard(
                 )
                 if (isQuerying) {
                     CircularProgressIndicator(
-                        modifier = Modifier.size(20.dp),
+                        modifier = Modifier.size(32.dp),
                         strokeWidth = 2.dp,
                     )
-                } else if (selected) {
-                    Text(
-                        "已选",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.primary,
-                    )
+                } else {
+                    UsageRing(snapshot = snapshot, hasError = errorMessage != null)
                 }
             }
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 Column(
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier.fillMaxWidth(),
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     BalanceCardMetric(
@@ -549,22 +544,35 @@ private fun BalanceSupplierCard(
                         valueColor = MaterialTheme.colorScheme.onSurface,
                     )
                 }
-                UsageRing(snapshot = snapshot, hasError = errorMessage != null)
             }
-            Text(
-                text = when {
-                    isQuerying -> "正在查询…"
-                    errorMessage != null -> errorMessage
-                    snapshot?.planName != null -> snapshot.planName.orEmpty()
-                    snapshot != null -> "已更新 ${formatDateTime(snapshot.checkedAt)}"
-                    supplier.baseUrl.isBlank() -> "需要配置站点地址"
-                    else -> "尚未查询"
-                },
-                style = MaterialTheme.typography.labelSmall,
-                color = statusColor,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    text = when {
+                        isQuerying -> "正在查询…"
+                        errorMessage != null -> errorMessage
+                        snapshot?.planName != null -> snapshot.planName.orEmpty()
+                        snapshot != null -> "已更新 ${formatDateTime(snapshot.checkedAt)}"
+                        supplier.baseUrl.isBlank() -> "需要配置站点地址"
+                        else -> "尚未查询"
+                    },
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = statusColor,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (selected) {
+                    Text(
+                        "已选",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+            }
         }
     }
 }
@@ -614,11 +622,11 @@ private fun UsageRing(snapshot: BalanceSnapshot?, hasError: Boolean) {
     // ring remains visible in both themes.
     val trackColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.45f)
     Box(
-        modifier = Modifier.size(40.dp),
+        modifier = Modifier.size(36.dp),
         contentAlignment = Alignment.Center,
     ) {
-        Canvas(modifier = Modifier.size(36.dp)) {
-            val stroke = Stroke(width = 4.dp.toPx(), cap = StrokeCap.Round)
+        Canvas(modifier = Modifier.size(32.dp)) {
+            val stroke = Stroke(width = 3.5.dp.toPx(), cap = StrokeCap.Round)
             drawArc(
                 color = trackColor,
                 startAngle = -90f,

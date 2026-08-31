@@ -7,6 +7,7 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.relaytester.app.core.model.BalanceHttpMethod
 import com.relaytester.app.core.model.BalanceQueryTemplate
+import com.relaytester.app.core.model.BalanceSnapshot
 import com.relaytester.app.core.model.BalanceTemplateHeader
 import com.relaytester.app.core.model.RelayProtocol
 import com.relaytester.app.core.model.SupplierProfile
@@ -22,6 +23,8 @@ data class SupplierStoreState(
     val suppliers: List<SupplierProfile>,
     val activeSupplierId: String?,
     val balanceTemplates: List<BalanceQueryTemplate> = listOf(BalanceQueryTemplate.newApiDefault()),
+    /** Successful balance responses are display-only local cache, never credentials. */
+    val balanceSnapshots: Map<String, BalanceSnapshot> = emptyMap(),
 )
 
 class SupplierStore(private val context: Context) {
@@ -66,6 +69,7 @@ class SupplierStore(private val context: Context) {
                             .put("concurrency", supplier.testSettings.concurrency)
                             .put("prompt", supplier.testSettings.prompt)
                             .put("keyword", supplier.testSettings.keyword)
+                            .put("quickFilterTerms", JSONArray(supplier.testSettings.quickFilterTerms))
                             .put("maxTokens", supplier.testSettings.maxTokens)
                             .put("retryCount", supplier.testSettings.retryCount)
                             .put("delayMinMs", supplier.testSettings.delayMinMs)
@@ -109,9 +113,15 @@ class SupplierStore(private val context: Context) {
                     .put("updatedAt", template.updatedAt),
             )
         }
+        val snapshotArray = JSONArray()
+        state.balanceSnapshots
+            .toSortedMap()
+            .values
+            .forEach { snapshot -> snapshotArray.put(snapshot.toJson()) }
         return root
             .put("suppliers", array)
             .put("balanceTemplates", templateArray)
+            .put("balanceSnapshots", snapshotArray)
             .toString()
     }
 
@@ -155,10 +165,21 @@ class SupplierStore(private val context: Context) {
                 template
             }
         }
+        val snapshots = runCatching {
+            val array = root.optJSONArray("balanceSnapshots") ?: JSONArray()
+            buildMap {
+                for (index in 0 until minOf(array.length(), MAX_BALANCE_SNAPSHOTS)) {
+                    array.optJSONObject(index)?.toBalanceSnapshot()?.let { snapshot ->
+                        put(snapshot.supplierId, snapshot)
+                    }
+                }
+            }
+        }.getOrDefault(emptyMap())
         return SupplierStoreState(
             suppliers = suppliers,
             activeSupplierId = activeSupplierId?.takeIf { id -> suppliers.any { it.id == id } },
             balanceTemplates = refreshedTemplates,
+            balanceSnapshots = snapshots,
         )
     }
 
@@ -187,6 +208,7 @@ class SupplierStore(private val context: Context) {
                 concurrency = settings.optInt("concurrency", 2).coerceIn(1, 20),
                 prompt = settings.optString("prompt", "ping").ifBlank { "ping" },
                 keyword = settings.optString("keyword", ""),
+                quickFilterTerms = readQuickFilterTerms(settings.optJSONArray("quickFilterTerms")),
                 maxTokens = settings.optInt("maxTokens", 4).coerceIn(1, 64),
                 retryCount = settings.optInt("retryCount", 0).coerceIn(0, 5),
                 delayMinMs = settings.optLong("delayMinMs", 500).coerceIn(0, 10_000),
@@ -197,6 +219,59 @@ class SupplierStore(private val context: Context) {
             balanceTemplateId = optString("balanceTemplateId").takeIf(String::isNotBlank),
         )
     }
+
+    private fun BalanceSnapshot.toJson(): JSONObject = JSONObject()
+        .put("supplierId", supplierId)
+        .put("templateId", templateId)
+        .put("templateName", templateName.take(MAX_TEMPLATE_NAME_LENGTH))
+        .put("availableRaw", availableRaw)
+        .put("usedRaw", usedRaw)
+        .put("totalRaw", totalRaw)
+        .put("currency", currency?.take(MAX_CURRENCY_LENGTH))
+        .put("planName", planName?.take(MAX_PLAN_NAME_LENGTH))
+        .put("unitLabel", unitLabel.take(MAX_UNIT_LABEL_LENGTH))
+        .put("scaleDivisor", scaleDivisor)
+        .put("checkedAt", checkedAt)
+        .put("latencyMs", latencyMs)
+
+    private fun JSONObject.toBalanceSnapshot(): BalanceSnapshot? {
+        val supplierId = optString("supplierId").trim().takeIf(String::isNotEmpty) ?: return null
+        val templateId = optString("templateId").trim().takeIf(String::isNotEmpty) ?: return null
+        val available = optDouble("availableRaw", Double.NaN).takeIf(Double::isFinite) ?: return null
+        val divisor = optDouble("scaleDivisor", 1.0).takeIf { it.isFinite() && it > 0 } ?: return null
+        val checkedAt = optLong("checkedAt", 0L).takeIf { it > 0 } ?: return null
+        fun optionalFinite(name: String): Double? = if (has(name) && !isNull(name)) {
+            optDouble(name, Double.NaN).takeIf(Double::isFinite)
+        } else {
+            null
+        }
+        return BalanceSnapshot(
+            supplierId = supplierId,
+            templateId = templateId,
+            templateName = optString("templateName").ifBlank { "已保存模板" }.take(MAX_TEMPLATE_NAME_LENGTH),
+            availableRaw = available,
+            usedRaw = optionalFinite("usedRaw"),
+            totalRaw = optionalFinite("totalRaw"),
+            currency = optString("currency").trim().takeIf(String::isNotEmpty)?.take(MAX_CURRENCY_LENGTH),
+            planName = optString("planName").trim().takeIf(String::isNotEmpty)?.take(MAX_PLAN_NAME_LENGTH),
+            unitLabel = optString("unitLabel").ifBlank { "额度" }.take(MAX_UNIT_LABEL_LENGTH),
+            scaleDivisor = divisor,
+            checkedAt = checkedAt,
+            latencyMs = optLong("latencyMs", 0L).coerceAtLeast(0L),
+        )
+    }
+
+    private fun readQuickFilterTerms(array: JSONArray?): List<String> = buildList {
+        val source = array ?: return@buildList
+        for (index in 0 until minOf(source.length(), MAX_QUICK_FILTER_TERMS)) {
+            source.optString(index)
+                .trim()
+                .take(MAX_QUICK_FILTER_TERM_LENGTH)
+                .takeIf(String::isNotEmpty)
+                ?.let(::add)
+        }
+    }
+        .distinctBy { it.lowercase() }
 
     private fun JSONObject.toBalanceTemplate(): BalanceQueryTemplate? {
         val id = optString("id").takeIf(String::isNotBlank) ?: return null
@@ -237,6 +312,13 @@ class SupplierStore(private val context: Context) {
     }
 
     private companion object {
+        const val MAX_BALANCE_SNAPSHOTS = 128
+        const val MAX_QUICK_FILTER_TERMS = 16
+        const val MAX_QUICK_FILTER_TERM_LENGTH = 128
+        const val MAX_TEMPLATE_NAME_LENGTH = 256
+        const val MAX_CURRENCY_LENGTH = 64
+        const val MAX_PLAN_NAME_LENGTH = 256
+        const val MAX_UNIT_LABEL_LENGTH = 64
         val SUPPLIERS_KEY: Preferences.Key<String> = stringPreferencesKey("suppliers_json")
         val ACTIVE_SUPPLIER_KEY: Preferences.Key<String> = stringPreferencesKey("active_supplier_id")
     }

@@ -13,9 +13,9 @@ android {
         minSdk = 26
         targetSdk = 36
         // Android versionCode must remain monotonic for an in-place upgrade.
-        // Reserve the 1.x range as 10_000 + patch for the public release line.
-        versionCode = 10_000
-        versionName = "1.0.0"
+        // Encode the public line as major * 10_000 + minor * 100 + patch.
+        versionCode = 10_100
+        versionName = "1.1.0"
     }
 
     buildFeatures {

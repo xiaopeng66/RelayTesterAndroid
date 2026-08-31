@@ -74,6 +74,8 @@ object ConfigurationBackupCodec {
     private const val MAX_SUPPLIERS = 100
     private const val MAX_TEMPLATES = 100
     private const val MAX_MODELS_PER_SUPPLIER = 2_000
+    private const val MAX_QUICK_FILTER_TERMS = 16
+    private const val MAX_QUICK_FILTER_TERM_LENGTH = 128
     private const val MAX_HEADERS_PER_TEMPLATE = 50
 
     fun encrypt(backup: ConfigurationBackup, password: CharArray): ByteArray {
@@ -202,6 +204,7 @@ object ConfigurationBackupCodec {
                 .put("concurrency", testSettings.concurrency)
                 .put("prompt", testSettings.prompt)
                 .put("keyword", testSettings.keyword)
+                .put("quickFilterTerms", JSONArray(testSettings.quickFilterTerms))
                 .put("maxTokens", testSettings.maxTokens)
                 .put("retryCount", testSettings.retryCount)
                 .put("delayMinMs", testSettings.delayMinMs)
@@ -305,6 +308,19 @@ object ConfigurationBackupCodec {
             }
         }.distinct().sorted()
         val settings = optJSONObject("settings") ?: JSONObject()
+        val quickFilterArray = settings.optJSONArray("quickFilterTerms") ?: JSONArray()
+        if (quickFilterArray.length() > MAX_QUICK_FILTER_TERMS) {
+            throw ConfigurationBackupException("供应商“$id”的快捷筛选词数量超出安全限制")
+        }
+        val quickFilterTerms = buildList {
+            for (index in 0 until quickFilterArray.length()) {
+                val value = quickFilterArray.optString(index).trim()
+                if (value.isEmpty() || value.length > MAX_QUICK_FILTER_TERM_LENGTH) {
+                    throw ConfigurationBackupException("供应商“$id”包含无效快捷筛选词")
+                }
+                add(value)
+            }
+        }.distinctBy { it.lowercase() }
         return ConfigurationBackupSupplier(
             id = id,
             name = requiredBoundedString("name", 120),
@@ -318,6 +334,7 @@ object ConfigurationBackupCodec {
                 concurrency = settings.optInt("concurrency", 2).coerceIn(1, 20),
                 prompt = settings.optionalBoundedString("prompt", 4_096).orEmpty().ifBlank { "ping" },
                 keyword = settings.optionalBoundedString("keyword", 512).orEmpty(),
+                quickFilterTerms = quickFilterTerms,
                 maxTokens = settings.optInt("maxTokens", 4).coerceIn(1, 64),
                 retryCount = settings.optInt("retryCount", 0).coerceIn(0, 5),
                 delayMinMs = settings.optLong("delayMinMs", 500).coerceIn(0, 10_000),

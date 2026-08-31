@@ -11,7 +11,7 @@ Android 原生版中转站模型批量测试器。它由应用直接向用户配
 - 批量测试：并发（1–20）、超时、随机请求间隔、分批、批间暂停、失败重试和取消；
 - 错误分类：认证、余额不足、无权限、模型不存在、限流、超时、网络、响应格式和上游错误；
 - 实时显示每个模型的状态、延迟、完成原因与 token；
-- 结果筛选、搜索、按名称/延迟排序、复制可用或失败模型、导出测试结果 JSON（不含 API Key、PAT 或用户 ID）；
+- 结果筛选、支持 `|` 的 OR 搜索、每个供应商可保存的多选快捷模型词、按名称/延迟排序、复制可用或失败模型、导出测试结果 JSON（不含 API Key、PAT 或用户 ID）；
 - 深色/浅色 Material 3 主题，页面对窄屏保持 48dp 以上交互目标。
 - 品牌图标已重绘为“中继节点 + 验证勾”的原生矢量标识；Adaptive Icon、Android 12+ 系统启动面和顶部品牌位共用同一套图形语言。系统 Splash 是唯一启动面，不再插入应用内“正在准备”加载页，因此不会出现两张连续启动页面。
 - 供应商选择卡由 52dp 最小高度的居中容器承载两行内容，名称与“协议 / 模型数”的文本组按卡片可用高度严格居中；标题右侧为 48dp 的添加和删除图标，保存区只保留保存操作。协议与 Prompt 选择器为等宽、8dp 等距的紧凑胶囊，点击不会出现超出控件边界的浅色覆盖层。
@@ -28,8 +28,9 @@ Android 原生版中转站模型批量测试器。它由应用直接向用户配
 
 - 顶栏提供“模型测试 / 余额查询”两个功能页；余额查询 PAT 独立于模型测试 API Key，二者均使用 Keystore 加密保存；
 - 内置 `new-api` 查询模板：`GET /api/user/self`、`Authorization: Bearer {{accessToken}}`、`User-Agent: RelayTester/1.0`、`data.quota`、`data.used_quota` 与 `data.group`；
-- 余额页同时展示全部供应商的双栏卡片。每张卡片显示可用余额、总额和已用比例圆环；点击卡片切换当前站点，支持顺序批量查询，单个站点失败不会中断其余站点。
+- 余额页同时展示全部供应商的双栏卡片。每张卡片显示可用余额、总额和已用比例圆环；圆环固定在右上角、已选状态固定在右下角，避免长金额挤压主信息列。点击卡片切换当前站点，支持顺序批量查询，单个站点失败不会中断其余站点。
 - 每个站点可配置余额查询访问令牌（PAT）和**可选**用户 ID；仅填写用户 ID 时才发送 `New-Api-User`，结果自动展示套餐、可用、已用和总额度（`quota + used_quota`）；
+- 最近一次成功余额查询会以仅展示的数据快照保存到本机；重新打开应用后会恢复，切换/更新余额模板、删除供应商或删除模板时会同步清理失效快照。快照不包含 API Key、PAT 或用户 ID，也不会写入配置备份。
 - 每个供应商可以单独选择余额模板；新建、编辑、复制、删除自定义模板均在应用内完成；
 - 模板可配置 GET / POST、站内 HTTPS 请求地址、请求头、Body、可用/已用/总额/币种 JSON 路径、单位、换算除数与成功标记；
 - 内置模板不可删除；点击“复制为自定义模板”后才创建可编辑副本，避免默认适配被覆盖；
@@ -55,9 +56,9 @@ Android 原生版中转站模型批量测试器。它由应用直接向用户配
 
 生成的调试包位于 app/build/outputs/apk/debug/app-debug.apk。
 
-当前公开版本为 `1.0.0`（versionCode `10000`）。日常开发构建为 `1.0.0-debug`；用于体验启动性能的优化构建为 `1.0.0-optimized`，二者均使用 `com.relaytester.app.debug` 包名，可覆盖同签名的旧调试包而无需清除应用数据。
+当前源码版本为 `1.1.0`（versionCode `10100`）。日常开发构建为 `1.1.0-debug`；用于体验启动性能的优化构建为 `1.1.0-optimized`，二者均使用 `com.relaytester.app.debug` 包名，可覆盖同签名的旧调试包而无需清除应用数据。
 
-`1.0.0` 已通过离线 `lintDebug`、`testDebugUnitTest`、`assembleDebug`、`assembleOptimized` 与 `assembleRelease`。优化体验包位于 `app/build/outputs/apk/optimized/app-optimized.apk`，大小为 `1,585,993` bytes，SHA-256 为 `4D29EA3EB2352ED1E93370CEBBE0F5044AE5A4715561BC3D8CFFFF803F4692D0`。正式 release 包位于 `app/build/outputs/apk/release/app-release-unsigned.apk`，已启用 R8 与资源收缩，但在使用前必须由发布者使用自己的正式签名密钥签名。
+`1.1.0` 延续并通过同一套离线构建门禁：`lintDebug`、`testDebugUnitTest`、`assembleDebug`、`assembleOptimized` 与 `assembleRelease`。优化体验包位于 `app/build/outputs/apk/optimized/app-optimized.apk`；正式 release 包位于 `app/build/outputs/apk/release/app-release-unsigned.apk`，已启用 R8 与资源收缩，但在使用前必须由发布者使用自己的正式签名密钥签名。上一公开版本 `1.0.0` 的验证资产 SHA-256 记录保留在 [RELEASE_NOTES_1.0.0.md](RELEASE_NOTES_1.0.0.md)。
 
 优化体验包已在隔离的 API 34 模拟器以 `adb install -r` 覆盖安装，连续五次冷进程启动均成功进入 `MainActivity`，后四次平均启动时间为 497 ms；`AndroidRuntime` 与崩溃缓冲均未发现异常。为保护现有配置，验证未调用模型或余额 API，也未导入、导出或清除数据。
 
@@ -67,11 +68,11 @@ Android 原生版中转站模型批量测试器。它由应用直接向用户配
 
 1. 添加供应商，填写地址（填至 /v1 层级）、协议和 API Key。
 2. 点击“获取模型”；模型列表会按供应商保存，并立即以纵向待测卡片显示。
-3. 按需设置超时、并发、Prompt 和模型名过滤；高级设置中可调整限速、批次和重试。
+3. 按需设置超时、并发、Prompt 和模型名过滤。使用 `gpt|claude` 可按 OR 匹配；可在“快捷筛选”中添加常用词，多选也按 OR 匹配。高级设置中可调整限速、批次和重试。
 4. 点击“开始测试”，运行期间同一批卡片原位更新；完成后可筛选、复制或导出结果。
 5. 如需余额，在“余额查询”页选择要配置的站点，保存 PAT；仅站点要求时再填写用户 ID，然后可查询当前站点或批量查询全部站点。
 6. 如需迁移全部配置，点击右上角“导入或导出配置”：导出时设置并妥善保存至少 12 个字符的独立密码；导入时先选择 `.rtbackup`、输入密码查看摘要，再次输入密码确认覆盖。导入不会自动请求任何站点。
 
 ## 后续扩展
 
-余额模板和查询结果已与模型测试分层；后续可在不改变现有模板数据的情况下增加余额历史、阈值提醒、站点分组或本地汇总计算。完整的实施、验收和模拟器验证记录见 [DEVELOPMENT_IMPLEMENTATION_SPEC.md](DEVELOPMENT_IMPLEMENTATION_SPEC.md)，当前紧凑交互、统一启动与品牌标识规范见 [UI_STARTUP_POLISH_V6_SPEC.md](UI_STARTUP_POLISH_V6_SPEC.md)，完整配置迁移规范见 [CONFIG_BACKUP_IMPORT_EXPORT_V5_SPEC.md](CONFIG_BACKUP_IMPORT_EXPORT_V5_SPEC.md)。
+余额模板和查询结果已与模型测试分层；后续可在不改变现有模板数据的情况下增加余额历史、阈值提醒、站点分组或本地汇总计算。完整的实施、验收和模拟器验证记录见 [DEVELOPMENT_IMPLEMENTATION_SPEC.md](DEVELOPMENT_IMPLEMENTATION_SPEC.md)，本次筛选与余额快照规范见 [MODEL_FILTER_BALANCE_PERSISTENCE_V1_1_SPEC.md](MODEL_FILTER_BALANCE_PERSISTENCE_V1_1_SPEC.md)，当前紧凑交互、统一启动与品牌标识规范见 [UI_STARTUP_POLISH_V6_SPEC.md](UI_STARTUP_POLISH_V6_SPEC.md)，完整配置迁移规范见 [CONFIG_BACKUP_IMPORT_EXPORT_V5_SPEC.md](CONFIG_BACKUP_IMPORT_EXPORT_V5_SPEC.md)。
