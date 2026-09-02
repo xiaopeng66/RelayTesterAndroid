@@ -46,7 +46,7 @@ fun RelayAppHeader(
                     Image(
                         painter = painterResource(R.drawable.ic_launcher_foreground),
                         contentDescription = null,
-                        modifier = Modifier.size(28.dp),
+                        modifier = Modifier.size(36.dp),
                     )
                     Spacer(Modifier.width(10.dp))
                     Column {

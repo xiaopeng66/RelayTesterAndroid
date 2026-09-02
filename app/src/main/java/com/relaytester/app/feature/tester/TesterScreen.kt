@@ -9,6 +9,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
@@ -21,6 +23,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
@@ -30,18 +33,26 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Download
+import androidx.compose.material.icons.outlined.Edit
+import androidx.compose.material.icons.outlined.EditNote
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.StopCircle
+import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material3.AlertDialog
@@ -55,7 +66,6 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.InputChip
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -70,15 +80,16 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
@@ -95,11 +106,16 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.DialogProperties
+import androidx.compose.ui.window.Dialog
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.relaytester.app.core.model.ModelTestResult
+import com.relaytester.app.core.model.ModelCatalogEntry
+import com.relaytester.app.core.model.ModelSource
 import com.relaytester.app.core.model.RelayProtocol
 import com.relaytester.app.core.model.SupplierProfile
 import com.relaytester.app.core.model.TestStatus
+import com.relaytester.app.feature.tester.UnifiedModelTestResult
 import com.relaytester.app.core.model.matchesAnyModelFilterTerm
 import com.relaytester.app.core.model.mergeModelFilterTerms
 import com.relaytester.app.ui.navigation.AppDestination
@@ -130,6 +146,9 @@ fun TesterScreen(
     val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
     var pendingExport by remember { mutableStateOf<ExportPayload?>(null) }
+    var showModelCatalog by rememberSaveable { mutableStateOf(false) }
+    var configurationSupplierId by rememberSaveable { mutableStateOf<String?>(null) }
+    var supplierToDeleteId by rememberSaveable { mutableStateOf<String?>(null) }
     // The configuration card already fills the first viewport. Keeping the
     // below-fold form out of the first composition prevents LazyColumn's
     // prefetch from building every input control immediately after launch.
@@ -203,20 +222,23 @@ fun TesterScreen(
                     state.resultQuery,
                     state.selectedQuickFilterTerms,
                 ) { viewModel.visibleResults() },
-                onNameChange = viewModel::updateName,
-                onBaseUrlChange = viewModel::updateBaseUrl,
-                onProtocolChange = viewModel::updateProtocol,
-                onApiKeyChange = viewModel::updateApiKey,
                 onSettingChange = viewModel::updateSetting,
                 onToggleQuickFilter = viewModel::toggleQuickFilterTerm,
                 onAddQuickFilters = viewModel::addQuickFilterTerms,
                 onRemoveQuickFilter = viewModel::removeQuickFilterTerm,
-                onSaveSupplier = viewModel::saveCurrentSupplier,
                 onSelectSupplier = viewModel::selectSupplier,
+                onRefreshSupplierModels = viewModel::refreshSupplierModels,
+                onEditSupplier = { supplierId ->
+                    configurationSupplierId = supplierId
+                    viewModel.selectSupplier(supplierId)
+                },
                 onAddSupplier = viewModel::addSupplier,
-                onDeleteSupplier = viewModel::deleteCurrentSupplier,
+                onDeleteSupplier = { supplierToDeleteId = state.activeSupplierId },
                 onFetchModels = viewModel::fetchModels,
                 onStartTest = viewModel::startTest,
+                onToggleModel = viewModel::toggleModelSelection,
+                onSelectAll = viewModel::selectAllModels,
+                onClearAll = viewModel::clearAllModels,
                 onCancelRun = viewModel::cancelRun,
                 onRetryFailed = viewModel::retryFailed,
                 onRetestAll = viewModel::retestAll,
@@ -233,8 +255,72 @@ fun TesterScreen(
                         createDocument.launch(export.fileName)
                     }
                 },
+                onOpenModelCatalog = { showModelCatalog = true },
                 showDeferredContent = showDeferredContent,
                 contentPadding = innerPadding,
+            )
+        }
+    }
+    if (showModelCatalog && state.draft != null) {
+        ModelCatalogDialog(
+            state = state,
+            onDismiss = {
+                viewModel.clearCatalogPickerModels()
+                showModelCatalog = false
+            },
+            onFetchModels = viewModel::fetchCatalogModels,
+            onClearPicker = viewModel::clearCatalogPickerModels,
+            onSaveEntry = { entryId, name, sources ->
+                if (entryId == null) {
+                    viewModel.saveModelCatalogEntry(name, sources)
+                } else {
+                    viewModel.updateModelCatalogEntry(entryId, name, sources)
+                }
+            },
+            onDeleteEntry = viewModel::deleteModelCatalogEntry,
+            onRunEntry = viewModel::startUnifiedCatalogTest,
+            onCancelRun = viewModel::cancelUnifiedCatalogTest,
+        )
+    }
+    configurationSupplierId?.let { supplierId ->
+        val draft = state.draft
+        if (state.activeSupplierId == supplierId && draft?.id == supplierId) {
+            SupplierConfigurationDialog(
+                draft = draft,
+                errors = state.errors,
+                enabled = !state.isRunning && !state.isUnifiedTesting && !state.isFetchingModels && !state.isSecretsHydrating,
+                isSecretsHydrating = state.isSecretsHydrating,
+                onDismiss = { configurationSupplierId = null },
+                onNameChange = viewModel::updateName,
+                onBaseUrlChange = viewModel::updateBaseUrl,
+                onProtocolChange = viewModel::updateProtocol,
+                onApiKeyChange = viewModel::updateApiKey,
+                onSave = viewModel::saveCurrentSupplier,
+            )
+        }
+    }
+    supplierToDeleteId?.let { supplierId ->
+        val supplier = state.suppliers.firstOrNull { it.id == supplierId }
+        if (supplier != null) {
+            AlertDialog(
+                onDismissRequest = { supplierToDeleteId = null },
+                title = { Text("删除供应商？") },
+                text = { Text("“${supplier.name}”及其模型、余额配置将被删除。此操作无法撤销。") },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            supplierToDeleteId = null
+                            viewModel.deleteCurrentSupplier()
+                        },
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) { Text("删除", color = MaterialTheme.colorScheme.error) }
+                },
+                dismissButton = {
+                    TextButton(
+                        onClick = { supplierToDeleteId = null },
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) { Text("取消") }
+                },
             )
         }
     }
@@ -244,20 +330,20 @@ fun TesterScreen(
 private fun TesterContent(
     state: TesterUiState,
     visibleResults: List<ModelTestResult>,
-    onNameChange: (String) -> Unit,
-    onBaseUrlChange: (String) -> Unit,
-    onProtocolChange: (RelayProtocol) -> Unit,
-    onApiKeyChange: (String) -> Unit,
     onSettingChange: (SettingField, String) -> Unit,
     onToggleQuickFilter: (String) -> Unit,
     onAddQuickFilters: (String) -> Unit,
     onRemoveQuickFilter: (String) -> Unit,
-    onSaveSupplier: () -> Unit,
     onSelectSupplier: (String) -> Unit,
+    onRefreshSupplierModels: (String) -> Unit,
+    onEditSupplier: (String) -> Unit,
     onAddSupplier: () -> Unit,
     onDeleteSupplier: () -> Unit,
     onFetchModels: () -> Unit,
     onStartTest: () -> Unit,
+    onToggleModel: (String) -> Unit,
+    onSelectAll: (Collection<String>?) -> Unit,
+    onClearAll: (Collection<String>?) -> Unit,
     onCancelRun: () -> Unit,
     onRetryFailed: () -> Unit,
     onRetestAll: () -> Unit,
@@ -266,13 +352,15 @@ private fun TesterContent(
     onQueryChange: (String) -> Unit,
     onCopy: (String, List<String>) -> Unit,
     onExport: () -> Unit,
+    onOpenModelCatalog: () -> Unit,
     showDeferredContent: Boolean,
     contentPadding: PaddingValues,
 ) {
     val draft = requireNotNull(state.draft)
-    val disabled = state.isRunning || state.isFetchingModels || state.isSecretsHydrating
-    val modelFilterTerms = remember(draft.keyword, state.selectedQuickFilterTerms) {
-        mergeModelFilterTerms(draft.keyword, state.selectedQuickFilterTerms)
+    val operationDisabled = state.isRunning || state.isUnifiedTesting || state.isSecretsHydrating
+    val disabled = operationDisabled || state.isFetchingModels
+    val modelFilterTerms = remember(state.modelFilterKeyword, state.selectedQuickFilterTerms) {
+        mergeModelFilterTerms(state.modelFilterKeyword, state.selectedQuickFilterTerms)
     }
     val filteredModels by produceState(
         initialValue = FilteredModelsState(values = emptyList(), isLoading = true),
@@ -303,23 +391,13 @@ private fun TesterContent(
             SupplierSelector(
                 suppliers = state.suppliers,
                 activeSupplierId = state.activeSupplierId,
-                enabled = !disabled,
+                fetchingSupplierIds = state.fetchingSupplierIds,
+                enabled = !operationDisabled,
                 onSelect = onSelectSupplier,
+                onRefreshModels = onRefreshSupplierModels,
+                onEditSupplier = onEditSupplier,
                 onAdd = onAddSupplier,
                 onDelete = onDeleteSupplier,
-            )
-        }
-        item(key = "supplier_config", contentType = "supplier_config") {
-            SupplierConfigurationCard(
-                draft = draft,
-                errors = state.errors,
-                enabled = !disabled,
-                isSecretsHydrating = state.isSecretsHydrating,
-                onNameChange = onNameChange,
-                onBaseUrlChange = onBaseUrlChange,
-                onProtocolChange = onProtocolChange,
-                onApiKeyChange = onApiKeyChange,
-                onSave = onSaveSupplier,
             )
         }
         if (showDeferredContent) {
@@ -329,12 +407,15 @@ private fun TesterContent(
                     errors = state.errors,
                     enabled = !disabled,
                     onSettingChange = onSettingChange,
+                    modelFilterKeyword = state.modelFilterKeyword,
+                    quickFilterTerms = state.quickFilterTerms,
                     selectedQuickFilters = state.selectedQuickFilterTerms,
                     onToggleQuickFilter = onToggleQuickFilter,
                     onAddQuickFilters = onAddQuickFilters,
                     onRemoveQuickFilter = onRemoveQuickFilter,
                     onFetchModels = onFetchModels,
                     onStartTest = onStartTest,
+                    onOpenModelCatalog = onOpenModelCatalog,
                     onCancel = onCancelRun,
                     isFetchingModels = state.isFetchingModels,
                     isRunning = state.isRunning,
@@ -347,6 +428,9 @@ private fun TesterContent(
                     onFilterChange = onFilterChange,
                     onSortChange = onSortChange,
                     onQueryChange = onQueryChange,
+                    onToggleModel = onToggleModel,
+                    onSelectAll = onSelectAll,
+                    onClearAll = onClearAll,
                     onRetryFailed = onRetryFailed,
                     onRetestAll = onRetestAll,
                     onCopy = onCopy,
@@ -361,6 +445,11 @@ private fun TesterContent(
                     fetchedModelsSection(
                         models = filteredModels.values,
                         totalModels = draft.models.size,
+                        selectedModels = state.selectedModels,
+                        enabled = !disabled,
+                        onToggleModel = onToggleModel,
+                        onSelectAll = onSelectAll,
+                        onClearAll = onClearAll,
                     )
                 }
             }
@@ -372,28 +461,33 @@ private fun TesterContent(
 }
 
 private const val INITIAL_DEFERRED_CONTENT_DELAY_MS = 350L
+private const val MAX_MODEL_SOURCES_PER_ENTRY = 32
 
 @Composable
-@OptIn(ExperimentalLayoutApi::class)
+@OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
 private fun SupplierSelector(
     suppliers: List<SupplierProfile>,
     activeSupplierId: String?,
+    fetchingSupplierIds: Set<String>,
     enabled: Boolean,
     onSelect: (String) -> Unit,
+    onRefreshModels: (String) -> Unit,
+    onEditSupplier: (String) -> Unit,
     onAdd: () -> Unit,
     onDelete: () -> Unit,
 ) {
+    val manageEnabled = enabled && fetchingSupplierIds.isEmpty()
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
+            verticalAlignment = Alignment.Top,
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
             Text("供应商", style = MaterialTheme.typography.titleMedium)
             Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 IconButton(
                     onClick = onAdd,
-                    enabled = enabled,
+                    enabled = manageEnabled,
                     modifier = Modifier.size(48.dp),
                 ) {
                     Icon(
@@ -403,7 +497,7 @@ private fun SupplierSelector(
                 }
                 IconButton(
                     onClick = onDelete,
-                    enabled = enabled,
+                    enabled = manageEnabled,
                     modifier = Modifier.size(48.dp),
                 ) {
                     Icon(
@@ -424,36 +518,46 @@ private fun SupplierSelector(
             ) {
                 suppliers.forEach { supplier ->
                     val selected = supplier.id == activeSupplierId
+                    val isRefreshing = supplier.id in fetchingSupplierIds
+                    val containerColor = if (selected) {
+                        MaterialTheme.colorScheme.secondaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.surface
+                    }
+                    val borderColor = if (selected || isRefreshing) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.outlineVariant
+                    }
                     OutlinedCard(
                         modifier = Modifier
                             .width(cardWidth)
-                            .heightIn(min = 52.dp)
-                            .clickable(enabled = enabled, role = Role.Tab) { onSelect(supplier.id) }
-                            .clearAndSetSemantics {
+                            .height(58.dp)
+                            .combinedClickable(
+                                enabled = enabled,
+                                role = Role.Tab,
+                                onClick = { onSelect(supplier.id) },
+                                onDoubleClick = { onRefreshModels(supplier.id) },
+                            )
+                            .semantics {
                                 role = Role.Tab
                                 this.selected = selected
-                                contentDescription = "选择供应商 ${supplier.name}"
-                                onClick(label = "选择供应商") {
-                                    onSelect(supplier.id)
-                                    true
-                                }
+                                contentDescription = "供应商 ${supplier.name}；双击重新拉取模型列表"
                             },
-                        colors = CardDefaults.outlinedCardColors(
-                            containerColor = if (selected) {
-                                MaterialTheme.colorScheme.secondaryContainer
-                            } else {
-                                MaterialTheme.colorScheme.surface
-                            },
-                        ),
+                        border = BorderStroke(1.dp, borderColor),
+                        colors = CardDefaults.outlinedCardColors(containerColor = containerColor),
                     ) {
                         Box(
                             modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(min = 52.dp)
-                                .padding(horizontal = 12.dp),
-                            contentAlignment = Alignment.Center,
+                                .fillMaxSize(),
                         ) {
-                            Column {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(horizontal = 10.dp)
+                                    .padding(end = 34.dp),
+                                verticalArrangement = Arrangement.Center,
+                            ) {
                                 Text(
                                     text = supplier.name,
                                     maxLines = 1,
@@ -467,10 +571,11 @@ private fun SupplierSelector(
                                         MaterialTheme.colorScheme.onSurface
                                     },
                                 )
+                                Spacer(Modifier.height(4.dp))
                                 Text(
                                     text = buildAnnotatedString {
                                         pushStyle(SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant))
-                                        append(supplier.protocol.label)
+                                        append(protocolShortLabel(supplier.protocol))
                                         append(" · ")
                                         pop()
                                         pushStyle(
@@ -490,13 +595,64 @@ private fun SupplierSelector(
                                     overflow = TextOverflow.Ellipsis,
                                 )
                             }
+                            // Keep a 48dp touch target while centering the compact square
+                            // control over the card's top-right rounded corner.
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.TopEnd)
+                                    .size(48.dp)
+                                    .clickable(
+                                        enabled = enabled,
+                                        role = Role.Button,
+                                        onClick = { onEditSupplier(supplier.id) },
+                                    )
+                                    .semantics {
+                                        contentDescription = "编辑 ${supplier.name} 站点配置"
+                                    },
+                                contentAlignment = Alignment.TopEnd,
+                            ) {
+                                Surface(
+                                    modifier = Modifier
+                                        .padding(top = 2.dp, end = 2.dp)
+                                        .size(28.dp),
+                                    shape = MaterialTheme.shapes.extraSmall,
+                                    color = if (selected || isRefreshing) {
+                                        MaterialTheme.colorScheme.primaryContainer
+                                    } else {
+                                        MaterialTheme.colorScheme.surfaceVariant
+                                    },
+                                    contentColor = if (selected || isRefreshing) {
+                                        MaterialTheme.colorScheme.onPrimaryContainer
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurfaceVariant
+                                    },
+                                ) {
+                                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                        Icon(
+                                            Icons.Outlined.EditNote,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(18.dp),
+                                        )
+                                    }
+                                }
+                            }
+                            if (isRefreshing) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier
+                                        .align(Alignment.BottomEnd)
+                                        .padding(end = 8.dp, bottom = 6.dp)
+                                        .size(18.dp),
+                                    strokeWidth = 2.dp,
+                                    color = MaterialTheme.colorScheme.primary,
+                                )
+                            }
                         }
                     }
                 }
             }
         }
         Text(
-            "不同站点的模型列表、测试参数和密钥相互隔离。",
+            "点击切换站点，双击重新拉取模型；右上角图标编辑站点配置。",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -504,7 +660,70 @@ private fun SupplierSelector(
 }
 
 @Composable
-private fun SupplierConfigurationCard(
+private fun SupplierConfigurationDialog(
+    draft: SupplierDraft,
+    errors: FormErrors,
+    enabled: Boolean,
+    isSecretsHydrating: Boolean,
+    onDismiss: () -> Unit,
+    onNameChange: (String) -> Unit,
+    onBaseUrlChange: (String) -> Unit,
+    onProtocolChange: (RelayProtocol) -> Unit,
+    onApiKeyChange: (String) -> Unit,
+    onSave: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text("站点配置")
+                Text(
+                    draft.name,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.primary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 480.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                SupplierConfigurationForm(
+                    draft = draft,
+                    errors = errors,
+                    enabled = enabled,
+                    isSecretsHydrating = isSecretsHydrating,
+                    onNameChange = onNameChange,
+                    onBaseUrlChange = onBaseUrlChange,
+                    onProtocolChange = onProtocolChange,
+                    onApiKeyChange = onApiKeyChange,
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onSave,
+                enabled = enabled,
+                modifier = Modifier.heightIn(min = 48.dp),
+            ) { Text("保存站点") }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = onDismiss,
+                modifier = Modifier.heightIn(min = 48.dp),
+            ) { Text("关闭") }
+        },
+    )
+}
+
+@Composable
+private fun SupplierConfigurationForm(
     draft: SupplierDraft,
     errors: FormErrors,
     enabled: Boolean,
@@ -513,108 +732,101 @@ private fun SupplierConfigurationCard(
     onBaseUrlChange: (String) -> Unit,
     onProtocolChange: (RelayProtocol) -> Unit,
     onApiKeyChange: (String) -> Unit,
-    onSave: () -> Unit,
 ) {
     var revealApiKey by rememberSaveable(draft.id) { mutableStateOf(false) }
-    ElevatedCard {
-        Column(
-            modifier = Modifier.fillMaxWidth().padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            SectionTitle("站点配置", "模型测试直接从本机请求目标站点")
-            AppTextField(
-                value = draft.name,
-                onValueChange = onNameChange,
-                label = "供应商名称",
-                placeholder = "例如：主账号 A",
-                enabled = enabled,
-            )
-            AppTextField(
-                value = draft.baseUrl,
-                onValueChange = onBaseUrlChange,
-                label = "中转站地址（Base URL）",
-                placeholder = "https://your-relay.example.com/v1",
-                enabled = enabled,
-                errorMessage = errors.baseUrl,
-                keyboardType = KeyboardType.Uri,
-            )
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("接口协议", style = MaterialTheme.typography.labelLarge)
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    RelayProtocol.entries.forEach { protocol ->
-                        SelectablePill(
-                            label = protocol.label,
-                            selected = draft.protocol == protocol,
-                            onClick = { onProtocolChange(protocol) },
-                            enabled = enabled,
-                            contentDescription = "使用接口协议：${protocol.label}",
-                            modifier = Modifier.weight(1f),
-                        )
-                    }
-                }
-                Text(
-                    protocolDescription(draft.protocol),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            AppTextField(
-                value = draft.apiKey,
-                onValueChange = onApiKeyChange,
-                label = "API Key",
-                placeholder = "sk-...",
-                enabled = enabled,
-                errorMessage = errors.apiKey,
-                keyboardType = KeyboardType.Password,
-                visualTransformation = if (revealApiKey) {
-                    VisualTransformation.None
-                } else {
-                    PasswordVisualTransformation()
-                },
-                trailingIcon = {
-                    IconButton(
-                        onClick = { revealApiKey = !revealApiKey },
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text(
+            "模型测试直接从本机请求目标站点。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        AppTextField(
+            value = draft.name,
+            onValueChange = onNameChange,
+            label = "供应商名称",
+            placeholder = "例如：主账号 A",
+            enabled = enabled,
+        )
+        AppTextField(
+            value = draft.baseUrl,
+            onValueChange = onBaseUrlChange,
+            label = "中转站地址（Base URL）",
+            placeholder = "https://your-relay.example.com/v1",
+            enabled = enabled,
+            errorMessage = errors.baseUrl,
+            keyboardType = KeyboardType.Uri,
+        )
+        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("接口协议", style = MaterialTheme.typography.labelLarge)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                RelayProtocol.entries.forEach { protocol ->
+                    SelectablePill(
+                        label = protocol.label,
+                        selected = draft.protocol == protocol,
+                        onClick = { onProtocolChange(protocol) },
                         enabled = enabled,
-                    ) {
-                        Icon(
-                            imageVector = if (revealApiKey) {
-                                Icons.Outlined.VisibilityOff
-                            } else {
-                                Icons.Outlined.Visibility
-                            },
-                            contentDescription = if (revealApiKey) "隐藏 API Key" else "显示 API Key",
-                        )
-                    }
-                },
-            )
-            Text(
-                "密钥由 Android Keystore 加密保存。测试结果 JSON 不含密钥；加密配置备份会包含密钥。",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            if (isSecretsHydrating) {
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                    Text(
-                        "正在安全读取本机凭据…",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        contentDescription = "使用接口协议：${protocol.label}",
+                        modifier = Modifier.weight(1f),
                     )
                 }
             }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.End,
-            ) {
-                Button(onClick = onSave, enabled = enabled) {
-                    Text("保存站点")
+            Text(
+                protocolDescription(draft.protocol),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        AppTextField(
+            value = draft.apiKey,
+            onValueChange = onApiKeyChange,
+            label = "API Key",
+            placeholder = "sk-...",
+            enabled = enabled,
+            errorMessage = errors.apiKey,
+            keyboardType = KeyboardType.Password,
+            visualTransformation = if (revealApiKey) {
+                VisualTransformation.None
+            } else {
+                PasswordVisualTransformation()
+            },
+            trailingIcon = {
+                IconButton(
+                    onClick = { revealApiKey = !revealApiKey },
+                    enabled = enabled,
+                ) {
+                    Icon(
+                        imageVector = if (revealApiKey) {
+                            Icons.Outlined.VisibilityOff
+                        } else {
+                            Icons.Outlined.Visibility
+                        },
+                        contentDescription = if (revealApiKey) "隐藏 API Key" else "显示 API Key",
+                    )
                 }
+            },
+        )
+        Text(
+            "密钥由 Android Keystore 加密保存。测试结果 JSON 不含密钥；加密配置备份会包含密钥。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (isSecretsHydrating) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                Text(
+                    "正在安全读取本机凭据…",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
     }
@@ -627,12 +839,15 @@ private fun TestSettingsCard(
     errors: FormErrors,
     enabled: Boolean,
     onSettingChange: (SettingField, String) -> Unit,
+    modelFilterKeyword: String,
+    quickFilterTerms: List<String>,
     selectedQuickFilters: Set<String>,
     onToggleQuickFilter: (String) -> Unit,
     onAddQuickFilters: (String) -> Unit,
     onRemoveQuickFilter: (String) -> Unit,
     onFetchModels: () -> Unit,
     onStartTest: () -> Unit,
+    onOpenModelCatalog: () -> Unit,
     onCancel: () -> Unit,
     isFetchingModels: Boolean,
     isRunning: Boolean,
@@ -640,12 +855,33 @@ private fun TestSettingsCard(
     var showAdvanced by rememberSaveable(draft.id) { mutableStateOf(false) }
     var showQuickFilterDialog by rememberSaveable(draft.id) { mutableStateOf(false) }
     var quickFilterInput by rememberSaveable(draft.id) { mutableStateOf("") }
+    var quickFilterToDelete by remember { mutableStateOf<String?>(null) }
     ElevatedCard {
         Column(
             modifier = Modifier.fillMaxWidth().padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            SectionTitle("测试参数", "并发、限速和重试均在设备本机执行")
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    SectionTitle("测试参数", "并发/限速/重试")
+                }
+                OutlinedButton(
+                    onClick = onOpenModelCatalog,
+                    enabled = enabled,
+                    contentPadding = PaddingValues(horizontal = 10.dp),
+                    modifier = Modifier
+                        .heightIn(min = 40.dp, max = 44.dp)
+                        .widthIn(min = 96.dp, max = 112.dp),
+                ) {
+                    Icon(Icons.Outlined.Tune, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("高级测试", maxLines = 1, softWrap = false)
+                }
+            }
             NumberRow(
                 firstLabel = "超时（秒）",
                 firstValue = draft.timeoutSeconds,
@@ -685,10 +921,10 @@ private fun TestSettingsCard(
                 }
             }
             AppTextField(
-                value = draft.keyword,
+                value = modelFilterKeyword,
                 onValueChange = { onSettingChange(SettingField.KEYWORD, it) },
-                label = "模型名过滤（OR）",
-                placeholder = "例如 gpt|claude",
+                label = "模型名过滤（逗号分隔，OR）",
+                placeholder = "例如 gpt,claude",
                 enabled = enabled,
             )
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -702,8 +938,8 @@ private fun TestSettingsCard(
                             style = MaterialTheme.typography.labelLarge,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
-                        Text(
-                            "多选和输入框中的 | 均为 OR",
+                Text(
+                    "多个词用英文半角逗号 , 表示 OR",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -716,43 +952,82 @@ private fun TestSettingsCard(
                         Icon(Icons.Outlined.Add, contentDescription = "添加快捷筛选词")
                     }
                 }
-                if (draft.quickFilterTerms.isEmpty()) {
+                if (quickFilterTerms.isEmpty()) {
                     Text(
                         "添加常用模型词后，可一键组合筛选。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 } else {
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        draft.quickFilterTerms.forEach { term ->
-                            InputChip(
-                                selected = term in selectedQuickFilters,
-                                onClick = { onToggleQuickFilter(term) },
-                                label = {
-                                    Text(
-                                        term,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                    )
-                                },
-                                trailingIcon = {
-                                    IconButton(
-                                        onClick = { onRemoveQuickFilter(term) },
-                                        enabled = enabled,
-                                        modifier = Modifier.size(48.dp),
-                                    ) {
-                                        Icon(Icons.Outlined.Close, contentDescription = "删除快捷筛选词 $term")
+                    BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+                        val filterWidth = (maxWidth - 8.dp) / 2
+                        FlowRow(
+                            modifier = Modifier.fillMaxWidth(),
+                            maxItemsInEachRow = 2,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            quickFilterTerms.forEach { term ->
+                                val selected = term in selectedQuickFilters
+                                Surface(
+                                    modifier = Modifier
+                                        .width(filterWidth)
+                                        .height(48.dp)
+                                        .clickable(
+                                            enabled = enabled,
+                                            role = Role.Checkbox,
+                                            onClick = { onToggleQuickFilter(term) },
+                                        )
+                                        .semantics {
+                                            contentDescription = "模型快捷筛选词：$term"
+                                            this.selected = selected
+                                        },
+                                    shape = MaterialTheme.shapes.small,
+                                    color = if (selected) {
+                                        MaterialTheme.colorScheme.secondaryContainer
+                                    } else {
+                                        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
+                                    },
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
+                                    ),
+                                ) {
+                                    Box(Modifier.fillMaxSize()) {
+                                        Text(
+                                            term,
+                                            modifier = Modifier
+                                                .align(Alignment.CenterStart)
+                                                .padding(start = 12.dp, end = 32.dp),
+                                            maxLines = 1,
+                                            softWrap = false,
+                                            overflow = TextOverflow.Ellipsis,
+                                            color = if (selected) {
+                                                MaterialTheme.colorScheme.onSecondaryContainer
+                                            } else {
+                                                MaterialTheme.colorScheme.onSurfaceVariant
+                                            },
+                                            style = MaterialTheme.typography.labelLarge,
+                                        )
+                                        IconButton(
+                                            onClick = { quickFilterToDelete = term },
+                                            enabled = enabled,
+                                            modifier = Modifier
+                                                .align(Alignment.TopEnd)
+                                                .size(36.dp)
+                                                .semantics {
+                                                    contentDescription = "删除快捷筛选词 $term"
+                                                },
+                                        ) {
+                                            Icon(
+                                                Icons.Outlined.Close,
+                                                contentDescription = null,
+                                                modifier = Modifier.size(16.dp),
+                                            )
+                                        }
                                     }
-                                },
-                                enabled = enabled,
-                                modifier = Modifier
-                                    .widthIn(max = 200.dp)
-                                    .heightIn(min = 48.dp)
-                                    .semantics { contentDescription = "模型快捷筛选词：$term" },
-                            )
+                                }
+                            }
                         }
                     }
                 }
@@ -850,7 +1125,7 @@ private fun TestSettingsCard(
                     value = quickFilterInput,
                     onValueChange = { quickFilterInput = it },
                     label = "模型词",
-                    placeholder = "例如 gpt|claude",
+                    placeholder = "例如 gpt,claude",
                 )
             },
             confirmButton = {
@@ -867,6 +1142,28 @@ private fun TestSettingsCard(
             dismissButton = {
                 TextButton(
                     onClick = { showQuickFilterDialog = false },
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) { Text("取消") }
+            },
+        )
+    }
+    quickFilterToDelete?.let { term ->
+        AlertDialog(
+            onDismissRequest = { quickFilterToDelete = null },
+            title = { Text("删除快捷筛选？") },
+            text = { Text("将移除快捷筛选词“$term”。") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        quickFilterToDelete = null
+                        onRemoveQuickFilter(term)
+                    },
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) { Text("删除", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { quickFilterToDelete = null },
                     modifier = Modifier.heightIn(min = 48.dp),
                 ) { Text("取消") }
             },
@@ -948,17 +1245,52 @@ private fun SelectablePill(
 private fun LazyListScope.fetchedModelsSection(
     models: List<String>,
     totalModels: Int,
+    selectedModels: Set<String>,
+    enabled: Boolean,
+    onToggleModel: (String) -> Unit,
+    onSelectAll: (Collection<String>?) -> Unit,
+    onClearAll: (Collection<String>?) -> Unit,
 ) {
     item(key = "fetched_models_header", contentType = "fetched_models_header") {
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            SectionTitle(
-                "已获取模型",
-                if (models.size == totalModels) {
-                    "共 " + totalModels + " 个"
-                } else {
-                    "匹配 " + models.size + " / " + totalModels + " 个"
-                },
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    SectionTitle(
+                        "已获取模型",
+                        if (models.size == totalModels) {
+                            "已选 ${selectedModels.intersect(models.toSet()).size} / $totalModels 个"
+                        } else {
+                            "匹配 ${models.size} / $totalModels · 已选 ${selectedModels.intersect(models.toSet()).size} 个"
+                        },
+                    )
+                }
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    "勾选后仅测试选中的模型",
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                TextButton(
+                    onClick = { onSelectAll(models) },
+                    enabled = enabled && models.any { it !in selectedModels },
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) { Text("全选") }
+                TextButton(
+                    onClick = { onClearAll(models) },
+                    enabled = enabled && models.any { it in selectedModels },
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) { Text("取消全选") }
+            }
             Text(
                 "开始测试后将在同一列表中显示延迟、用量和错误详情。",
                 style = MaterialTheme.typography.bodySmall,
@@ -982,6 +1314,10 @@ private fun LazyListScope.fetchedModelsSection(
             ResultItem(
                 result = ModelTestResult.pending(model),
                 isFetchedOnly = true,
+                selectable = true,
+                selected = model in selectedModels,
+                enabled = enabled,
+                onToggle = { onToggleModel(model) },
             )
         }
     }
@@ -993,6 +1329,9 @@ private fun LazyListScope.resultSection(
     onFilterChange: (ResultFilter) -> Unit,
     onSortChange: (ResultSort) -> Unit,
     onQueryChange: (String) -> Unit,
+    onToggleModel: (String) -> Unit,
+    onSelectAll: (Collection<String>?) -> Unit,
+    onClearAll: (Collection<String>?) -> Unit,
     onRetryFailed: () -> Unit,
     onRetestAll: () -> Unit,
     onCopy: (String, List<String>) -> Unit,
@@ -1009,6 +1348,31 @@ private fun LazyListScope.resultSection(
             onQueryChange = onQueryChange,
         )
     }
+    item(key = "result_selection", contentType = "result_selection") {
+        val visibleModels = visibleResults.map { it.model }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                "已选 ${state.selectedModels.intersect(visibleModels.toSet()).size} / ${visibleModels.size} 个",
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            TextButton(
+                onClick = { onSelectAll(visibleModels) },
+                enabled = !state.isRunning && visibleModels.any { it !in state.selectedModels },
+                modifier = Modifier.heightIn(min = 48.dp),
+            ) { Text("全选") }
+            TextButton(
+                onClick = { onClearAll(visibleModels) },
+                enabled = !state.isRunning && visibleModels.any { it in state.selectedModels },
+                modifier = Modifier.heightIn(min = 48.dp),
+            ) { Text("取消全选") }
+        }
+    }
     if (visibleResults.isEmpty()) {
         item(key = "empty_results", contentType = "empty_results") {
             OutlinedCard {
@@ -1021,7 +1385,13 @@ private fun LazyListScope.resultSection(
         }
     } else {
         items(visibleResults, key = { it.model }, contentType = { "result_item" }) { result ->
-            ResultItem(result = result)
+            ResultItem(
+                result = result,
+                selectable = true,
+                selected = result.model in state.selectedModels,
+                enabled = !state.isRunning,
+                onToggle = { onToggleModel(result.model) },
+            )
         }
     }
     item(key = "result_actions", contentType = "result_actions") {
@@ -1135,8 +1505,8 @@ private fun ResultFilters(
         AppTextField(
             value = state.resultQuery,
             onValueChange = onQueryChange,
-            label = "搜索测试结果（OR）",
-            placeholder = "例如 gpt|claude",
+            label = "搜索测试结果（逗号分隔，OR）",
+            placeholder = "例如 gpt,claude",
             leadingIcon = {
                 Icon(Icons.Outlined.Search, contentDescription = null)
             },
@@ -1148,29 +1518,73 @@ private fun ResultFilters(
 private fun ResultItem(
     result: ModelTestResult,
     isFetchedOnly: Boolean = false,
+    selectable: Boolean = false,
+    selected: Boolean = false,
+    enabled: Boolean = true,
+    onToggle: () -> Unit = {},
 ) {
+    var expanded by rememberSaveable(result.model, result.status) { mutableStateOf(false) }
     val statusColor = when (result.status) {
         TestStatus.SUCCESS -> Color(0xFF16A34A)
         TestStatus.FAILED -> MaterialTheme.colorScheme.error
         TestStatus.PENDING -> MaterialTheme.colorScheme.tertiary
     }
+    val failureDetail = result.error?.message
+        ?.takeIf { message ->
+            message.isNotBlank() &&
+                message != result.error?.kind?.label &&
+                !failureSummary(result).contains(message)
+        }
+    val canExpandFailure = !isFetchedOnly && result.status == TestStatus.FAILED && failureDetail != null
     OutlinedCard {
         Row(
-            modifier = Modifier.fillMaxWidth().padding(14.dp),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 64.dp)
+                .padding(horizontal = 6.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
             verticalAlignment = Alignment.Top,
         ) {
+            if (selectable) {
+                Box(
+                    modifier = Modifier.width(40.dp).height(56.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Checkbox(
+                        checked = selected,
+                        onCheckedChange = { onToggle() },
+                        enabled = enabled,
+                        modifier = Modifier
+                            .size(46.dp)
+                            .graphicsLayer(scaleX = 0.7f, scaleY = 0.7f),
+                    )
+                }
+            }
             Box(
                 modifier = Modifier
-                    .padding(top = 5.dp)
-                    .size(10.dp)
-                    .clip(MaterialTheme.shapes.extraSmall)
-                    .background(statusColor),
-            )
-            Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(4.dp),
+                    .width(8.dp)
+                    .height(56.dp),
+                contentAlignment = Alignment.Center,
             ) {
+                Box(
+                    modifier = Modifier
+                        .size(8.dp)
+                        .clip(MaterialTheme.shapes.extraSmall)
+                        .background(statusColor),
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .heightIn(min = 56.dp),
+                contentAlignment = if (expanded) Alignment.TopStart else Alignment.CenterStart,
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = if (expanded) 7.dp else 0.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
                         result.model,
@@ -1178,10 +1592,6 @@ private fun ResultItem(
                         style = MaterialTheme.typography.titleSmall,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
-                    )
-                    StatusLabel(
-                        status = result.status,
-                        isFetchedOnly = isFetchedOnly,
                     )
                 }
                 when (result.status) {
@@ -1195,23 +1605,21 @@ private fun ResultItem(
                             meta.ifEmpty { listOf("请求成功") }.joinToString("  ·  "),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis,
                         )
                     }
 
                     TestStatus.FAILED -> {
                         Text(
-                            "HTTP " + (result.httpStatus?.toString() ?: "—") +
-                                " · " + (result.error?.kind?.label ?: "请求失败"),
+                            listOfNotNull(failureSummary(result), failureDetail).joinToString(" · "),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.error,
+                            maxLines = if (expanded) Int.MAX_VALUE else 1,
+                            softWrap = expanded,
+                            overflow = if (expanded) TextOverflow.Clip else TextOverflow.Ellipsis,
                         )
-                        result.error?.message?.let { message ->
-                            Text(
-                                message,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
                     }
 
                     TestStatus.PENDING -> {
@@ -1219,7 +1627,66 @@ private fun ResultItem(
                             if (isFetchedOnly) "已获取，尚未开始测试" else "等待测试…",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis,
                         )
+                    }
+                }
+            }
+            }
+            if (isFetchedOnly) {
+                Box(
+                    modifier = Modifier
+                        .width(60.dp)
+                        .height(56.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    TextButton(
+                        onClick = {},
+                        enabled = false,
+                        contentPadding = PaddingValues(horizontal = 4.dp),
+                        modifier = Modifier.width(56.dp).height(40.dp),
+                    ) {
+                        Text(
+                            "待测",
+                            style = MaterialTheme.typography.labelMedium,
+                            maxLines = 1,
+                            softWrap = false,
+                        )
+                    }
+                }
+            } else {
+                Column(
+                    modifier = Modifier
+                        .width(60.dp)
+                        .height(56.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Top,
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .width(56.dp)
+                            .height(28.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        StatusLabel(result.status)
+                    }
+                    if (canExpandFailure) {
+                        TextButton(
+                            onClick = { expanded = !expanded },
+                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+                            modifier = Modifier.width(56.dp).height(28.dp),
+                        ) {
+                            Text(
+                                if (expanded) "收起" else "详情",
+                                style = MaterialTheme.typography.labelMedium,
+                                maxLines = 1,
+                                softWrap = false,
+                            )
+                        }
+                    } else {
+                        Spacer(Modifier.height(28.dp))
                     }
                 }
             }
@@ -1240,6 +1707,8 @@ private fun ResultActions(
             .partition { it.status == TestStatus.SUCCESS }
             .let { (ok, bad) -> ok.map { it.model } to bad.map { it.model } }
     }
+    val selectedFailed = failed.filter { it in state.selectedModels }
+    val selectedResults = state.results.count { it.model in state.selectedModels }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -1247,19 +1716,19 @@ private fun ResultActions(
         ) {
             OutlinedButton(
                 onClick = onRetestAll,
-                enabled = !state.isRunning,
+                enabled = !state.isRunning && selectedResults > 0,
                 modifier = Modifier.weight(1f),
             ) {
                 Icon(Icons.Outlined.Refresh, contentDescription = null)
                 Spacer(Modifier.width(6.dp))
-                Text("重测全部")
+                Text("重测已选")
             }
             OutlinedButton(
                 onClick = onRetryFailed,
-                enabled = !state.isRunning && failed.isNotEmpty(),
+                enabled = !state.isRunning && selectedFailed.isNotEmpty(),
                 modifier = Modifier.weight(1f),
             ) {
-                Text("重测失败项")
+                Text("重测已选失败")
             }
         }
         Row(
@@ -1323,6 +1792,9 @@ private fun SectionTitle(title: String, subtitle: String) {
             subtitle,
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            softWrap = false,
+            overflow = TextOverflow.Ellipsis,
         )
     }
 }
@@ -1435,10 +1907,21 @@ private fun StatusLabel(status: TestStatus, isFetchedOnly: Boolean = false) {
     Text(label, style = MaterialTheme.typography.labelMedium, color = color)
 }
 
+private fun failureSummary(result: ModelTestResult): String {
+    val kind = result.error?.kind?.label ?: "请求失败"
+    return result.httpStatus?.let { "HTTP $it · $kind" } ?: kind
+}
+
 private fun protocolDescription(protocol: RelayProtocol): String = when (protocol) {
     RelayProtocol.CHAT_COMPLETIONS -> "POST /chat/completions · Authorization: Bearer"
     RelayProtocol.RESPONSES -> "POST /responses · Authorization: Bearer"
     RelayProtocol.ANTHROPIC -> "POST /messages · x-api-key + anthropic-version"
+}
+
+private fun protocolShortLabel(protocol: RelayProtocol): String = when (protocol) {
+    RelayProtocol.CHAT_COMPLETIONS -> "C"
+    RelayProtocol.RESPONSES -> "R"
+    RelayProtocol.ANTHROPIC -> "A"
 }
 
 private fun finishReasonLabel(value: String): String = when (value) {
@@ -1458,4 +1941,505 @@ private fun copyNames(context: Context, label: String, values: List<String>) {
     val clipboard = context.getSystemService(ClipboardManager::class.java)
     clipboard.setPrimaryClip(ClipData.newPlainText(label, values.joinToString("\n")))
     Toast.makeText(context, "已复制 " + values.size + " 个" + label, Toast.LENGTH_SHORT).show()
+}
+
+/**
+ * Cross-supplier model directory. It is intentionally a dialog so the existing
+ * supplier/test form remains untouched and users can configure sources without
+ * losing their current scroll position or test selection.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ModelCatalogDialog(
+    state: TesterUiState,
+    onDismiss: () -> Unit,
+    onFetchModels: (String) -> Unit,
+    onClearPicker: () -> Unit,
+    onSaveEntry: (String?, String, List<ModelSource>) -> Unit,
+    onDeleteEntry: (String) -> Unit,
+    onRunEntry: (String) -> Unit,
+    onCancelRun: () -> Unit,
+) {
+    var editingEntryId by rememberSaveable { mutableStateOf<String?>(null) }
+    var entryName by rememberSaveable { mutableStateOf("") }
+    var selectedSupplierId by rememberSaveable { mutableStateOf(state.suppliers.firstOrNull()?.id) }
+    var selectedModel by rememberSaveable { mutableStateOf("") }
+    var pendingSources by remember { mutableStateOf<List<ModelSource>>(emptyList()) }
+    var sourceToDelete by remember { mutableStateOf<ModelSource?>(null) }
+    var entryToDeleteId by remember { mutableStateOf<String?>(null) }
+    var supplierMenuExpanded by rememberSaveable { mutableStateOf(false) }
+    var modelMenuExpanded by rememberSaveable { mutableStateOf(false) }
+    val selectedSupplier = state.suppliers.firstOrNull { it.id == selectedSupplierId }
+    val pickerModels = state.catalogPickerModels
+    val unifiedByEntry = state.unifiedResults.groupBy { it.entryId }
+    val editingEnabled = !state.isUnifiedTesting
+    val entryNameError = if (entryName.length > 256) "模型名称不能超过 256 个字符" else null
+    val sourceLimitReached = pendingSources.size >= MAX_MODEL_SOURCES_PER_ENTRY
+    val canAddSource = editingEnabled && !sourceLimitReached &&
+        selectedSupplierId != null && selectedModel.isNotBlank()
+    val canSave = editingEnabled &&
+        entryName.trim().isNotEmpty() &&
+        entryNameError == null &&
+        pendingSources.isNotEmpty()
+
+    fun resetDraft() {
+        editingEntryId = null
+        entryName = ""
+        selectedModel = ""
+        pendingSources = emptyList()
+        onClearPicker()
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(
+            usePlatformDefaultWidth = false,
+            decorFitsSystemWindows = false,
+        ),
+    ) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth(0.94f)
+                .fillMaxHeight(0.9f),
+            shape = MaterialTheme.shapes.extraLarge,
+            tonalElevation = 6.dp,
+            shadowElevation = 10.dp,
+        ) {
+            Column(modifier = Modifier.fillMaxSize()) {
+                Column(
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(
+                        if (editingEntryId == null) "高级测试" else "编辑模型来源",
+                        style = MaterialTheme.typography.headlineSmall,
+                    )
+                    Text(
+                        "为同一模型配置多个供应商来源，并单独检查连接状态、延迟和用量。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                HorizontalDivider()
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .verticalScroll(rememberScrollState())
+                        .padding(horizontal = 20.dp, vertical = 16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    AppTextField(
+                        value = entryName,
+                        onValueChange = { entryName = it },
+                        label = "模型名称",
+                        placeholder = "例如 GPT-4o（主用）",
+                        enabled = editingEnabled,
+                        errorMessage = entryNameError,
+                    )
+                    Text("添加供应商来源", style = MaterialTheme.typography.titleSmall)
+                    Box(modifier = Modifier.fillMaxWidth()) {
+                        OutlinedButton(
+                            onClick = { supplierMenuExpanded = true },
+                            enabled = editingEnabled && !state.isCatalogFetching && state.suppliers.isNotEmpty(),
+                            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                        ) {
+                            Text(
+                                selectedSupplier?.name ?: "选择供应商",
+                                modifier = Modifier.weight(1f),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text("选择")
+                        }
+                        DropdownMenu(
+                            expanded = supplierMenuExpanded,
+                            onDismissRequest = { supplierMenuExpanded = false },
+                            modifier = Modifier.heightIn(max = 280.dp),
+                        ) {
+                            state.suppliers.forEach { supplier ->
+                                DropdownMenuItem(
+                                    text = { Text(supplier.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                                    onClick = {
+                                        supplierMenuExpanded = false
+                                        selectedSupplierId = supplier.id
+                                        selectedModel = ""
+                                        onClearPicker()
+                                    },
+                                )
+                            }
+                        }
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(modifier = Modifier.weight(1f)) {
+                            OutlinedButton(
+                                onClick = { modelMenuExpanded = true },
+                                enabled = editingEnabled && !state.isCatalogFetching && pickerModels.isNotEmpty() &&
+                                    state.catalogPickerSupplierId == selectedSupplierId,
+                                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                            ) {
+                                Text(
+                                    selectedModel.ifBlank { "先拉取模型列表" },
+                                    modifier = Modifier.weight(1f),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                Text("选择")
+                            }
+                            DropdownMenu(
+                                expanded = modelMenuExpanded,
+                                onDismissRequest = { modelMenuExpanded = false },
+                                modifier = Modifier.heightIn(max = 280.dp),
+                            ) {
+                                pickerModels.forEach { model ->
+                                    DropdownMenuItem(
+                                        text = { Text(model, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                                        onClick = {
+                                            selectedModel = model
+                                            modelMenuExpanded = false
+                                        },
+                                    )
+                                }
+                            }
+                        }
+                        OutlinedButton(
+                            onClick = { selectedSupplierId?.let(onFetchModels) },
+                            enabled = editingEnabled && selectedSupplierId != null && !state.isCatalogFetching,
+                            contentPadding = PaddingValues(horizontal = 8.dp),
+                            modifier = Modifier.widthIn(min = 96.dp, max = 100.dp).heightIn(min = 48.dp),
+                        ) {
+                            if (state.isCatalogFetching) {
+                                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                            } else {
+                                Icon(Icons.Outlined.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                            }
+                            Spacer(Modifier.width(4.dp))
+                            Text(
+                                if (state.isCatalogFetching) "拉取中" else "拉取",
+                                maxLines = 1,
+                                softWrap = false,
+                                overflow = TextOverflow.Clip,
+                            )
+                        }
+                    }
+                    if (pendingSources.isNotEmpty()) {
+                        Column(verticalArrangement = Arrangement.spacedBy(0.dp)) {
+                            Text(
+                                "已添加 ${pendingSources.size} / $MAX_MODEL_SOURCES_PER_ENTRY 个来源",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (sourceLimitReached) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(bottom = 4.dp),
+                            )
+                            pendingSources.forEachIndexed { index, source ->
+                                if (index > 0) HorizontalDivider()
+                                val supplierName = state.suppliers.firstOrNull { it.id == source.supplierId }?.name ?: "已删除供应商"
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text(
+                                        "$supplierName · ${source.modelId}",
+                                        modifier = Modifier.weight(1f),
+                                        style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                    IconButton(
+                                        onClick = { sourceToDelete = source },
+                                        enabled = editingEnabled,
+                                        modifier = Modifier.size(44.dp),
+                                    ) {
+                                        Icon(Icons.Outlined.DeleteOutline, contentDescription = "移除来源", modifier = Modifier.size(20.dp))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    HorizontalDivider()
+                    Text("已配置模型", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "${state.modelCatalog.size} 个模型 · ${state.modelCatalog.sumOf { it.sources.size }} 个供应商来源",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    if (state.isUnifiedTesting && state.unifiedProgressTotal > 0) {
+                        LinearProgressIndicator(
+                            progress = { state.unifiedProgressDone.toFloat() / state.unifiedProgressTotal },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Text(
+                            "正在测试 ${state.unifiedProgressDone} / ${state.unifiedProgressTotal} 个来源",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    if (state.modelCatalog.isEmpty()) {
+                        Text(
+                            "尚未配置跨供应商模型。先选择供应商并拉取模型列表，再添加来源。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    } else {
+                        Column(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            state.modelCatalog.forEach { entry ->
+                                val isTesting = state.isUnifiedTesting && state.unifiedEntryId == entry.id
+                                ModelCatalogEntryCard(
+                                    entry = entry,
+                                    suppliers = state.suppliers,
+                                    results = unifiedByEntry[entry.id].orEmpty(),
+                                    enabled = !state.isUnifiedTesting,
+                                    isTesting = isTesting,
+                                    onEdit = {
+                                        editingEntryId = entry.id
+                                        entryName = entry.name
+                                        pendingSources = entry.sources
+                                        selectedSupplierId = entry.sources.firstOrNull()?.supplierId ?: state.suppliers.firstOrNull()?.id
+                                        selectedModel = ""
+                                        onClearPicker()
+                                    },
+                                    onRun = { onRunEntry(entry.id) },
+                                    onCancel = onCancelRun,
+                                    onDelete = { entryToDeleteId = entry.id },
+                                )
+                            }
+                        }
+                    }
+                }
+                HorizontalDivider()
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    TextButton(onClick = onDismiss, modifier = Modifier.heightIn(min = 48.dp)) { Text("关闭") }
+                    Spacer(Modifier.weight(1f))
+                    OutlinedButton(
+                        onClick = {
+                            val supplierId = selectedSupplierId
+                            if (supplierId != null && selectedModel.isNotBlank()) {
+                                pendingSources = (pendingSources + ModelSource(supplierId, selectedModel))
+                                    .distinctBy { it.supplierId + "\u0000" + it.modelId }
+                                selectedModel = ""
+                            }
+                        },
+                        enabled = canAddSource,
+                        contentPadding = PaddingValues(horizontal = 8.dp),
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) {
+                        Icon(Icons.Outlined.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(3.dp))
+                        Text("添加来源", maxLines = 1)
+                    }
+                    Button(
+                        onClick = {
+                            onSaveEntry(editingEntryId, entryName, pendingSources)
+                            resetDraft()
+                        },
+                        enabled = canSave,
+                        contentPadding = PaddingValues(horizontal = 10.dp),
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) { Text(if (editingEntryId == null) "保存模型来源" else "保存修改") }
+                }
+            }
+        }
+    }
+    sourceToDelete?.let { source ->
+        val supplierName = state.suppliers.firstOrNull { it.id == source.supplierId }?.name ?: "未知供应商"
+        AlertDialog(
+            onDismissRequest = { sourceToDelete = null },
+            title = { Text("移除供应商来源？") },
+            text = { Text("将移除“$supplierName · ${source.modelId}”，但不会影响已保存配置。") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        sourceToDelete = null
+                        pendingSources = pendingSources - source
+                    },
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) { Text("移除", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { sourceToDelete = null },
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) { Text("取消") }
+            },
+        )
+    }
+    entryToDeleteId?.let { entryId ->
+        val entry = state.modelCatalog.firstOrNull { it.id == entryId }
+        if (entry != null) {
+            AlertDialog(
+                onDismissRequest = { entryToDeleteId = null },
+                title = { Text("删除已配置模型？") },
+                text = { Text("“${entry.name}”及其供应商来源将被删除。此操作无法撤销。") },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            entryToDeleteId = null
+                            onDeleteEntry(entry.id)
+                            if (editingEntryId == entry.id) {
+                                resetDraft()
+                            }
+                        },
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) { Text("删除", color = MaterialTheme.colorScheme.error) }
+                },
+                dismissButton = {
+                    TextButton(
+                        onClick = { entryToDeleteId = null },
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) { Text("取消") }
+                },
+            )
+        }
+    }
+}
+
+@Composable
+private fun ModelCatalogEntryCard(
+    entry: ModelCatalogEntry,
+    suppliers: List<SupplierProfile>,
+    results: List<UnifiedModelTestResult>,
+    enabled: Boolean,
+    isTesting: Boolean,
+    onEdit: () -> Unit,
+    onRun: () -> Unit,
+    onCancel: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    OutlinedCard(
+        colors = CardDefaults.outlinedCardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+        ),
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    entry.name,
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
+                    maxLines = 1,
+                    softWrap = false,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                IconButton(onClick = onEdit, enabled = enabled, modifier = Modifier.size(44.dp)) {
+                    Icon(Icons.Outlined.Edit, contentDescription = "编辑模型来源", modifier = Modifier.size(20.dp))
+                }
+                IconButton(
+                    onClick = if (isTesting) onCancel else onRun,
+                    enabled = enabled || isTesting,
+                    modifier = Modifier.size(44.dp),
+                ) {
+                    Icon(
+                        if (isTesting) Icons.Outlined.StopCircle else Icons.Outlined.PlayArrow,
+                        contentDescription = if (isTesting) "取消测试 ${entry.name}" else "测试 ${entry.name}",
+                        modifier = Modifier.size(20.dp),
+                    )
+                }
+                IconButton(onClick = onDelete, enabled = enabled, modifier = Modifier.size(44.dp)) {
+                    Icon(Icons.Outlined.DeleteOutline, contentDescription = "删除模型来源配置", modifier = Modifier.size(20.dp))
+                }
+            }
+            Text(
+                "${entry.sources.size} 个供应商来源",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                softWrap = false,
+            )
+            entry.sources.forEachIndexed { index, source ->
+                if (index > 0) HorizontalDivider(modifier = Modifier.padding(vertical = 2.dp))
+                val supplierName = suppliers.firstOrNull { it.id == source.supplierId }
+                    ?.name
+                    ?: "已删除供应商"
+                val result = results.firstOrNull {
+                    it.supplierId == source.supplierId && it.sourceModel == source.modelId
+                }?.result
+                Row(
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 38.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        "$supplierName · ${source.modelId}",
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold),
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    if (result != null) {
+                        StatusLabel(result.status)
+                    } else {
+                        Text(
+                            "未测试",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                if (result != null) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        result.latencyMs?.let {
+                            Text(
+                                "${it}ms",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.tertiary,
+                                maxLines = 1,
+                            )
+                        }
+                        result.httpStatus?.let {
+                            Text(
+                                "HTTP $it",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (result.status == TestStatus.SUCCESS) {
+                                    Color(0xFF15803D)
+                                } else {
+                                    MaterialTheme.colorScheme.error
+                                },
+                                maxLines = 1,
+                            )
+                        }
+                        result.usage?.resolvedTotal?.takeIf { it > 0 }?.let {
+                            Text(
+                                "$it tok",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.secondary,
+                                maxLines = 1,
+                            )
+                        }
+                    }
+                }
+                result?.error?.message
+                    ?.takeIf { message -> message.isNotBlank() && message != result.error?.kind?.label }
+                    ?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        }
+    }
 }
