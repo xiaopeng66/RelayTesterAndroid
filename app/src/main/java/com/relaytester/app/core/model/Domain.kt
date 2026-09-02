@@ -39,16 +39,35 @@ data class SupplierProfile(
     }
 }
 
+/** A model source maps a user-facing model entry to one configured supplier. */
+@Immutable
+data class ModelSource(
+    val supplierId: String,
+    val modelId: String,
+)
+
+/** Cross-supplier model entry used by the unified connection check panel. */
+@Immutable
+data class ModelCatalogEntry(
+    val id: String,
+    val name: String,
+    val sources: List<ModelSource> = emptyList(),
+)
+
 /**
- * A deliberately small, declarative HTTP language for balance lookups.
+ * A deliberately small balance-query contract.
  *
- * Templates are data, not executable scripts. This lets users adapt to new
- * stations without giving a saved template permission to execute arbitrary
- * code on their phone.
+ * Form templates describe HTTP and JSON-path fields directly. Script templates
+ * use the constrained request/extractor contract enforced by [BalanceQueryMode].
  */
 enum class BalanceHttpMethod(val label: String) {
     GET("GET"),
     POST("POST"),
+}
+
+enum class BalanceQueryMode(val label: String) {
+    FORM("参数配置"),
+    SCRIPT("查询脚本"),
 }
 
 @Immutable
@@ -62,6 +81,9 @@ data class BalanceQueryTemplate(
     val id: String,
     val name: String,
     val description: String,
+    val queryMode: BalanceQueryMode = BalanceQueryMode.FORM,
+    /** A restricted JavaScript object expression used only when [queryMode] is SCRIPT. */
+    val scriptCode: String? = null,
     val method: BalanceHttpMethod,
     val endpointTemplate: String,
     val headers: List<BalanceTemplateHeader>,
@@ -148,7 +170,7 @@ data class TestSettings(
     val concurrency: Int = 2,
     val prompt: String = "ping",
     val keyword: String = "",
-    /** User-defined one-tap model filters. Selections remain screen-local. */
+    /** Legacy per-supplier copy retained for backward-compatible imports. */
     val quickFilterTerms: List<String> = emptyList(),
     val maxTokens: Int = 4,
     val retryCount: Int = 0,
@@ -162,11 +184,12 @@ private const val MAX_MODEL_FILTER_TERM_LENGTH = 128
 private const val MAX_QUICK_FILTER_TERMS = 16
 
 /**
- * Splits the model-search expression into OR terms. `|` is the documented
- * separator; accepting its full-width form keeps pasted Chinese input usable.
+ * Splits the model-search expression into OR terms. The primary separator is
+ * the English half-width comma; pipe variants remain accepted for backward
+ * compatibility with older saved configurations.
  */
 fun parseModelFilterTerms(value: String): List<String> = value
-    .split('|', '｜')
+    .split(',', '|', '，', '｜')
     .asSequence()
     .map(String::trim)
     .filter(String::isNotEmpty)

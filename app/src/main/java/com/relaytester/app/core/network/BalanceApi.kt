@@ -1,6 +1,7 @@
 package com.relaytester.app.core.network
 
 import com.relaytester.app.core.model.BalanceHttpMethod
+import com.relaytester.app.core.model.BalanceQueryMode
 import com.relaytester.app.core.model.BalanceQueryResult
 import com.relaytester.app.core.model.BalanceQueryTemplate
 import com.relaytester.app.core.model.BalanceSnapshot
@@ -32,6 +33,8 @@ class BalanceApi(
         .retryOnConnectionFailure(false)
         .build(),
 ) {
+    private val scriptRuntime = BalanceQueryScript()
+
     suspend fun query(
         profile: SupplierProfile,
         apiKey: String,
@@ -41,6 +44,15 @@ class BalanceApi(
     ): BalanceQueryResult {
         val validation = validateTemplate(template)
         if (validation != null) return BalanceQueryResult.Failure(validation)
+        if (template.queryMode == BalanceQueryMode.SCRIPT) {
+            return queryWithScript(
+                profile = profile,
+                apiKey = apiKey,
+                accessToken = accessToken,
+                userId = userId,
+                template = template,
+            )
+        }
         if (template.requiresPlaceholder("{{apiKey}}") && apiKey.isBlank()) {
             return BalanceQueryResult.Failure("该模板需要模型测试页保存的 API Key")
         }
@@ -121,6 +133,20 @@ class BalanceApi(
     /** Returns a display-safe validation message, never an expanded request or secret. */
     fun validateTemplate(template: BalanceQueryTemplate): String? {
         if (template.name.trim().isEmpty()) return "请填写模板名称"
+        if (template.queryMode == BalanceQueryMode.SCRIPT) {
+            val script = template.scriptCode.orEmpty()
+            val scriptError = scriptRuntime.validate(script)
+            if (scriptError != null) return scriptError
+            val request = runCatching { scriptRuntime.compileRequest(script) }
+                .getOrElse { return "查询脚本无效，请检查 request 与 extractor" }
+            if (containsUnsupportedPlaceholder(request.urlTemplate) ||
+                request.headers.values.any(::containsUnsupportedPlaceholder) ||
+                request.bodyTemplate?.let(::containsUnsupportedPlaceholder) == true
+            ) {
+                return "模板只支持 {{baseUrl}}、{{apiKey}}、{{accessToken}}、{{userId}} 和 {{nowEpochMs}} 占位符"
+            }
+            return validateHeaders(request.headers.map { BalanceTemplateHeader(it.key, it.value) })
+        }
         if (template.endpointTemplate.trim().isEmpty()) return "请填写请求地址"
         if (template.availablePath.trim().isEmpty()) return "请填写可用余额的 JSON 路径"
         if (!template.scaleDivisor.isFinite() || template.scaleDivisor <= 0) return "换算除数必须大于 0"
@@ -141,6 +167,89 @@ class BalanceApi(
         return validateHeaders(template.headers)
     }
 
+    private suspend fun queryWithScript(
+        profile: SupplierProfile,
+        apiKey: String,
+        accessToken: String,
+        userId: String,
+        template: BalanceQueryTemplate,
+    ): BalanceQueryResult {
+        return try {
+            val script = template.scriptCode.orEmpty()
+            val scriptRequest = scriptRuntime.compileRequest(script)
+            if (scriptRequest.requiresPlaceholder("{{apiKey}}") && apiKey.isBlank()) {
+                return BalanceQueryResult.Failure("该模板需要模型测试页保存的 API Key")
+            }
+            if (scriptRequest.requiresPlaceholder("{{accessToken}}") && accessToken.isBlank()) {
+                return BalanceQueryResult.Failure("请先配置余额查询访问令牌（PAT）")
+            }
+            val baseUrl = profile.baseUrl.trim().toHttpUrlOrNull()
+                ?.takeIf { it.isHttps }
+                ?: return BalanceQueryResult.Failure("Base URL 必须是有效的 HTTPS 地址")
+            val endpoint = resolveEndpoint(
+                baseUrl,
+                scriptRequest.urlTemplate,
+                apiKey,
+                accessToken,
+                userId,
+            ) ?: return BalanceQueryResult.Failure("模板地址无效，或目标主机与供应商不一致")
+            val headers = scriptRequest.headers.map { BalanceTemplateHeader(it.key, it.value) }
+            validateHeaders(headers)?.let { return BalanceQueryResult.Failure(it) }
+            val request = buildResolvedRequest(
+                endpoint = endpoint,
+                baseUrl = baseUrl,
+                apiKey = apiKey,
+                accessToken = accessToken,
+                userId = userId,
+                method = if (scriptRequest.method == "POST") BalanceHttpMethod.POST else BalanceHttpMethod.GET,
+                headers = headers,
+                requestBodyTemplate = scriptRequest.bodyTemplate,
+            )
+            val startedAt = System.nanoTime()
+            val response = execute(request, profile.testSettings.timeoutSeconds)
+            val latencyMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+            response.use { safeResponse ->
+                if (safeResponse.code !in 200..299) {
+                    return BalanceQueryResult.Failure(
+                        message = "站点返回 HTTP ${safeResponse.code}",
+                        httpStatus = safeResponse.code,
+                    )
+                }
+                val body = safeResponse.readLimitedBody()
+                parseJson(body) ?: return BalanceQueryResult.Failure("站点未返回有效 JSON")
+                val extracted = scriptRuntime.extract(script, body)
+                BalanceQueryResult.Success(
+                    BalanceSnapshot(
+                        supplierId = profile.id,
+                        templateId = template.id,
+                        templateName = template.name,
+                        availableRaw = extracted.remaining,
+                        usedRaw = extracted.used,
+                        totalRaw = extracted.total,
+                        currency = extracted.currency,
+                        planName = extracted.planName,
+                        unitLabel = extracted.unit,
+                        scaleDivisor = 1.0,
+                        checkedAt = System.currentTimeMillis(),
+                        latencyMs = latencyMs,
+                    ),
+                )
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: BalanceScriptException) {
+            BalanceQueryResult.Failure(error.message ?: "查询脚本无效")
+        } catch (error: TemplateException) {
+            BalanceQueryResult.Failure(error.message ?: "模板配置无效")
+        } catch (error: InterruptedIOException) {
+            BalanceQueryResult.Failure("查询超时，请检查站点或提高超时设置")
+        } catch (error: IOException) {
+            BalanceQueryResult.Failure("网络连接失败，请检查站点地址和网络")
+        } catch (_: Throwable) {
+            BalanceQueryResult.Failure("余额查询失败，请检查查询脚本与站点配置")
+        }
+    }
+
     private fun buildRequest(
         endpoint: HttpUrl,
         baseUrl: HttpUrl,
@@ -148,9 +257,29 @@ class BalanceApi(
         accessToken: String,
         userId: String,
         template: BalanceQueryTemplate,
+    ): Request = buildResolvedRequest(
+        endpoint = endpoint,
+        baseUrl = baseUrl,
+        apiKey = apiKey,
+        accessToken = accessToken,
+        userId = userId,
+        method = template.method,
+        headers = template.headers,
+        requestBodyTemplate = template.requestBodyTemplate,
+    )
+
+    private fun buildResolvedRequest(
+        endpoint: HttpUrl,
+        baseUrl: HttpUrl,
+        apiKey: String,
+        accessToken: String,
+        userId: String,
+        method: BalanceHttpMethod,
+        headers: List<BalanceTemplateHeader>,
+        requestBodyTemplate: String?,
     ): Request {
         val builder = Request.Builder().url(endpoint)
-        template.headers.forEach { header ->
+        headers.forEach { header ->
             val resolvedValue = resolvePlaceholders(
                 header.valueTemplate,
                 baseUrl,
@@ -165,11 +294,11 @@ class BalanceApi(
                 builder.header(header.name.trim(), resolvedValue)
             }
         }
-        return when (template.method) {
+        return when (method) {
             BalanceHttpMethod.GET -> builder.get().build()
             BalanceHttpMethod.POST -> {
                 val requestBody = resolvePlaceholders(
-                    template.requestBodyTemplate.orEmpty(),
+                    requestBodyTemplate.orEmpty(),
                     baseUrl,
                     apiKey,
                     accessToken,
@@ -247,6 +376,12 @@ class BalanceApi(
         add(endpointTemplate)
         addAll(headers.map { it.valueTemplate })
         requestBodyTemplate?.let(::add)
+    }.any { it.contains(placeholder) }
+
+    private fun BalanceQueryScript.RequestSpec.requiresPlaceholder(placeholder: String): Boolean = buildList {
+        add(urlTemplate)
+        addAll(headers.values)
+        bodyTemplate?.let(::add)
     }.any { it.contains(placeholder) }
 
     private suspend fun execute(request: Request, timeoutSeconds: Int): Response {

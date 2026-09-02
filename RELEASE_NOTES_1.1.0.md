@@ -28,4 +28,4 @@
 - `app-optimized.apk` 已在隔离的 `RelayTesterApi35` API 35 模拟器上通过 `adb install -r` 覆盖安装，主界面和余额查询页均正常渲染。
 - 连续 5 次冷启动耗时为 359–470 ms，崩溃缓冲为空，未发现 ANR；验证未调用真实模型或余额 API，也未导入、导出或清除数据。
 - 优化 APK 大小为 1,602,377 bytes，SHA-256：`80B2A7188822EC9F1878FDB9A17A98F9484874B4427C8ADBEE79847D133D1DA0`。
-- 正式 release APK 仍未使用发布签名密钥，因此不会作为 Release 附件上传。
+- 本次 GitHub Release 附件使用 R8 与资源收缩后的 `RelayTester-1.1.0.apk`（debug 签名、体验包包名），正式 release APK 仍未使用发布签名密钥。

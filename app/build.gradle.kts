@@ -16,6 +16,9 @@ android {
         // Encode the public line as major * 10_000 + minor * 100 + patch.
         versionCode = 10_100
         versionName = "1.1.0"
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
     }
 
     buildFeatures {
@@ -78,6 +81,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("io.github.taoweiji.quickjs:quickjs-android:1.4.6")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

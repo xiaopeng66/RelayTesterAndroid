@@ -2,9 +2,14 @@ package com.relaytester.app.feature.balance
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -30,6 +35,7 @@ import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Edit
+import androidx.compose.material.icons.outlined.EditNote
 import androidx.compose.material.icons.outlined.ExpandMore
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Refresh
@@ -85,6 +91,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.relaytester.app.core.model.BalanceHttpMethod
+import com.relaytester.app.core.model.BalanceQueryMode
 import com.relaytester.app.core.model.BalanceQueryTemplate
 import com.relaytester.app.core.model.BalanceSnapshot
 import com.relaytester.app.core.model.SupplierProfile
@@ -101,7 +108,8 @@ import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
 
-private val BALANCE_SUPPLIER_CARD_HEIGHT = 124.dp
+private val BALANCE_RING_SLOT_SIZE = 44.dp
+private val BALANCE_RING_DIAMETER = 36.dp
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -134,6 +142,8 @@ fun BalanceScreen(
             isQuerying = state.isQuerying,
             onBack = viewModel::dismissBalanceTemplateEditor,
             onUpdate = viewModel::updateBalanceTemplate,
+            onModeChange = viewModel::updateBalanceTemplateMode,
+            onRestoreDefaultScript = viewModel::restoreDefaultBalanceScript,
             onMethodChange = viewModel::updateBalanceTemplateMethod,
             onDerivedTotalChange = viewModel::updateBalanceTemplateDerivedTotal,
             onSave = { viewModel.saveBalanceTemplate(queryAfterSave = false) },
@@ -150,6 +160,7 @@ fun BalanceScreen(
             onQuery = viewModel::queryBalance,
             onQueryAll = viewModel::queryAllBalances,
             onSelectSupplier = viewModel::selectSupplier,
+            onRefreshSupplierBalance = viewModel::refreshSupplierBalance,
             onAccessTokenChange = viewModel::updateBalanceAccessToken,
             onUserIdChange = viewModel::updateBalanceUserId,
             onSaveCredentials = viewModel::saveBalanceCredentials,
@@ -175,6 +186,7 @@ private fun BalanceHome(
     onQuery: () -> Unit,
     onQueryAll: () -> Unit,
     onSelectSupplier: (String) -> Unit,
+    onRefreshSupplierBalance: (String) -> Unit,
     onAccessTokenChange: (String) -> Unit,
     onUserIdChange: (String) -> Unit,
     onSaveCredentials: () -> Unit,
@@ -188,6 +200,7 @@ private fun BalanceHome(
     modifier: Modifier,
 ) {
     var templateToDelete by remember { mutableStateOf<BalanceQueryTemplate?>(null) }
+    var credentialsSupplierId by rememberSaveable { mutableStateOf<String?>(null) }
     val activeSupplier = state.suppliers.firstOrNull { it.id == state.activeSupplierId }
     val selectedTemplate = state.templates.firstOrNull { it.id == activeSupplier?.balanceTemplateId }
         ?: state.templates.firstOrNull()
@@ -217,8 +230,6 @@ private fun BalanceHome(
                 activeSupplier = activeSupplier,
                 selectedTemplate = selectedTemplate,
                 templates = state.templates,
-                credentials = state.credentials,
-                credentialErrors = state.credentialErrors,
                 snapshots = state.balanceSnapshots,
                 errors = state.balanceErrors,
                 isQuerying = isQuerying,
@@ -229,9 +240,11 @@ private fun BalanceHome(
                 onQuery = onQuery,
                 onQueryAll = onQueryAll,
                 onSelectSupplier = onSelectSupplier,
-                onAccessTokenChange = onAccessTokenChange,
-                onUserIdChange = onUserIdChange,
-                onSaveCredentials = onSaveCredentials,
+                onRefreshSupplierBalance = onRefreshSupplierBalance,
+                onEditCredentials = { supplierId ->
+                    credentialsSupplierId = supplierId
+                    onSelectSupplier(supplierId)
+                },
                 onTemplateSelected = onTemplateSelected,
                 onNewTemplate = onNewTemplate,
                 onEditTemplate = onEditTemplate,
@@ -263,6 +276,20 @@ private fun BalanceHome(
             },
         )
     }
+    credentialsSupplierId?.let { supplierId ->
+        if (activeSupplier?.id == supplierId && !isSecretsHydrating) {
+            BalanceCredentialsDialog(
+                supplierName = activeSupplier.name,
+                credentials = state.credentials,
+                errors = state.credentialErrors,
+                enabled = !isQuerying,
+                onDismiss = { credentialsSupplierId = null },
+                onAccessTokenChange = onAccessTokenChange,
+                onUserIdChange = onUserIdChange,
+                onSave = onSaveCredentials,
+            )
+        }
+    }
 }
 
 @Composable
@@ -271,8 +298,6 @@ private fun BalanceContent(
     activeSupplier: SupplierProfile?,
     selectedTemplate: BalanceQueryTemplate?,
     templates: List<BalanceQueryTemplate>,
-    credentials: BalanceCredentialsDraft,
-    credentialErrors: BalanceCredentialsErrors,
     snapshots: Map<String, BalanceSnapshot>,
     errors: Map<String, String>,
     isQuerying: Boolean,
@@ -283,9 +308,8 @@ private fun BalanceContent(
     onQuery: () -> Unit,
     onQueryAll: () -> Unit,
     onSelectSupplier: (String) -> Unit,
-    onAccessTokenChange: (String) -> Unit,
-    onUserIdChange: (String) -> Unit,
-    onSaveCredentials: () -> Unit,
+    onRefreshSupplierBalance: (String) -> Unit,
+    onEditCredentials: (String) -> Unit,
     onTemplateSelected: (String) -> Unit,
     onNewTemplate: () -> Unit,
     onEditTemplate: (String) -> Unit,
@@ -293,7 +317,7 @@ private fun BalanceContent(
     contentPadding: PaddingValues,
 ) {
     LazyVerticalGrid(
-        columns = GridCells.Fixed(2),
+        columns = GridCells.Fixed(1),
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(
             start = 16.dp,
@@ -323,15 +347,22 @@ private fun BalanceContent(
             key = { it.id },
             contentType = { "supplier_balance" },
         ) { supplier ->
-            BalanceSupplierCard(
-                supplier = supplier,
-                snapshot = snapshots[supplier.id],
-                errorMessage = errors[supplier.id],
-                selected = supplier.id == activeSupplier?.id,
-                isQuerying = supplier.id in queryingSupplierIds,
-                enabled = !isSecretsHydrating,
-                onClick = { onSelectSupplier(supplier.id) },
-            )
+            Box(modifier = Modifier.fillMaxWidth()) {
+                BalanceSupplierCard(
+                    modifier = Modifier
+                        .widthIn(max = 336.dp)
+                        .align(Alignment.Center),
+                    supplier = supplier,
+                    snapshot = snapshots[supplier.id],
+                    errorMessage = errors[supplier.id],
+                    selected = supplier.id == activeSupplier?.id,
+                    isQuerying = supplier.id in queryingSupplierIds,
+                    enabled = !isSecretsHydrating,
+                    onClick = { onSelectSupplier(supplier.id) },
+                    onDoubleClick = { onRefreshSupplierBalance(supplier.id) },
+                    onEditCredentials = { onEditCredentials(supplier.id) },
+                )
+            }
         }
         if (isSecretsHydrating) {
             item(
@@ -345,21 +376,6 @@ private fun BalanceContent(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-        }
-        item(
-            key = "balance_credentials",
-            span = { GridItemSpan(maxLineSpan) },
-            contentType = "balance_credentials",
-        ) {
-            BalanceCredentialsCard(
-                supplierName = activeSupplier?.name,
-                credentials = credentials,
-                errors = credentialErrors,
-                enabled = !isQuerying && !isSecretsHydrating,
-                onAccessTokenChange = onAccessTokenChange,
-                onUserIdChange = onUserIdChange,
-                onSave = onSaveCredentials,
-            )
         }
         item(
             key = "balance_result",
@@ -411,17 +427,7 @@ private fun BalanceOverviewHeader(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
-                Column(
-                    modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(2.dp),
-                ) {
-                    Text("全部站点余额", style = MaterialTheme.typography.titleMedium)
-                    Text(
-                        "选择卡片后配置该站点凭据。",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
+                Text("全部站点余额", style = MaterialTheme.typography.titleMedium)
                 Spacer(Modifier.width(12.dp))
                 Text(
                     "$supplierCount 个站点",
@@ -437,29 +443,26 @@ private fun BalanceOverviewHeader(
             Button(
                 onClick = onQueryAll,
                 enabled = supplierCount > 0 && !isQuerying && enabled,
-                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
             ) {
-                Icon(
-                    imageVector = Icons.Outlined.Refresh,
-                    contentDescription = null,
-                )
+                Icon(Icons.Outlined.Refresh, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
                 Text(
-                    if (isQuerying && progressTotal > 1) {
-                        "正在查询 $progressDone / $progressTotal"
-                    } else if (isQuerying) {
-                        "正在查询…"
-                    } else {
-                        "批量查询余额"
-                    },
+                    if (isQuerying && progressTotal > 1) "正在查询 $progressDone / $progressTotal"
+                    else if (isQuerying) "正在查询…"
+                    else "批量查询余额",
+                    maxLines = 1,
+                    softWrap = false,
                 )
             }
         }
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun BalanceSupplierCard(
+    modifier: Modifier = Modifier,
     supplier: SupplierProfile,
     snapshot: BalanceSnapshot?,
     errorMessage: String?,
@@ -467,6 +470,8 @@ private fun BalanceSupplierCard(
     isQuerying: Boolean,
     enabled: Boolean,
     onClick: () -> Unit,
+    onDoubleClick: () -> Unit,
+    onEditCredentials: () -> Unit,
 ) {
     val statusColor = when {
         errorMessage != null -> MaterialTheme.colorScheme.error
@@ -474,21 +479,17 @@ private fun BalanceSupplierCard(
         else -> MaterialTheme.colorScheme.onSurfaceVariant
     }
     OutlinedCard(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
-            .height(BALANCE_SUPPLIER_CARD_HEIGHT)
-            .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
-            .clearAndSetSemantics {
+            .combinedClickable(
+                enabled = enabled,
+                role = Role.Button,
+                onClick = onClick,
+                onDoubleClick = onDoubleClick,
+            )
+            .semantics {
                 this.selected = selected
-                contentDescription = "选择供应商 ${supplier.name}"
-                if (enabled) {
-                    onClick(label = "选择供应商") {
-                        onClick()
-                        true
-                    }
-                } else {
-                    disabled()
-                }
+                contentDescription = "供应商 ${supplier.name}；双击查询余额"
             },
         colors = androidx.compose.material3.CardDefaults.outlinedCardColors(
             containerColor = if (selected) {
@@ -497,59 +498,54 @@ private fun BalanceSupplierCard(
                 MaterialTheme.colorScheme.surface
             },
         ),
+        border = BorderStroke(
+            1.dp,
+            if (selected || isQuerying) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
+        ),
     ) {
-        Column(
+        Box(
             modifier = Modifier
-                .fillMaxSize()
-                .padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
+                .fillMaxWidth()
+                .heightIn(min = 118.dp),
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 8.dp)
+                    .padding(end = 50.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
-                Text(
-                    text = supplier.name,
-                    modifier = Modifier.weight(1f),
-                    style = MaterialTheme.typography.titleSmall,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                if (isQuerying) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(32.dp),
-                        strokeWidth = 2.dp,
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(36.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = supplier.name,
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.titleSmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                     )
-                } else {
-                    UsageRing(snapshot = snapshot, hasError = errorMessage != null)
                 }
-            }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(
+                Row(
                     modifier = Modifier.fillMaxWidth(),
-                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
                 ) {
                     BalanceCardMetric(
                         label = "可用",
                         value = snapshot?.formatValue(snapshot.availableRaw) ?: "—",
                         valueColor = MaterialTheme.colorScheme.tertiary,
+                        modifier = Modifier.weight(1f),
                     )
                     BalanceCardMetric(
                         label = "总额",
                         value = snapshot?.totalRaw?.let(snapshot::formatValue) ?: "—",
                         valueColor = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.weight(1f),
                     )
                 }
-            }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
                 Text(
                     text = when {
                         isQuerying -> "正在查询…"
@@ -559,18 +555,63 @@ private fun BalanceSupplierCard(
                         supplier.baseUrl.isBlank() -> "需要配置站点地址"
                         else -> "尚未查询"
                     },
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier.fillMaxWidth(),
                     style = MaterialTheme.typography.labelSmall,
                     color = statusColor,
-                    maxLines = 1,
+                    maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                 )
-                if (selected) {
-                    Text(
-                        "已选",
-                        style = MaterialTheme.typography.labelSmall,
+            }
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(top = 2.dp, end = 2.dp)
+                    .size(BALANCE_RING_SLOT_SIZE),
+                contentAlignment = Alignment.Center,
+            ) {
+                if (isQuerying) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(30.dp),
+                        strokeWidth = 2.5.dp,
                         color = MaterialTheme.colorScheme.primary,
                     )
+                } else {
+                    UsageRing(
+                        snapshot = snapshot,
+                        hasError = errorMessage != null,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
+            }
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .size(48.dp)
+                    .clickable(
+                        enabled = enabled,
+                        role = Role.Button,
+                        onClick = onEditCredentials,
+                    )
+                    .semantics { contentDescription = "编辑 ${supplier.name} 查询凭据" },
+                contentAlignment = Alignment.BottomEnd,
+            ) {
+                Surface(
+                    modifier = Modifier.padding(end = 2.dp, bottom = 2.dp).size(28.dp),
+                    shape = MaterialTheme.shapes.extraSmall,
+                    color = if (selected) {
+                        MaterialTheme.colorScheme.primaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.surfaceVariant
+                    },
+                    contentColor = if (selected) {
+                        MaterialTheme.colorScheme.onPrimaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                ) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Icon(Icons.Outlined.EditNote, contentDescription = null, modifier = Modifier.size(18.dp))
+                    }
                 }
             }
         }
@@ -582,10 +623,11 @@ private fun BalanceCardMetric(
     label: String,
     value: String,
     valueColor: androidx.compose.ui.graphics.Color,
+    modifier: Modifier = Modifier,
 ) {
     Column(
-        modifier = Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(0.dp),
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(2.dp),
     ) {
         Text(
             text = label,
@@ -603,7 +645,11 @@ private fun BalanceCardMetric(
 }
 
 @Composable
-private fun UsageRing(snapshot: BalanceSnapshot?, hasError: Boolean) {
+private fun UsageRing(
+    snapshot: BalanceSnapshot?,
+    hasError: Boolean,
+    modifier: Modifier = Modifier,
+) {
     val usedFraction = snapshot?.let { value ->
         val total = value.totalRaw
         val used = value.usedRaw
@@ -622,10 +668,10 @@ private fun UsageRing(snapshot: BalanceSnapshot?, hasError: Boolean) {
     // ring remains visible in both themes.
     val trackColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.45f)
     Box(
-        modifier = Modifier.size(36.dp),
+        modifier = modifier,
         contentAlignment = Alignment.Center,
     ) {
-        Canvas(modifier = Modifier.size(32.dp)) {
+        Canvas(modifier = Modifier.size(BALANCE_RING_DIAMETER)) {
             val stroke = Stroke(width = 3.5.dp.toPx(), cap = StrokeCap.Round)
             drawArc(
                 color = trackColor,
@@ -653,105 +699,132 @@ private fun UsageRing(snapshot: BalanceSnapshot?, hasError: Boolean) {
 }
 
 @Composable
-private fun BalanceCredentialsCard(
-    supplierName: String?,
+private fun BalanceCredentialsDialog(
+    supplierName: String,
     credentials: BalanceCredentialsDraft,
     errors: BalanceCredentialsErrors,
     enabled: Boolean,
+    onDismiss: () -> Unit,
     onAccessTokenChange: (String) -> Unit,
     onUserIdChange: (String) -> Unit,
     onSave: () -> Unit,
 ) {
-    var revealAccessToken by rememberSaveable(supplierName) { mutableStateOf(false) }
-    ElevatedCard(modifier = Modifier.fillMaxWidth()) {
-        Column(
-            modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            Text(
-                "余额查询凭据",
-                style = MaterialTheme.typography.titleMedium,
-            )
-            supplierName?.let { name ->
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text("余额查询凭据")
                 Text(
-                    name,
+                    supplierName,
                     style = MaterialTheme.typography.labelLarge,
                     color = MaterialTheme.colorScheme.primary,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
             }
-            Text(
-                "余额访问令牌可与模型测试 API Key 不同，并会加密保存在本机。",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            if (supplierName == null) {
-                Text(
-                    "请先在“模型测试”页创建站点。",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.error,
-                )
-            } else {
-                OutlinedTextField(
-                    value = credentials.accessToken,
-                    onValueChange = onAccessTokenChange,
-                    modifier = Modifier.fillMaxWidth(),
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 360.dp)
+                    .verticalScroll(rememberScrollState()),
+            ) {
+                BalanceCredentialsForm(
+                    supplierName = supplierName,
+                    credentials = credentials,
+                    errors = errors,
                     enabled = enabled,
-                    label = { Text("余额查询访问令牌（PAT）") },
-                    placeholder = { Text("用于 Authorization: Bearer …") },
-                    singleLine = true,
-                    isError = errors.accessToken != null,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                    visualTransformation = if (revealAccessToken) {
-                        VisualTransformation.None
-                    } else {
-                        PasswordVisualTransformation()
-                    },
-                    trailingIcon = {
-                        IconButton(
-                            onClick = { revealAccessToken = !revealAccessToken },
-                            enabled = enabled,
-                        ) {
-                            Icon(
-                                imageVector = if (revealAccessToken) {
-                                    Icons.Outlined.VisibilityOff
-                                } else {
-                                    Icons.Outlined.Visibility
-                                },
-                                contentDescription = if (revealAccessToken) "隐藏访问令牌" else "显示访问令牌",
-                            )
-                        }
-                    },
+                    onAccessTokenChange = onAccessTokenChange,
+                    onUserIdChange = onUserIdChange,
                 )
-                CredentialHelperText(
-                    text = errors.accessToken
-                        ?: "仅用于余额接口，保存后受 Android Keystore 保护。",
-                    isError = errors.accessToken != null,
-                )
-                OutlinedTextField(
-                    value = credentials.userId,
-                    onValueChange = onUserIdChange,
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = enabled,
-                    label = { Text("用户 ID（可选）") },
-                    placeholder = { Text("需要指定账户时填写") },
-                    singleLine = true,
-                    isError = errors.userId != null,
-                )
-                CredentialHelperText(
-                    text = errors.userId ?: "可留空；仅在站点要求指定账户时填写。",
-                    isError = errors.userId != null,
-                )
-                OutlinedButton(
-                    onClick = onSave,
-                    enabled = enabled,
-                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-                ) {
-                    Text("保存余额查询凭据")
-                }
             }
-        }
+        },
+        confirmButton = {
+            Button(
+                onClick = onSave,
+                enabled = enabled,
+                modifier = Modifier.heightIn(min = 48.dp),
+            ) { Text("保存凭据") }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = onDismiss,
+                modifier = Modifier.heightIn(min = 48.dp),
+            ) { Text("关闭") }
+        },
+    )
+}
+
+@Composable
+private fun BalanceCredentialsForm(
+    supplierName: String,
+    credentials: BalanceCredentialsDraft,
+    errors: BalanceCredentialsErrors,
+    enabled: Boolean,
+    onAccessTokenChange: (String) -> Unit,
+    onUserIdChange: (String) -> Unit,
+) {
+    var revealAccessToken by rememberSaveable(supplierName) { mutableStateOf(false) }
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text(
+            "余额访问令牌可与模型测试 API Key 不同，并会加密保存在本机。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        OutlinedTextField(
+            value = credentials.accessToken,
+            onValueChange = onAccessTokenChange,
+            modifier = Modifier.fillMaxWidth(),
+            enabled = enabled,
+            label = { Text("余额查询访问令牌（PAT）") },
+            placeholder = { Text("用于 Authorization: Bearer …") },
+            singleLine = true,
+            isError = errors.accessToken != null,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+            visualTransformation = if (revealAccessToken) {
+                VisualTransformation.None
+            } else {
+                PasswordVisualTransformation()
+            },
+            trailingIcon = {
+                IconButton(
+                    onClick = { revealAccessToken = !revealAccessToken },
+                    enabled = enabled,
+                ) {
+                    Icon(
+                        imageVector = if (revealAccessToken) {
+                            Icons.Outlined.VisibilityOff
+                        } else {
+                            Icons.Outlined.Visibility
+                        },
+                        contentDescription = if (revealAccessToken) "隐藏访问令牌" else "显示访问令牌",
+                    )
+                }
+            },
+        )
+        CredentialHelperText(
+            text = errors.accessToken
+                ?: "仅用于余额接口，保存后受 Android Keystore 保护。",
+            isError = errors.accessToken != null,
+        )
+        OutlinedTextField(
+            value = credentials.userId,
+            onValueChange = onUserIdChange,
+            modifier = Modifier.fillMaxWidth(),
+            enabled = enabled,
+            label = { Text("用户 ID（可选）") },
+            placeholder = { Text("需要指定账户时填写") },
+            singleLine = true,
+            isError = errors.userId != null,
+        )
+        CredentialHelperText(
+            text = errors.userId ?: "可留空；仅在站点要求指定账户时填写。",
+            isError = errors.userId != null,
+        )
     }
 }
 
@@ -1076,7 +1149,7 @@ private fun TemplateSecuritySummary() {
         Text("安全边界", style = MaterialTheme.typography.labelLarge)
         TemplateSafetyBullet("HTTPS：只能访问当前站点的 HTTPS 地址。")
         TemplateSafetyBullet("凭据：API Key / PAT 仅在请求时注入，不写入模板或日志。")
-        TemplateSafetyBullet("模板：仅支持受限 HTTP 与 JSON 映射，不执行脚本或代码。")
+        TemplateSafetyBullet("脚本：只能描述同站请求与 JSON 映射，不能直接联网或访问设备能力。")
     }
 }
 
@@ -1113,6 +1186,8 @@ private fun BalanceTemplateEditor(
     isQuerying: Boolean,
     onBack: () -> Unit,
     onUpdate: (BalanceTemplateField, String) -> Unit,
+    onModeChange: (BalanceQueryMode) -> Unit,
+    onRestoreDefaultScript: () -> Unit,
     onMethodChange: (BalanceHttpMethod) -> Unit,
     onDerivedTotalChange: (Boolean) -> Unit,
     onSave: () -> Unit,
@@ -1129,7 +1204,7 @@ private fun BalanceTemplateEditor(
                     Column {
                         Text("余额模板编辑", style = MaterialTheme.typography.titleLarge)
                         Text(
-                            "保存的是受限 HTTP 配置，不执行任意代码",
+                            "参数配置或受限查询脚本，均由本机安全发起请求",
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -1160,7 +1235,11 @@ private fun BalanceTemplateEditor(
             item(key = "editor_intro") {
                 OutlinedCard(modifier = Modifier.fillMaxWidth()) {
                     Text(
-                        "先配置站点如何请求与读取余额；复杂的可选字段可在“高级响应映射”中展开。所有字段均可在保存后继续修改。",
+                        if (draft.queryMode == BalanceQueryMode.FORM) {
+                            "参数配置适合固定接口与 JSON 路径；复杂的可选字段可在“高级响应映射”中展开。"
+                        } else {
+                            "查询脚本采用 cc-switch 风格的 request + extractor 结构；网络请求仍由本机校验后执行。"
+                        },
                         modifier = Modifier.padding(16.dp),
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1186,6 +1265,29 @@ private fun BalanceTemplateEditor(
                     )
                 }
             }
+            item(key = "query_mode") {
+                EditorSection("配置方式") {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        BalanceQueryMode.entries.forEach { mode ->
+                            FilterChip(
+                                selected = draft.queryMode == mode,
+                                onClick = { onModeChange(mode) },
+                                label = { Text(mode.label) },
+                                modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                            )
+                        }
+                    }
+                    Text(
+                        "切换方式不会清除另一种配置，可随时切回继续编辑。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            if (draft.queryMode == BalanceQueryMode.FORM) {
             item(key = "request") {
                 EditorSection("请求配置") {
                     Text("请求方法", style = MaterialTheme.typography.labelLarge)
@@ -1311,6 +1413,48 @@ private fun BalanceTemplateEditor(
                             errorMessage = errors.success,
                             helperText = "例如 true。填写此项时必须同时填写成功标记路径。",
                         )
+                    }
+                }
+            }
+            } else {
+                item(key = "script") {
+                    EditorSection("查询脚本") {
+                        TemplateTextField(
+                            label = "查询脚本 *",
+                            value = draft.scriptCode,
+                            onValueChange = { onUpdate(BalanceTemplateField.SCRIPT_CODE, it) },
+                            errorMessage = errors.script,
+                            helperText = "返回 { request, extractor }；extractor 返回 remaining、used、total、unit、planName。",
+                            singleLine = false,
+                            maxLines = 18,
+                        )
+                        OutlinedButton(
+                            onClick = onRestoreDefaultScript,
+                            enabled = !isQuerying,
+                            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                        ) {
+                            Text("恢复 new-api 示例脚本")
+                        }
+                    }
+                }
+                item(key = "script_contract") {
+                    OutlinedCard(modifier = Modifier.fillMaxWidth()) {
+                        Column(
+                            modifier = Modifier.padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            Text("脚本返回约定", style = MaterialTheme.typography.titleSmall)
+                            Text(
+                                "request: url、method（GET/POST）、headers、body（可选）；extractor(response) 可返回 isValid: false 与 invalidMessage。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Text(
+                                "余额数值由 extractor 直接返回显示值；可用占位符仅在请求发送前替换。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
                     }
                 }
             }

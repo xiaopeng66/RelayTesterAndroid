@@ -1,8 +1,11 @@
 package com.relaytester.app.core.backup
 
 import com.relaytester.app.core.model.BalanceHttpMethod
+import com.relaytester.app.core.model.BalanceQueryMode
 import com.relaytester.app.core.model.BalanceQueryTemplate
 import com.relaytester.app.core.model.BalanceTemplateHeader
+import com.relaytester.app.core.model.ModelCatalogEntry
+import com.relaytester.app.core.model.ModelSource
 import com.relaytester.app.core.model.RelayProtocol
 import com.relaytester.app.core.model.TestSettings
 import java.security.GeneralSecurityException
@@ -26,6 +29,9 @@ data class ConfigurationBackup(
     val activeSupplierId: String?,
     val suppliers: List<ConfigurationBackupSupplier>,
     val balanceTemplates: List<BalanceQueryTemplate>,
+    val modelCatalog: List<ModelCatalogEntry> = emptyList(),
+    val modelFilterKeyword: String = "",
+    val quickFilterTerms: List<String> = emptyList(),
 )
 
 data class ConfigurationBackupSupplier(
@@ -77,6 +83,8 @@ object ConfigurationBackupCodec {
     private const val MAX_QUICK_FILTER_TERMS = 16
     private const val MAX_QUICK_FILTER_TERM_LENGTH = 128
     private const val MAX_HEADERS_PER_TEMPLATE = 50
+    private const val MAX_MODEL_CATALOG_ENTRIES = 128
+    private const val MAX_MODEL_SOURCES_PER_ENTRY = 32
 
     fun encrypt(backup: ConfigurationBackup, password: CharArray): ByteArray {
         return try {
@@ -186,6 +194,28 @@ object ConfigurationBackupCodec {
         .put("activeSupplierId", activeSupplierId)
         .put("suppliers", JSONArray(suppliers.map { supplier -> supplier.toJson() }))
         .put("balanceTemplates", JSONArray(balanceTemplates.map { template -> template.toJson() }))
+        .put(
+            "modelCatalog",
+            JSONArray(modelCatalog.map { entry ->
+                JSONObject()
+                    .put("id", entry.id)
+                    .put("name", entry.name)
+                    .put(
+                        "sources",
+                        JSONArray(entry.sources.map { source ->
+                            JSONObject()
+                                .put("supplierId", source.supplierId)
+                                .put("modelId", source.modelId)
+                        }),
+                    )
+            }),
+        )
+        .put(
+            "modelFilters",
+            JSONObject()
+                .put("keyword", modelFilterKeyword)
+                .put("quickFilterTerms", JSONArray(quickFilterTerms)),
+        )
 
     private fun ConfigurationBackupSupplier.toJson(): JSONObject = JSONObject()
         .put("id", id)
@@ -217,6 +247,8 @@ object ConfigurationBackupCodec {
         .put("id", id)
         .put("name", name)
         .put("description", description)
+        .put("queryMode", queryMode.name)
+        .put("scriptCode", scriptCode)
         .put("method", method.name)
         .put("endpointTemplate", endpointTemplate)
         .put(
@@ -281,14 +313,68 @@ object ConfigurationBackupCodec {
                     ?: BalanceQueryTemplate.NEW_API_TEMPLATE_ID,
             )
         }
+        val supplierIds = normalizedSuppliers.mapTo(mutableSetOf()) { it.id }
+        val modelCatalog = root.optJSONArray("modelCatalog")?.let { catalogArray ->
+            if (catalogArray.length() > MAX_MODEL_CATALOG_ENTRIES) {
+                throw ConfigurationBackupException("备份中的模型来源数量超出安全限制")
+            }
+            buildList {
+                for (index in 0 until catalogArray.length()) {
+                    val item = catalogArray.optJSONObject(index)
+                        ?: throw ConfigurationBackupException("第 ${index + 1} 个模型来源格式无效")
+                    val id = item.requiredBoundedString("id", 128)
+                    val name = item.requiredBoundedString("name", 256)
+                    val sourceArray = item.optJSONArray("sources") ?: JSONArray()
+                    if (sourceArray.length() !in 1..MAX_MODEL_SOURCES_PER_ENTRY) {
+                        throw ConfigurationBackupException("模型“$name”的供应商来源数量无效")
+                    }
+                    val sources = buildList {
+                        for (sourceIndex in 0 until sourceArray.length()) {
+                            val source = sourceArray.optJSONObject(sourceIndex)
+                                ?: throw ConfigurationBackupException("模型“$name”的供应商来源格式无效")
+                            val supplierId = source.requiredBoundedString("supplierId", 128)
+                                .takeIf { it in supplierIds }
+                                ?: throw ConfigurationBackupException("模型“$name”引用了不存在的供应商")
+                            val modelId = source.requiredBoundedString("modelId", 256)
+                            add(ModelSource(supplierId, modelId))
+                        }
+                    }.distinctBy { it.supplierId + "\u0000" + it.modelId }
+                    add(ModelCatalogEntry(id, name, sources))
+                }
+            }.distinctBy { it.id }
+        } ?: emptyList()
         val activeId = root.optionalBoundedString("activeSupplierId", 128)
             ?.takeIf { candidate -> normalizedSuppliers.any { it.id == candidate } }
             ?: normalizedSuppliers.first().id
+        val modelFilters = root.optJSONObject("modelFilters")
+        val legacyFilters = normalizedSuppliers.firstOrNull { it.id == activeId }?.testSettings
+        val legacyQuickFilterTerms = normalizedSuppliers.flatMap { it.testSettings.quickFilterTerms }
         return ConfigurationBackup(
             createdAt = root.optLong("createdAt", 0L).takeIf { it > 0 } ?: 0L,
             activeSupplierId = activeId,
             suppliers = normalizedSuppliers,
             balanceTemplates = withBuiltIn,
+            modelCatalog = modelCatalog,
+            modelFilterKeyword = modelFilters
+                ?.optionalBoundedString("keyword", 512)
+                ?: legacyFilters?.keyword.orEmpty(),
+            quickFilterTerms = modelFilters
+                ?.optJSONArray("quickFilterTerms")
+                ?.let { array ->
+                    if (array.length() > MAX_QUICK_FILTER_TERMS) {
+                        throw ConfigurationBackupException("备份中的快捷筛选词数量超出安全限制")
+                    }
+                    buildList {
+                        for (index in 0 until array.length()) {
+                            val value = array.optString(index).trim()
+                            if (value.isEmpty() || value.length > MAX_QUICK_FILTER_TERM_LENGTH) {
+                                throw ConfigurationBackupException("备份中包含无效快捷筛选词")
+                            }
+                            add(value)
+                    }
+                    }.distinctBy { it.lowercase() }
+                }
+                ?: legacyQuickFilterTerms.distinctBy { it.lowercase() },
         )
     }
 
@@ -368,6 +454,9 @@ object ConfigurationBackupCodec {
         }
         val method = runCatching { BalanceHttpMethod.valueOf(requiredBoundedString("method", 16)) }
             .getOrElse { throw ConfigurationBackupException("余额模板“$id”的请求方法无效") }
+        val queryMode = runCatching {
+            BalanceQueryMode.valueOf(optionalBoundedString("queryMode", 16) ?: BalanceQueryMode.FORM.name)
+        }.getOrElse { throw ConfigurationBackupException("余额模板“$id”的查询模式无效") }
         val divisor = optDouble("scaleDivisor", 1.0)
         if (!divisor.isFinite() || divisor <= 0) {
             throw ConfigurationBackupException("余额模板“$id”的换算除数无效")
@@ -376,6 +465,8 @@ object ConfigurationBackupCodec {
             id = id,
             name = requiredBoundedString("name", 120),
             description = optionalBoundedString("description", 1_024).orEmpty(),
+            queryMode = queryMode,
+            scriptCode = optionalBoundedString("scriptCode", 16 * 1024),
             method = method,
             endpointTemplate = requiredBoundedString("endpointTemplate", 2_048),
             headers = headers,

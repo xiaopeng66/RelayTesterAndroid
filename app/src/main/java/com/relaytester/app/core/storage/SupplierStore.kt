@@ -6,9 +6,12 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.relaytester.app.core.model.BalanceHttpMethod
+import com.relaytester.app.core.model.BalanceQueryMode
 import com.relaytester.app.core.model.BalanceQueryTemplate
 import com.relaytester.app.core.model.BalanceSnapshot
 import com.relaytester.app.core.model.BalanceTemplateHeader
+import com.relaytester.app.core.model.ModelCatalogEntry
+import com.relaytester.app.core.model.ModelSource
 import com.relaytester.app.core.model.RelayProtocol
 import com.relaytester.app.core.model.SupplierProfile
 import com.relaytester.app.core.model.TestSettings
@@ -23,8 +26,13 @@ data class SupplierStoreState(
     val suppliers: List<SupplierProfile>,
     val activeSupplierId: String?,
     val balanceTemplates: List<BalanceQueryTemplate> = listOf(BalanceQueryTemplate.newApiDefault()),
+    /** User-facing model aliases with one or more supplier-backed sources. */
+    val modelCatalog: List<ModelCatalogEntry> = emptyList(),
     /** Successful balance responses are display-only local cache, never credentials. */
     val balanceSnapshots: Map<String, BalanceSnapshot> = emptyMap(),
+    /** Model-name filters are shared by every supplier. */
+    val modelFilterKeyword: String = "",
+    val quickFilterTerms: List<String> = emptyList(),
 )
 
 class SupplierStore(private val context: Context) {
@@ -94,6 +102,8 @@ class SupplierStore(private val context: Context) {
                     .put("id", template.id)
                     .put("name", template.name)
                     .put("description", template.description)
+                    .put("queryMode", template.queryMode.name)
+                    .put("scriptCode", template.scriptCode)
                     .put("method", template.method.name)
                     .put("endpointTemplate", template.endpointTemplate)
                     .put("headers", headerArray)
@@ -118,10 +128,34 @@ class SupplierStore(private val context: Context) {
             .toSortedMap()
             .values
             .forEach { snapshot -> snapshotArray.put(snapshot.toJson()) }
+        val catalogArray = JSONArray()
+        state.modelCatalog.forEach { entry ->
+            val sourceArray = JSONArray()
+            entry.sources.forEach { source ->
+                sourceArray.put(
+                    JSONObject()
+                        .put("supplierId", source.supplierId)
+                        .put("modelId", source.modelId),
+                )
+            }
+            catalogArray.put(
+                JSONObject()
+                    .put("id", entry.id)
+                    .put("name", entry.name)
+                    .put("sources", sourceArray),
+            )
+        }
         return root
             .put("suppliers", array)
             .put("balanceTemplates", templateArray)
+            .put("modelCatalog", catalogArray)
             .put("balanceSnapshots", snapshotArray)
+            .put(
+                "modelFilters",
+                JSONObject()
+                    .put("keyword", state.modelFilterKeyword)
+                    .put("quickFilterTerms", JSONArray(state.quickFilterTerms)),
+            )
             .toString()
     }
 
@@ -165,6 +199,28 @@ class SupplierStore(private val context: Context) {
                 template
             }
         }
+        val modelCatalog = runCatching {
+            val array = root.optJSONArray("modelCatalog") ?: JSONArray()
+            buildList {
+                for (index in 0 until minOf(array.length(), MAX_MODEL_CATALOG_ENTRIES)) {
+                    val item = array.optJSONObject(index) ?: continue
+                    val id = item.optString("id").trim().takeIf(String::isNotEmpty) ?: continue
+                    val name = item.optString("name").trim().takeIf(String::isNotEmpty) ?: continue
+                    val sourceArray = item.optJSONArray("sources") ?: JSONArray()
+                    val sources = buildList {
+                        for (sourceIndex in 0 until minOf(sourceArray.length(), MAX_MODEL_SOURCES_PER_ENTRY)) {
+                            val source = sourceArray.optJSONObject(sourceIndex) ?: continue
+                            val supplierId = source.optString("supplierId").trim()
+                            val modelId = source.optString("modelId").trim()
+                            if (supplierId.isNotEmpty() && modelId.isNotEmpty()) {
+                                add(ModelSource(supplierId, modelId))
+                            }
+                        }
+                    }.distinctBy { it.supplierId + "\u0000" + it.modelId }
+                    if (sources.isNotEmpty()) add(ModelCatalogEntry(id, name, sources))
+                }
+            }.distinctBy { it.id }
+        }.getOrDefault(emptyList())
         val snapshots = runCatching {
             val array = root.optJSONArray("balanceSnapshots") ?: JSONArray()
             buildMap {
@@ -175,11 +231,32 @@ class SupplierStore(private val context: Context) {
                 }
             }
         }.getOrDefault(emptyMap())
+        val resolvedActiveId = activeSupplierId?.takeIf { id -> suppliers.any { it.id == id } }
+            ?: suppliers.firstOrNull()?.id
+        val modelFilters = root.optJSONObject("modelFilters")
+        val legacyActive = suppliers.firstOrNull { it.id == resolvedActiveId }
+        val modelFilterKeyword = modelFilters
+            ?.optString("keyword", "")
+            ?.take(512)
+            ?: legacyActive?.testSettings?.keyword.orEmpty()
+        val legacyQuickFilterTerms = suppliers.flatMap { it.testSettings.quickFilterTerms }
+        val quickFilterTerms = modelFilters
+            ?.optJSONArray("quickFilterTerms")
+            ?.let { array -> readQuickFilterTerms(array) }
+            ?: readQuickFilterTerms(JSONArray(legacyQuickFilterTerms))
         return SupplierStoreState(
             suppliers = suppliers,
-            activeSupplierId = activeSupplierId?.takeIf { id -> suppliers.any { it.id == id } },
+            activeSupplierId = resolvedActiveId,
             balanceTemplates = refreshedTemplates,
+            modelCatalog = modelCatalog.mapNotNull { entry ->
+                val validSources = entry.sources.filter { source ->
+                    suppliers.any { it.id == source.supplierId }
+                }
+                entry.copy(sources = validSources).takeIf { validSources.isNotEmpty() }
+            },
             balanceSnapshots = snapshots,
+            modelFilterKeyword = modelFilterKeyword,
+            quickFilterTerms = quickFilterTerms,
         )
     }
 
@@ -289,6 +366,10 @@ class SupplierStore(private val context: Context) {
             id = id,
             name = optString("name").ifBlank { "未命名模板" },
             description = optString("description"),
+            queryMode = runCatching {
+                BalanceQueryMode.valueOf(optString("queryMode"))
+            }.getOrDefault(BalanceQueryMode.FORM),
+            scriptCode = optString("scriptCode").takeIf(String::isNotBlank)?.take(MAX_SCRIPT_CODE_LENGTH),
             method = runCatching {
                 BalanceHttpMethod.valueOf(optString("method"))
             }.getOrDefault(BalanceHttpMethod.GET),
@@ -313,12 +394,15 @@ class SupplierStore(private val context: Context) {
 
     private companion object {
         const val MAX_BALANCE_SNAPSHOTS = 128
+        const val MAX_MODEL_CATALOG_ENTRIES = 128
+        const val MAX_MODEL_SOURCES_PER_ENTRY = 32
         const val MAX_QUICK_FILTER_TERMS = 16
         const val MAX_QUICK_FILTER_TERM_LENGTH = 128
         const val MAX_TEMPLATE_NAME_LENGTH = 256
         const val MAX_CURRENCY_LENGTH = 64
         const val MAX_PLAN_NAME_LENGTH = 256
         const val MAX_UNIT_LABEL_LENGTH = 64
+        const val MAX_SCRIPT_CODE_LENGTH = 16 * 1024
         val SUPPLIERS_KEY: Preferences.Key<String> = stringPreferencesKey("suppliers_json")
         val ACTIVE_SUPPLIER_KEY: Preferences.Key<String> = stringPreferencesKey("active_supplier_id")
     }
