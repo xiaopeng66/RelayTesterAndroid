@@ -74,6 +74,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.semantics.Role
@@ -478,9 +479,11 @@ private fun BalanceSupplierCard(
         selected -> MaterialTheme.colorScheme.primary
         else -> MaterialTheme.colorScheme.onSurfaceVariant
     }
+    val cardShape = MaterialTheme.shapes.medium
     OutlinedCard(
         modifier = modifier
             .fillMaxWidth()
+            .clip(cardShape)
             .combinedClickable(
                 enabled = enabled,
                 role = Role.Button,
@@ -502,6 +505,7 @@ private fun BalanceSupplierCard(
             1.dp,
             if (selected || isQuerying) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
         ),
+        shape = cardShape,
     ) {
         Box(
             modifier = Modifier
