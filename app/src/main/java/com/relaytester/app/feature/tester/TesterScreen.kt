@@ -529,10 +529,12 @@ private fun SupplierSelector(
                     } else {
                         MaterialTheme.colorScheme.outlineVariant
                     }
+                    val cardShape = MaterialTheme.shapes.medium
                     OutlinedCard(
                         modifier = Modifier
                             .width(cardWidth)
                             .height(58.dp)
+                            .clip(cardShape)
                             .combinedClickable(
                                 enabled = enabled,
                                 role = Role.Tab,
@@ -545,6 +547,7 @@ private fun SupplierSelector(
                                 contentDescription = "供应商 ${supplier.name}；双击重新拉取模型列表"
                             },
                         border = BorderStroke(1.dp, borderColor),
+                        shape = cardShape,
                         colors = CardDefaults.outlinedCardColors(containerColor = containerColor),
                     ) {
                         Box(
@@ -969,10 +972,12 @@ private fun TestSettingsCard(
                         ) {
                             quickFilterTerms.forEach { term ->
                                 val selected = term in selectedQuickFilters
+                                val filterShape = MaterialTheme.shapes.small
                                 Surface(
                                     modifier = Modifier
                                         .width(filterWidth)
                                         .height(48.dp)
+                                        .clip(filterShape)
                                         .clickable(
                                             enabled = enabled,
                                             role = Role.Checkbox,
@@ -982,7 +987,7 @@ private fun TestSettingsCard(
                                             contentDescription = "模型快捷筛选词：$term"
                                             this.selected = selected
                                         },
-                                    shape = MaterialTheme.shapes.small,
+                                    shape = filterShape,
                                     color = if (selected) {
                                         MaterialTheme.colorScheme.secondaryContainer
                                     } else {
