@@ -26,6 +26,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -149,6 +150,7 @@ fun TesterScreen(
     var pendingExport by remember { mutableStateOf<ExportPayload?>(null) }
     var showModelCatalog by rememberSaveable { mutableStateOf(false) }
     var configurationSupplierId by rememberSaveable { mutableStateOf<String?>(null) }
+    var saveCompletedAt by rememberSaveable { mutableStateOf(0L) }
     var supplierToDeleteId by rememberSaveable { mutableStateOf<String?>(null) }
     // The configuration card already fills the first viewport. Keeping the
     // below-fold form out of the first composition prevents LazyColumn's
@@ -234,6 +236,7 @@ fun TesterScreen(
                 onRemoveQuickFilter = viewModel::removeQuickFilterTerm,
                 onSelectSupplier = viewModel::selectSupplier,
                 onRefreshSupplierModels = viewModel::refreshSupplierModels,
+                onFetchAllSupplierModels = viewModel::fetchAllSupplierModels,
                 onEditSupplier = { supplierId ->
                     configurationSupplierId = supplierId
                     viewModel.selectSupplier(supplierId)
@@ -277,6 +280,7 @@ fun TesterScreen(
             onFetchModels = viewModel::fetchCatalogModels,
             onSearchAllModels = viewModel::searchAllCatalogModels,
             onClearPicker = viewModel::clearCatalogPickerModels,
+            onClearPickerPreservingSearch = viewModel::clearCatalogPickerModelsPreservingSearch,
             onSaveEntry = { entryId, name, sources ->
                 if (entryId == null) {
                     viewModel.saveModelCatalogEntry(name, sources)
@@ -286,6 +290,7 @@ fun TesterScreen(
             },
             onDeleteEntry = viewModel::deleteModelCatalogEntry,
             onRunEntry = viewModel::startUnifiedCatalogTest,
+            onRunSource = viewModel::startUnifiedCatalogSourceTest,
             onCancelRun = viewModel::cancelUnifiedCatalogTest,
         )
     }
@@ -295,9 +300,10 @@ fun TesterScreen(
             SupplierConfigurationDialog(
                 draft = draft,
                 errors = state.errors,
-                enabled = !state.isRunning && !state.isUnifiedTesting && !state.isFetchingModels && !state.isSecretsHydrating,
+                enabled = !state.isRunning && !state.isFetchingModels && !state.isSecretsHydrating,
                 isSecretsHydrating = state.isSecretsHydrating,
                 onDismiss = {
+                    saveCompletedAt = 0L
                     viewModel.discardCurrentSupplierChanges()
                     configurationSupplierId = null
                 },
@@ -305,7 +311,13 @@ fun TesterScreen(
                 onBaseUrlChange = viewModel::updateBaseUrl,
                 onProtocolChange = viewModel::updateProtocol,
                 onApiKeyChange = viewModel::updateApiKey,
-                onSave = viewModel::saveCurrentSupplier,
+                onSave = {
+                    viewModel.saveCurrentSupplier {
+                        saveCompletedAt = System.currentTimeMillis()
+                    }
+                },
+                saveCompletedAt = saveCompletedAt,
+                onToastShown = { saveCompletedAt = 0L },
             )
         }
     }
@@ -346,6 +358,7 @@ private fun TesterContent(
     onRemoveQuickFilter: (String) -> Unit,
     onSelectSupplier: (String) -> Unit,
     onRefreshSupplierModels: (String) -> Unit,
+    onFetchAllSupplierModels: () -> Unit,
     onEditSupplier: (String) -> Unit,
     onAddSupplier: () -> Unit,
     onDeleteSupplier: () -> Unit,
@@ -402,9 +415,12 @@ private fun TesterContent(
                 suppliers = state.suppliers,
                 activeSupplierId = state.activeSupplierId,
                 fetchingSupplierIds = state.fetchingSupplierIds,
+                modelFetchProgressDone = state.modelFetchProgressDone,
+                modelFetchProgressTotal = state.modelFetchProgressTotal,
                 enabled = !operationDisabled,
                 onSelect = onSelectSupplier,
                 onRefreshModels = onRefreshSupplierModels,
+                onFetchAll = onFetchAllSupplierModels,
                 onEditSupplier = onEditSupplier,
                 onAdd = onAddSupplier,
                 onDelete = onDeleteSupplier,
@@ -479,9 +495,12 @@ private fun SupplierSelector(
     suppliers: List<SupplierProfile>,
     activeSupplierId: String?,
     fetchingSupplierIds: Set<String>,
+    modelFetchProgressDone: Int,
+    modelFetchProgressTotal: Int,
     enabled: Boolean,
     onSelect: (String) -> Unit,
     onRefreshModels: (String) -> Unit,
+    onFetchAll: () -> Unit,
     onEditSupplier: (String) -> Unit,
     onAdd: () -> Unit,
     onDelete: () -> Unit,
@@ -517,6 +536,25 @@ private fun SupplierSelector(
                     )
                 }
             }
+        }
+        Button(
+            onClick = onFetchAll,
+            enabled = enabled && suppliers.isNotEmpty() && fetchingSupplierIds.isEmpty(),
+            modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
+        ) {
+            Icon(Icons.Outlined.Download, contentDescription = null)
+            Spacer(Modifier.width(8.dp))
+            Text(
+                if (fetchingSupplierIds.isNotEmpty() && modelFetchProgressTotal > 1) {
+                    "正在拉取 $modelFetchProgressDone / $modelFetchProgressTotal"
+                } else if (fetchingSupplierIds.isNotEmpty()) {
+                    "正在拉取…"
+                } else {
+                    "批量拉取模型"
+                },
+                maxLines = 1,
+                softWrap = false,
+            )
         }
         BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
             val cardWidth = (maxWidth - 8.dp) / 2
@@ -678,6 +716,8 @@ private fun SupplierConfigurationDialog(
     errors: FormErrors,
     enabled: Boolean,
     isSecretsHydrating: Boolean,
+    saveCompletedAt: Long,
+    onToastShown: () -> Unit,
     onDismiss: () -> Unit,
     onNameChange: (String) -> Unit,
     onBaseUrlChange: (String) -> Unit,
@@ -685,54 +725,80 @@ private fun SupplierConfigurationDialog(
     onApiKeyChange: (String) -> Unit,
     onSave: () -> Unit,
 ) {
-    AlertDialog(
+    Dialog(
         onDismissRequest = onDismiss,
-        title = {
-            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text("站点配置")
-                Text(
-                    draft.name,
-                    style = MaterialTheme.typography.labelLarge,
-                    color = MaterialTheme.colorScheme.primary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-        },
-        text = {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(max = 480.dp)
-                    .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Box(modifier = Modifier.fillMaxWidth(0.94f)) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = MaterialTheme.shapes.extraLarge,
+                tonalElevation = 6.dp,
+                shadowElevation = 10.dp,
             ) {
-                SupplierConfigurationForm(
-                    draft = draft,
-                    errors = errors,
-                    enabled = enabled,
-                    isSecretsHydrating = isSecretsHydrating,
-                    onNameChange = onNameChange,
-                    onBaseUrlChange = onBaseUrlChange,
-                    onProtocolChange = onProtocolChange,
-                    onApiKeyChange = onApiKeyChange,
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp),
+                    ) {
+                        Text("站点配置", style = MaterialTheme.typography.headlineSmall)
+                        Text(
+                            draft.name,
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.primary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 480.dp)
+                            .verticalScroll(rememberScrollState())
+                            .padding(horizontal = 24.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        SupplierConfigurationForm(
+                            draft = draft,
+                            errors = errors,
+                            enabled = enabled,
+                            isSecretsHydrating = isSecretsHydrating,
+                            onNameChange = onNameChange,
+                            onBaseUrlChange = onBaseUrlChange,
+                            onProtocolChange = onProtocolChange,
+                            onApiKeyChange = onApiKeyChange,
+                        )
+                    }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 24.dp, vertical = 12.dp),
+                        horizontalArrangement = Arrangement.End,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        TextButton(onClick = onDismiss, modifier = Modifier.heightIn(min = 48.dp)) {
+                            Text("关闭")
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Button(
+                            onClick = onSave,
+                            enabled = enabled,
+                            modifier = Modifier.heightIn(min = 48.dp),
+                        ) { Text("保存站点") }
+                    }
+                }
+            }
+            if (saveCompletedAt > 0L) {
+                Toast(
+                    message = "站点配置已保存",
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .offset(y = (-52).dp),
+                    onToastShown = onToastShown,
                 )
             }
-        },
-        confirmButton = {
-            Button(
-                onClick = onSave,
-                enabled = enabled,
-                modifier = Modifier.heightIn(min = 48.dp),
-            ) { Text("保存站点") }
-        },
-        dismissButton = {
-            TextButton(
-                onClick = onDismiss,
-                modifier = Modifier.heightIn(min = 48.dp),
-            ) { Text("关闭") }
-        },
-    )
+        }
+    }
 }
 
 @Composable
@@ -842,6 +908,34 @@ private fun SupplierConfigurationForm(
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun Toast(
+    message: String,
+    modifier: Modifier = Modifier,
+    onToastShown: () -> Unit,
+) {
+    LaunchedEffect(message) {
+        delay(1600L)
+        onToastShown()
+    }
+    Surface(
+        modifier = modifier,
+        shape = MaterialTheme.shapes.small,
+        color = Color(0xE6000000),
+        tonalElevation = 0.dp,
+        shadowElevation = 6.dp,
+    ) {
+        Text(
+            message,
+            color = Color.White,
+            style = MaterialTheme.typography.labelLarge,
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+            maxLines = 1,
+            softWrap = false,
+        )
     }
 }
 
@@ -1971,9 +2065,11 @@ private fun ModelCatalogDialog(
     onFetchModels: (String) -> Unit,
     onSearchAllModels: (String) -> Unit,
     onClearPicker: () -> Unit,
+    onClearPickerPreservingSearch: () -> Unit,
     onSaveEntry: (String?, String, List<ModelSource>) -> Unit,
     onDeleteEntry: (String) -> Unit,
     onRunEntry: (String) -> Unit,
+    onRunSource: (String, ModelSource) -> Unit,
     onCancelRun: () -> Unit,
 ) {
     var editingEntryId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -1982,6 +2078,7 @@ private fun ModelCatalogDialog(
     var selectedModel by rememberSaveable { mutableStateOf("") }
     var pendingSources by remember { mutableStateOf<List<ModelSource>>(emptyList()) }
     var catalogSearchKeyword by rememberSaveable { mutableStateOf("") }
+    var editingSearchKeyword by rememberSaveable { mutableStateOf("") }
     var selectedSearchKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
     var sourceToDelete by remember { mutableStateOf<ModelSource?>(null) }
     var entryToDeleteId by remember { mutableStateOf<String?>(null) }
@@ -2007,6 +2104,7 @@ private fun ModelCatalogDialog(
         selectedModel = ""
         pendingSources = emptyList()
         catalogSearchKeyword = ""
+        editingSearchKeyword = ""
         selectedSearchKeys = emptySet()
         onClearPicker()
     }
@@ -2104,6 +2202,7 @@ private fun ModelCatalogDialog(
                                     onClick = {
                                         selectedSearchKeys = emptySet()
                                         onSearchAllModels(catalogSearchKeyword)
+                                        editingSearchKeyword = catalogSearchKeyword
                                     },
                                     enabled = editingEnabled && !state.isCatalogSearching && catalogSearchKeyword.isNotBlank(),
                                     contentPadding = PaddingValues(horizontal = 12.dp),
@@ -2115,6 +2214,17 @@ private fun ModelCatalogDialog(
                                 }
                             }
                             if (searchResults.isNotEmpty()) {
+                                val searchResultKeys = searchResults.map {
+                                    it.supplierId + "\u0000" + it.modelId
+                                }.toSet()
+                                val pendingSourceKeys = pendingSources.map {
+                                    it.supplierId + "\u0000" + it.modelId
+                                }.toSet().intersect(searchResultKeys)
+                                LaunchedEffect(searchResults, pendingSourceKeys) {
+                                    selectedSearchKeys = selectedSearchKeys
+                                        .intersect(searchResultKeys)
+                                        .subtract(pendingSourceKeys)
+                                }
                                 Text(
                                     "找到 ${searchResults.size} 个模型，勾选后添加来源",
                                     style = MaterialTheme.typography.labelMedium,
@@ -2128,12 +2238,13 @@ private fun ModelCatalogDialog(
                                 ) {
                                     searchResults.forEach { result ->
                                         val resultKey = result.supplierId + "\u0000" + result.modelId
-                                        val checked = resultKey in selectedSearchKeys
+                                        val resultLock = resultKey in pendingSourceKeys
+                                        val checked = resultLock || resultKey in selectedSearchKeys
                                         Row(
                                             modifier = Modifier
                                                 .fillMaxWidth()
                                                 .clickable(
-                                                    enabled = editingEnabled,
+                                                    enabled = editingEnabled && !resultLock,
                                                     onClick = {
                                                         selectedSearchKeys = if (checked) {
                                                             selectedSearchKeys - resultKey
@@ -2149,13 +2260,15 @@ private fun ModelCatalogDialog(
                                             Checkbox(
                                                 checked = checked,
                                                 onCheckedChange = { nextChecked ->
-                                                    selectedSearchKeys = if (nextChecked) {
-                                                        selectedSearchKeys + resultKey
-                                                    } else {
-                                                        selectedSearchKeys - resultKey
+                                                    if (!resultLock) {
+                                                        selectedSearchKeys = if (nextChecked) {
+                                                            selectedSearchKeys + resultKey
+                                                        } else {
+                                                            selectedSearchKeys - resultKey
+                                                        }
                                                     }
                                                 },
-                                                enabled = editingEnabled,
+                                                enabled = editingEnabled && !resultLock,
                                             )
                                             Column(modifier = Modifier.weight(1f)) {
                                                 Text(
@@ -2175,7 +2288,10 @@ private fun ModelCatalogDialog(
                                         }
                                     }
                                 }
-                                val selectedSearchCount = selectedSearchKeys.size
+                                val selectedSearchCount = selectedSearchKeys
+                                    .intersect(searchResultKeys)
+                                    .subtract(pendingSourceKeys)
+                                    .size
                                 val remainingSourceSlots = (MAX_MODEL_SOURCES_PER_ENTRY - pendingSources.size).coerceAtLeast(0)
                                 OutlinedButton(
                                     onClick = {
@@ -2339,17 +2455,6 @@ private fun ModelCatalogDialog(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    if (state.isUnifiedTesting && state.unifiedProgressTotal > 0) {
-                        LinearProgressIndicator(
-                            progress = { state.unifiedProgressDone.toFloat() / state.unifiedProgressTotal },
-                            modifier = Modifier.fillMaxWidth(),
-                        )
-                        Text(
-                            "正在测试 ${state.unifiedProgressDone} / ${state.unifiedProgressTotal} 个来源",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
                     if (state.modelCatalog.isEmpty()) {
                         Text(
                             "尚未配置跨供应商模型。先选择供应商并拉取模型列表，再添加来源。",
@@ -2362,22 +2467,33 @@ private fun ModelCatalogDialog(
                             verticalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
                             state.modelCatalog.forEach { entry ->
-                                val isTesting = state.isUnifiedTesting && state.unifiedEntryId == entry.id
+                                val entryTestingKeys = state.unifiedTestingKeys.filter { key ->
+                                    key.startsWith("${entry.id}\u0000")
+                                }
+                                val entryTestingCount = entryTestingKeys.size
+                                val entrySourceCount = entry.sources.size
+                                val entryCompletedCount = (entrySourceCount - entryTestingCount).coerceIn(0, entrySourceCount)
                                 ModelCatalogEntryCard(
                                     entry = entry,
                                     suppliers = state.suppliers,
                                     results = unifiedByEntry[entry.id].orEmpty(),
-                                    enabled = !state.isUnifiedTesting,
-                                    isTesting = isTesting,
+                                    testingKeys = state.unifiedTestingKeys,
+                                    progressDone = entryCompletedCount,
+                                    progressTotal = entrySourceCount,
+                                    editingEnabled = editingEnabled,
+                                    testingEnabled = true,
+                                    isTesting = entryTestingKeys.isNotEmpty(),
                                     onEdit = {
                                         editingEntryId = entry.id
                                         entryName = entry.name
                                         pendingSources = entry.sources
-                                        selectedSupplierId = entry.sources.firstOrNull()?.supplierId ?: state.suppliers.firstOrNull()?.id
-                                        selectedModel = ""
-                                        onClearPicker()
+                selectedSupplierId = entry.sources.firstOrNull()?.supplierId ?: state.suppliers.firstOrNull()?.id
+                selectedModel = ""
+                catalogSearchKeyword = editingSearchKeyword
+                onClearPickerPreservingSearch()
                                     },
                                     onRun = { onRunEntry(entry.id) },
+                                    onRunSource = { source -> onRunSource(entry.id, source) },
                                     onCancel = onCancelRun,
                                     onDelete = { entryToDeleteId = entry.id },
                                 )
@@ -2481,10 +2597,15 @@ private fun ModelCatalogEntryCard(
     entry: ModelCatalogEntry,
     suppliers: List<SupplierProfile>,
     results: List<UnifiedModelTestResult>,
-    enabled: Boolean,
+    testingKeys: Set<String>,
+    progressDone: Int,
+    progressTotal: Int,
+    editingEnabled: Boolean,
+    testingEnabled: Boolean,
     isTesting: Boolean,
     onEdit: () -> Unit,
     onRun: () -> Unit,
+    onRunSource: (ModelSource) -> Unit,
     onCancel: () -> Unit,
     onDelete: () -> Unit,
 ) {
@@ -2509,12 +2630,12 @@ private fun ModelCatalogEntryCard(
                     softWrap = false,
                     overflow = TextOverflow.Ellipsis,
                 )
-                IconButton(onClick = onEdit, enabled = enabled, modifier = Modifier.size(44.dp)) {
+                IconButton(onClick = onEdit, enabled = editingEnabled, modifier = Modifier.size(44.dp)) {
                     Icon(Icons.Outlined.Edit, contentDescription = "编辑模型来源", modifier = Modifier.size(20.dp))
                 }
                 IconButton(
                     onClick = if (isTesting) onCancel else onRun,
-                    enabled = enabled || isTesting,
+                    enabled = testingEnabled || isTesting,
                     modifier = Modifier.size(44.dp),
                 ) {
                     Icon(
@@ -2523,17 +2644,36 @@ private fun ModelCatalogEntryCard(
                         modifier = Modifier.size(20.dp),
                     )
                 }
-                IconButton(onClick = onDelete, enabled = enabled, modifier = Modifier.size(44.dp)) {
+                IconButton(onClick = onDelete, enabled = editingEnabled, modifier = Modifier.size(44.dp)) {
                     Icon(Icons.Outlined.DeleteOutline, contentDescription = "删除模型来源配置", modifier = Modifier.size(20.dp))
                 }
             }
-            Text(
-                "${entry.sources.size} 个供应商来源",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                softWrap = false,
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    "${entry.sources.size} 个供应商来源",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    softWrap = false,
+                )
+                if (testingKeys.any { it.startsWith("${entry.id}\u0000") }) {
+                    Spacer(Modifier.width(2.dp))
+                    Text(
+                        "$progressDone/$progressTotal",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                    )
+                    LinearProgressIndicator(
+                        progress = { progressDone.toFloat() / progressTotal.coerceAtLeast(1) },
+                        modifier = Modifier.width(72.dp).height(4.dp),
+                    )
+                }
+            }
             entry.sources.forEachIndexed { index, source ->
                 if (index > 0) HorizontalDivider(modifier = Modifier.padding(vertical = 2.dp))
                 val supplierName = suppliers.firstOrNull { it.id == source.supplierId }
@@ -2542,6 +2682,8 @@ private fun ModelCatalogEntryCard(
                 val result = results.firstOrNull {
                     it.supplierId == source.supplierId && it.sourceModel == source.modelId
                 }?.result
+                val sourceKey = "${entry.id}\u0000${source.supplierId}\u0000${source.modelId}"
+                val sourceTesting = sourceKey in testingKeys
                 Row(
                     modifier = Modifier.fillMaxWidth().heightIn(min = 38.dp),
                     verticalAlignment = Alignment.CenterVertically,
@@ -2556,7 +2698,25 @@ private fun ModelCatalogEntryCard(
                         overflow = TextOverflow.Ellipsis,
                     )
                     if (result != null) {
-                        StatusLabel(result.status)
+                        if (sourceTesting) {
+                            Text(
+                                "进行中",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.tertiary,
+                            )
+                        } else if (result.status == TestStatus.SUCCESS) {
+                            Text(
+                                "可用",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = Color(0xFF15803D),
+                            )
+                        } else {
+                            Text(
+                                result.httpStatus?.toString() ?: result.error?.kind?.label ?: "失败",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
                     } else {
                         Text(
                             "未测试",
@@ -2564,54 +2724,17 @@ private fun ModelCatalogEntryCard(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
-                }
-                if (result != null) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+                    IconButton(
+                        onClick = { onRunSource(source) },
+                        enabled = testingEnabled && !sourceTesting,
+                        modifier = Modifier.size(36.dp),
                     ) {
-                        result.latencyMs?.let {
-                            Text(
-                                "${it}ms",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.tertiary,
-                                maxLines = 1,
-                            )
-                        }
-                        result.httpStatus?.let {
-                            Text(
-                                "HTTP $it",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (result.status == TestStatus.SUCCESS) {
-                                    Color(0xFF15803D)
-                                } else {
-                                    MaterialTheme.colorScheme.error
-                                },
-                                maxLines = 1,
-                            )
-                        }
-                        result.usage?.resolvedTotal?.takeIf { it > 0 }?.let {
-                            Text(
-                                "$it tok",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.secondary,
-                                maxLines = 1,
-                            )
-                        }
+                        Icon(
+                            Icons.Outlined.PlayArrow,
+                            contentDescription = "测试 ${entry.name} 的 $supplierName 来源",
+                            modifier = Modifier.size(18.dp),
+                        )
                     }
-                }
-                result?.error?.message
-                    ?.takeIf { message -> message.isNotBlank() && message != result.error?.kind?.label }
-                    ?.let {
-                    Text(
-                        it,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
-                        maxLines = 1,
-                        softWrap = false,
-                        overflow = TextOverflow.Ellipsis,
-                    )
                 }
             }
         }

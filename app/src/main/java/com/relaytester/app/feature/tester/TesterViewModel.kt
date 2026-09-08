@@ -187,6 +187,8 @@ data class TesterUiState(
     val isFetchingModels: Boolean = false,
     /** Suppliers whose model directory request is currently in flight. */
     val fetchingSupplierIds: Set<String> = emptySet(),
+    val modelFetchProgressDone: Int = 0,
+    val modelFetchProgressTotal: Int = 0,
     val isRunning: Boolean = false,
     val progressDone: Int = 0,
     val progressTotal: Int = 0,
@@ -217,9 +219,7 @@ data class TesterUiState(
     val catalogSearchMessage: String? = null,
     val isCatalogSearchError: Boolean = false,
     val isUnifiedTesting: Boolean = false,
-    val unifiedEntryId: String? = null,
-    val unifiedProgressDone: Int = 0,
-    val unifiedProgressTotal: Int = 0,
+    val unifiedTestingKeys: Set<String> = emptySet(),
     val unifiedResults: List<UnifiedModelTestResult> = emptyList(),
 )
 
@@ -500,6 +500,7 @@ class TesterViewModel(
     private val secretStore: SecretStore,
     private val relayApiFactory: () -> RelayApi,
     private val balanceApiFactory: () -> BalanceApi,
+    private val skipRestore: Boolean = false,
 ) : ViewModel() {
     /** Network clients are not needed to draw or restore the first screen. */
     private val relayApi: RelayApi by lazy { relayApiFactory() }
@@ -519,6 +520,10 @@ class TesterViewModel(
     private var modelCatalog = mutableListOf<ModelCatalogEntry>()
     private var testJob: Job? = null
     private var unifiedTestJob: Job? = null
+    private val unifiedTestJobs = mutableMapOf<String, Job>()
+    private var fetchAllModelsJob: Job? = null
+    /** Closes the tiny pre-publication window for rapid double-clicks. */
+    private val fetchAllModelsStartMutex = Mutex()
     /** Serializes profile replacement and persistence when card refreshes finish together. */
     private val profileMutationMutex = Mutex()
     private val supplierActivationMutex = Mutex()
@@ -528,22 +533,17 @@ class TesterViewModel(
     private var pendingConfigurationImportBytes: ByteArray? = null
 
     init {
-        viewModelScope.launch {
-            restore()
+        if (skipRestore) {
+            // Unit tests populate state directly and never touch Android storage.
+        } else {
+            viewModelScope.launch { restore() }
         }
     }
 
     fun cancelUnifiedCatalogTest() {
-        unifiedTestJob?.cancel()
+        unifiedTestJobs.values.forEach { it.cancel() }
+        unifiedTestJobs.clear()
         unifiedTestJob = null
-        _uiState.update {
-            it.copy(
-                isUnifiedTesting = false,
-                unifiedEntryId = null,
-                message = "统一连接测试已取消",
-                isMessageError = false,
-            )
-        }
     }
 
     fun updateName(value: String) = updateDraft { copy(name = value) }
@@ -650,6 +650,15 @@ class TesterViewModel(
                 catalogSearchResults = emptyList(),
                 catalogSearchMessage = null,
                 isCatalogSearchError = false,
+            )
+        }
+    }
+
+    fun clearCatalogPickerModelsPreservingSearch() {
+        _uiState.update {
+            it.copy(
+                catalogPickerSupplierId = null,
+                catalogPickerModels = emptyList(),
             )
         }
     }
@@ -849,14 +858,36 @@ class TesterViewModel(
     }
 
     fun startUnifiedCatalogTest(entryId: String) {
-        if (runningOrInitializing() || _uiState.value.isCatalogFetching) return
+        startUnifiedCatalogTests(entryId)
+    }
+
+    fun startUnifiedCatalogSourceTest(entryId: String, source: ModelSource) {
+        if (source.supplierId.isBlank() || source.modelId.isBlank()) return
+        startUnifiedCatalogTests(entryId, listOf(source))
+    }
+
+    private fun unifiedResultKey(entryId: String, supplierId: String, modelId: String) =
+        "$entryId\u0000$supplierId\u0000$modelId"
+
+    private fun startUnifiedCatalogTests(
+        entryId: String,
+        sourceFilter: List<ModelSource>? = null,
+    ) {
+        if (
+            _uiState.value.isRunning ||
+            _uiState.value.isInitializing ||
+            _uiState.value.isSecretsHydrating ||
+            _configurationBackupUiState.value.isBusy ||
+            _uiState.value.isCatalogFetching
+        ) return
         val entries = _uiState.value.modelCatalog.filter { it.id == entryId }
         if (entries.isEmpty()) {
             showMessage("未找到要测试的模型来源", isError = true)
             return
         }
-        val targets = entries.flatMap { entry ->
+        var targets = entries.flatMap { entry ->
             entry.sources.mapNotNull { source ->
+                if (sourceFilter != null && source !in sourceFilter) return@mapNotNull null
                 val profile = profiles.firstOrNull { it.id == source.supplierId }
                     ?: return@mapNotNull null
                 UnifiedModelTestResult(
@@ -873,14 +904,32 @@ class TesterViewModel(
             showMessage("请先添加至少一个模型来源", isError = true)
             return
         }
-        val preservedResults = _uiState.value.unifiedResults.filterNot { it.entryId == entryId }
+        val activeKeys = _uiState.value.unifiedTestingKeys
+        targets = targets.filter {
+            unifiedResultKey(entryId, it.supplierId, it.sourceModel) !in activeKeys
+        }
+        if (targets.isEmpty()) return
+        val jobId = UUID.randomUUID().toString()
+        val targetKeys = targets.mapTo(mutableSetOf()) {
+            unifiedResultKey(it.entryId, it.supplierId, it.sourceModel)
+        }
+        val previousResults = _uiState.value.unifiedResults
+        val preservedResults = previousResults.filterNot {
+            unifiedResultKey(it.entryId, it.supplierId, it.sourceModel) in targetKeys
+        }
         _uiState.update {
             it.copy(
                 isUnifiedTesting = true,
-                unifiedEntryId = entryId,
-                unifiedProgressDone = 0,
-                unifiedProgressTotal = targets.size,
-                unifiedResults = preservedResults + targets,
+                unifiedTestingKeys = it.unifiedTestingKeys + targetKeys,
+                unifiedResults = preservedResults + targets.map { target ->
+                    target.copy(
+                        result = previousResults.firstOrNull {
+                            it.entryId == target.entryId &&
+                                it.supplierId == target.supplierId &&
+                                it.sourceModel == target.sourceModel
+                        }?.result ?: ModelTestResult.pending(target.sourceModel),
+                    )
+                },
                 message = null,
                 isMessageError = false,
             )
@@ -888,7 +937,6 @@ class TesterViewModel(
         val job = viewModelScope.launch {
             val mutex = Mutex()
             val semaphore = Semaphore(MAX_UNIFIED_TEST_CONCURRENCY)
-            var completed = 0
             try {
                 coroutineScope {
                     targets.map { target ->
@@ -927,48 +975,76 @@ class TesterViewModel(
                                     }
                                 }
                             }
-                            mutex.withLock {
-                                completed += 1
-                                _uiState.update { state ->
-                                    state.copy(
-                                        unifiedProgressDone = completed,
-                                        unifiedResults = state.unifiedResults.map {
-                                            if (it.entryId == target.entryId &&
-                                                it.supplierId == target.supplierId &&
-                                                it.sourceModel == target.sourceModel
-                                            ) it.copy(result = result) else it
-                                        },
-                                    )
-                                }
-                            }
-                        }
+            mutex.withLock {
+                _uiState.update { state ->
+                    val resultKey = unifiedResultKey(
+                        target.entryId,
+                        target.supplierId,
+                        target.sourceModel,
+                    )
+                    val nextTestingKeys = state.unifiedTestingKeys - resultKey
+                    state.copy(
+                        unifiedTestingKeys = nextTestingKeys,
+                        isUnifiedTesting = nextTestingKeys.isNotEmpty(),
+                        unifiedResults = state.unifiedResults.map {
+                            if (it.entryId == target.entryId &&
+                                it.supplierId == target.supplierId &&
+                                it.sourceModel == target.sourceModel
+                            ) it.copy(result = result) else it
+                        },
+                    )
+                }
+            }
+        }
                     }.forEach { it.await() }
                 }
                 _uiState.update {
                     it.copy(
-                        isUnifiedTesting = false,
-                        unifiedEntryId = null,
+                        isUnifiedTesting = it.unifiedTestingKeys.isNotEmpty(),
                         message = "模型来源连接测试完成",
                         isMessageError = false,
                     )
                 }
             } catch (error: CancellationException) {
-                _uiState.update { it.copy(isUnifiedTesting = false, unifiedEntryId = null) }
                 throw error
             } catch (error: Throwable) {
                 _uiState.update {
+                    val nextTestingKeys = it.unifiedTestingKeys - targetKeys
                     it.copy(
-                        isUnifiedTesting = false,
-                        unifiedEntryId = null,
+                        unifiedTestingKeys = nextTestingKeys,
+                        isUnifiedTesting = nextTestingKeys.isNotEmpty(),
                         message = error.message ?: "统一连接测试中断",
                         isMessageError = true,
                     )
                 }
             }
         }
+        unifiedTestJobs[jobId] = job
         unifiedTestJob = job
         job.invokeOnCompletion {
+            unifiedTestJobs.remove(jobId)
             if (unifiedTestJob === job) unifiedTestJob = null
+            if (job.isCancelled) {
+                _uiState.update { state ->
+                    val cancelledKeys = targetKeys.intersect(state.unifiedTestingKeys)
+                    val nextKeys = state.unifiedTestingKeys - cancelledKeys
+                    state.copy(
+                        unifiedTestingKeys = nextKeys,
+                        isUnifiedTesting = nextKeys.isNotEmpty(),
+                        unifiedResults = if (cancelledKeys.isEmpty()) {
+                            state.unifiedResults
+                        } else {
+                            state.unifiedResults.map {
+                                if (unifiedResultKey(it.entryId, it.supplierId, it.sourceModel) in cancelledKeys) {
+                                    it.copy(result = ModelTestResult.pending(it.sourceModel))
+                                } else {
+                                    it
+                                }
+                            }
+                        },
+                    )
+                }
+            }
         }
     }
 
@@ -1525,11 +1601,11 @@ class TesterViewModel(
         viewModelScope.launch { queryAllBalancesInternal() }
     }
 
-    fun saveCurrentSupplier() {
+    fun saveCurrentSupplier(onSaved: () -> Unit = {}) {
         if (runningOrInitializing()) return
         viewModelScope.launch {
             if (persistDraft() != null) {
-                showMessage("站点配置已保存")
+                onSaved()
             }
         }
     }
@@ -1727,6 +1803,104 @@ class TesterViewModel(
         viewModelScope.launch { fetchModelsInternal() }
     }
 
+    /**
+     * Refreshes every configured supplier in parallel. Each request uses only
+     * that supplier's credentials, and one failure never cancels the batch.
+     */
+    fun fetchAllSupplierModels() {
+        if (runningOrInitializing() || fetchAllModelsJob?.isActive == true) return
+        val targets = profiles.toList()
+        if (targets.isEmpty()) {
+            showMessage("请先添加供应商", isError = true)
+            return
+        }
+        if (!fetchAllModelsStartMutex.tryLock()) return
+        val job = viewModelScope.launch {
+            try {
+                if (persistDraft() == null) return@launch
+                val targetIds = targets.mapTo(mutableSetOf()) { it.id }
+                _uiState.update {
+                    it.copy(
+                        isFetchingModels = true,
+                        fetchingSupplierIds = targetIds,
+                        modelFetchProgressDone = 0,
+                        modelFetchProgressTotal = targets.size,
+                        message = null,
+                        isMessageError = false,
+                    )
+                }
+                coroutineScope {
+                    val deferred = targets.map { profile ->
+                        async {
+                            try {
+                                val profileNow = profiles.firstOrNull { it.id == profile.id }
+                                if (profileNow == null) {
+                                    return@async false
+                                }
+                                val activeDraft = _uiState.value.draft
+                                val apiKey = if (activeDraft?.id == profile.id &&
+                                    (activeDraft.apiKeyDirty || activeDraft.apiKey.isNotBlank())
+                                ) {
+                                    activeDraft.apiKey
+                                } else {
+                                    withContext(Dispatchers.IO) {
+                                        profileNow.apiKeySecretId?.let(secretStore::get).orEmpty()
+                                    }
+                                }
+                                if (apiKey.isBlank()) {
+                                    completeBatchModelFetch(profile.id)
+                                    showMessage("请先保存 ${profile.name} 的 API Key", isError = true)
+                                    return@async false
+                                }
+                                fetchModelsForSupplierInternal(
+                                    PreparedRequest(profileNow, apiKey),
+                                )
+                            } catch (error: CancellationException) {
+                                throw error
+                            } catch (_: Throwable) {
+                                completeBatchModelFetch(profile.id)
+                                showMessage("${profile.name} 模型拉取失败", isError = true)
+                                false
+                            }
+                        }
+                    }
+                    val results = deferred.awaitAll()
+                    val succeeded = results.count { it }
+                    val failed = targets.size - succeeded
+                    _uiState.update { state ->
+                        state.copy(
+                            message = when {
+                                failed == 0 -> "已拉取 ${targets.size} 个供应商的模型"
+                                failed == targets.size -> "批量拉取模型失败，请检查 API Key 和网络"
+                                else -> "已完成：$succeeded 成功，$failed 需要处理"
+                            },
+                            isMessageError = failed > 0,
+                        )
+                    }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } finally {
+                _uiState.update { state ->
+                    state.copy(
+                        isFetchingModels = false,
+                        fetchingSupplierIds = emptySet(),
+                        modelFetchProgressDone = targets.size,
+                        modelFetchProgressTotal = targets.size,
+                        message = state.message ?: "批量拉取模型已结束",
+                    )
+                }
+            }
+        }
+        fetchAllModelsJob = job
+        job.invokeOnCompletion {
+            if (fetchAllModelsJob === job) fetchAllModelsJob = null
+            if (fetchAllModelsStartMutex.isLocked) {
+                fetchAllModelsStartMutex.unlock()
+            }
+        }
+    }
+
     /** Refreshes exactly the requested supplier without changing the active draft. */
     fun refreshSupplierModels(id: String) {
         if (runningOrInitializing()) return
@@ -1758,12 +1932,28 @@ class TesterViewModel(
         }
     }
 
+    private fun completeBatchModelFetch(supplierId: String) {
+        _uiState.update { state ->
+            if (supplierId !in state.fetchingSupplierIds) return@update state
+            val remaining = state.fetchingSupplierIds - supplierId
+            state.copy(
+                fetchingSupplierIds = remaining,
+                isFetchingModels = remaining.isNotEmpty(),
+                modelFetchProgressDone = (state.modelFetchProgressDone + 1).coerceAtMost(
+                    state.modelFetchProgressTotal
+                ),
+            )
+        }
+    }
+
     private suspend fun fetchModelsInternal() {
         val request = prepareRequest() ?: return
         fetchModelsForSupplierInternal(request)
     }
 
-    private suspend fun fetchModelsForSupplierInternal(request: PreparedRequest) {
+    private suspend fun fetchModelsForSupplierInternal(
+        request: PreparedRequest,
+    ): Boolean {
         val supplierId = request.profile.id
         _uiState.update {
             it.copy(
@@ -1773,10 +1963,10 @@ class TesterViewModel(
             )
         }
         try {
-            when (val result = fetchModelsInBackground(request)) {
+            return when (val result = fetchModelsInBackground(request)) {
                 is ApiResult.Success -> {
                     val saved = request.profile.copy(models = result.value)
-                    if (!replaceProfile(saved)) return
+                    if (!replaceProfile(saved)) return false
                     _uiState.update { state ->
                         val isActive = state.activeSupplierId == supplierId
                         state.copy(
@@ -1802,12 +1992,14 @@ class TesterViewModel(
                             isMessageError = result.value.isEmpty(),
                         )
                     }
+                    true
                 }
 
                 is ApiResult.Failure -> {
                     _uiState.update {
                         it.copy(message = result.error.message, isMessageError = true)
                     }
+                    false
                 }
             }
         } finally {
@@ -1816,6 +2008,9 @@ class TesterViewModel(
                 it.copy(
                     fetchingSupplierIds = remaining,
                     isFetchingModels = remaining.isNotEmpty(),
+                    modelFetchProgressDone = (it.modelFetchProgressDone + 1).coerceAtMost(
+                        it.modelFetchProgressTotal
+                    ),
                 )
             }
         }
@@ -1932,10 +2127,13 @@ class TesterViewModel(
     fun cancelRun() {
         testJob?.cancel()
         testJob = null
+        fetchAllModelsJob?.cancel()
+        fetchAllModelsJob = null
         _uiState.update {
             it.copy(
                 isRunning = false,
                 isFetchingModels = false,
+                fetchingSupplierIds = emptySet(),
                 message = "测试已取消",
                 isMessageError = false,
             )
