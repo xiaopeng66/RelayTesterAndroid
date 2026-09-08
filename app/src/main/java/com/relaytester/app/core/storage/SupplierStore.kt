@@ -35,20 +35,20 @@ data class SupplierStoreState(
     val quickFilterTerms: List<String> = emptyList(),
 )
 
-class SupplierStore(private val context: Context) {
+open class SupplierStore(private val context: Context?) {
     /**
      * DataStore is deliberately resolved at the call site rather than during
      * ViewModel construction. The first access can touch disk, so startup
      * callers invoke this from Dispatchers.IO before publishing UI state.
      */
-    suspend fun read(): SupplierStoreState = context.supplierDataStore.data
+    open suspend fun read(): SupplierStoreState = requireNotNull(context).supplierDataStore.data
         .map { preferences ->
             deserialize(preferences[SUPPLIERS_KEY], preferences[ACTIVE_SUPPLIER_KEY])
         }
         .first()
 
-    suspend fun save(state: SupplierStoreState) {
-        context.supplierDataStore.edit { preferences ->
+    open suspend fun save(state: SupplierStoreState) {
+        requireNotNull(context).supplierDataStore.edit { preferences ->
             preferences[SUPPLIERS_KEY] = serialize(state)
             state.activeSupplierId?.let { preferences[ACTIVE_SUPPLIER_KEY] = it }
                 ?: preferences.remove(ACTIVE_SUPPLIER_KEY)
