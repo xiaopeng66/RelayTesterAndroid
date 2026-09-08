@@ -17,6 +17,7 @@ import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -63,6 +64,7 @@ fun ConfigurationBackupDialog(
     var exportPassword by remember { mutableStateOf("") }
     var exportPasswordConfirmation by remember { mutableStateOf("") }
     var showExportPassword by remember { mutableStateOf(false) }
+    var exportEncrypted by remember { mutableStateOf(true) }
     var importPassword by remember { mutableStateOf("") }
     var confirmationPassword by remember { mutableStateOf("") }
 
@@ -114,11 +116,16 @@ fun ConfigurationBackupDialog(
             importPassword = ""
         }
     }
+    LaunchedEffect(state.importFileSelected, state.importIsEncrypted) {
+        if (state.importFileSelected && !state.importIsEncrypted) {
+            viewModel.previewConfigurationImport("")
+        }
+    }
 
     when {
         state.exportPayload != null -> ConfigurationBackupBusyDialog(
             title = "等待保存位置",
-            description = "请在系统文件选择器中保存加密备份。取消后不会改变现有配置。",
+            description = "请在系统文件选择器中保存备份。取消后不会改变现有配置。",
         )
 
         state.isBusy -> ConfigurationBackupBusyDialog(
@@ -128,6 +135,7 @@ fun ConfigurationBackupDialog(
 
         state.importPreview != null -> ConfigurationBackupImportConfirmationDialog(
             preview = requireNotNull(state.importPreview),
+            encrypted = state.importIsEncrypted,
             password = confirmationPassword,
             onPasswordChange = { confirmationPassword = it },
             errorMessage = state.message.takeIf { state.isMessageError },
@@ -145,6 +153,7 @@ fun ConfigurationBackupDialog(
         )
 
         state.importFileSelected -> ConfigurationBackupImportPasswordDialog(
+            encrypted = state.importIsEncrypted,
             password = importPassword,
             onPasswordChange = { importPassword = it },
             errorMessage = state.message.takeIf { state.isMessageError },
@@ -161,13 +170,13 @@ fun ConfigurationBackupDialog(
             },
         )
 
-        showExportPassword -> ConfigurationBackupExportPasswordDialog(
+        showExportPassword && exportEncrypted -> ConfigurationBackupExportPasswordDialog(
             password = exportPassword,
             confirmation = exportPasswordConfirmation,
             onPasswordChange = { exportPassword = it },
             onConfirmationChange = { exportPasswordConfirmation = it },
             errorMessage = state.message.takeIf { state.isMessageError },
-            onExport = { viewModel.createConfigurationBackup(exportPassword) },
+            onExport = { viewModel.createConfigurationBackup(exportPassword, encrypted = true) },
             onDismiss = {
                 exportPassword = ""
                 exportPasswordConfirmation = ""
@@ -178,9 +187,15 @@ fun ConfigurationBackupDialog(
 
         else -> ConfigurationBackupHomeDialog(
             state = state,
+            encrypted = exportEncrypted,
+            onEncryptedChange = { exportEncrypted = it },
             onExport = {
                 viewModel.clearConfigurationBackupMessage()
-                showExportPassword = true
+                if (exportEncrypted) {
+                    showExportPassword = true
+                } else {
+                    viewModel.createConfigurationBackup(password = "", encrypted = false)
+                }
             },
             onImport = {
                 viewModel.clearConfigurationBackupMessage()
@@ -203,6 +218,8 @@ private val BACKUP_MIME_TYPES = arrayOf("*/*")
 @Composable
 private fun ConfigurationBackupHomeDialog(
     state: ConfigurationBackupUiState,
+    encrypted: Boolean,
+    onEncryptedChange: (Boolean) -> Unit,
     onExport: () -> Unit,
     onImport: () -> Unit,
     onDismiss: () -> Unit,
@@ -214,7 +231,7 @@ private fun ConfigurationBackupHomeDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(
-                    "加密备份会迁移供应商、模型、测试参数和余额模板。",
+                    "备份会迁移供应商、模型、测试参数和余额模板。",
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 Text(
@@ -223,9 +240,13 @@ private fun ConfigurationBackupHomeDialog(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Text(
-                    "密码不会保存。遗失后无法恢复备份内容。",
+                    if (encrypted) "密码不会保存。遗失后无法恢复备份内容。" else "未加密备份可被直接读取，请只保存到可信位置。",
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = if (encrypted) {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    } else {
+                        MaterialTheme.colorScheme.error
+                    },
                 )
                 state.message?.let { message ->
                     Text(
@@ -236,6 +257,20 @@ private fun ConfigurationBackupHomeDialog(
                         } else {
                             MaterialTheme.colorScheme.tertiary
                         },
+                    )
+                }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Checkbox(
+                        checked = encrypted,
+                        onCheckedChange = onEncryptedChange,
+                    )
+                    Text(
+                        "加密备份",
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodyMedium,
                     )
                 }
             }
@@ -319,6 +354,7 @@ private fun ConfigurationBackupExportPasswordDialog(
 
 @Composable
 private fun ConfigurationBackupImportPasswordDialog(
+    encrypted: Boolean = true,
     password: String,
     onPasswordChange: (String) -> Unit,
     errorMessage: String?,
@@ -332,7 +368,11 @@ private fun ConfigurationBackupImportPasswordDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
-                    "输入创建此备份时的密码。验证成功后会先显示摘要，尚不会覆盖当前配置。",
+                    if (encrypted) {
+                        "输入创建此备份时的密码。验证成功后会先显示摘要，尚不会覆盖当前配置。"
+                    } else {
+                        "正在读取未加密备份，稍后会显示摘要。"
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -345,9 +385,13 @@ private fun ConfigurationBackupImportPasswordDialog(
             }
         },
         confirmButton = {
-            Button(
-                onClick = onPreview,
-                enabled = password.length >= ConfigurationBackupCodec.MIN_PASSWORD_LENGTH,
+                Button(
+                    onClick = onPreview,
+                    enabled = if (encrypted) {
+                        password.length >= ConfigurationBackupCodec.MIN_PASSWORD_LENGTH
+                    } else {
+                        true
+                    },
                 modifier = Modifier.heightIn(min = 48.dp),
             ) { Text("验证并预览") }
         },
@@ -367,6 +411,7 @@ private fun ConfigurationBackupImportPasswordDialog(
 @Composable
 private fun ConfigurationBackupImportConfirmationDialog(
     preview: ConfigurationBackupPreview,
+    encrypted: Boolean,
     password: String,
     onPasswordChange: (String) -> Unit,
     errorMessage: String?,
@@ -388,18 +433,20 @@ private fun ConfigurationBackupImportConfirmationDialog(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
                 )
-                BackupPasswordField(
-                    value = password,
-                    onValueChange = onPasswordChange,
-                    label = "再次输入备份密码以确认",
-                )
+                if (encrypted) {
+                    BackupPasswordField(
+                        value = password,
+                        onValueChange = onPasswordChange,
+                        label = "再次输入备份密码以确认",
+                    )
+                }
                 errorMessage?.let { message -> BackupInlineError(message) }
             }
         },
         confirmButton = {
             Button(
                 onClick = onConfirm,
-                enabled = password.length >= ConfigurationBackupCodec.MIN_PASSWORD_LENGTH,
+                enabled = !encrypted || password.length >= ConfigurationBackupCodec.MIN_PASSWORD_LENGTH,
                 modifier = Modifier.heightIn(min = 48.dp),
             ) { Text("确认覆盖") }
         },

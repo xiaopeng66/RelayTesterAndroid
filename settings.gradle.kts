@@ -16,5 +16,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "RelayTesterAndroid"
+rootProject.name = "relay-tester-android"
 include(":app")
