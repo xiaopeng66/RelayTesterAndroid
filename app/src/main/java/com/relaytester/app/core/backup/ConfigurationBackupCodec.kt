@@ -66,9 +66,10 @@ class ConfigurationBackupException(message: String) : Exception(message)
 object ConfigurationBackupCodec {
     const val MIN_PASSWORD_LENGTH = 12
     const val MAX_BACKUP_BYTES = 5 * 1024 * 1024
+    const val PLAINTEXT_VERSION = 2
 
     private const val FORMAT = "relay-tester-backup"
-    private const val VERSION = 1
+    private const val ENCRYPTED_VERSION = 1
     private const val KDF_ALGORITHM = "PBKDF2WithHmacSHA256"
     private const val CIPHER_ALGORITHM = "AES/GCM/NoPadding"
     private const val AES_ALGORITHM = "AES"
@@ -100,7 +101,7 @@ object ConfigurationBackupCodec {
             val payload = cipher.doFinal(backup.toJson().toString().toByteArray(Charsets.UTF_8))
             JSONObject()
                 .put("format", FORMAT)
-                .put("version", VERSION)
+                .put("version", ENCRYPTED_VERSION)
                 .put(
                     "kdf",
                     JSONObject()
@@ -126,6 +127,19 @@ object ConfigurationBackupCodec {
         }
     }
 
+    fun exportPlaintext(backup: ConfigurationBackup): ByteArray {
+        return try {
+            JSONObject()
+                .put("format", FORMAT)
+                .put("version", PLAINTEXT_VERSION)
+                .put("payload", backup.toJson())
+                .toString()
+                .toByteArray(Charsets.UTF_8)
+        } catch (_: Throwable) {
+            throw ConfigurationBackupException("无法创建未加密备份")
+        }
+    }
+
     fun decrypt(raw: ByteArray, password: CharArray): ConfigurationBackup {
         return try {
             if (raw.size !in 1..MAX_BACKUP_BYTES) {
@@ -135,7 +149,9 @@ object ConfigurationBackupCodec {
                 throw ConfigurationBackupException("请输入至少 $MIN_PASSWORD_LENGTH 个字符的备份密码")
             }
             val envelope = JSONObject(raw.toString(Charsets.UTF_8))
-            if (envelope.optString("format") != FORMAT || envelope.optInt("version", -1) != VERSION) {
+            if (envelope.optString("format") != FORMAT ||
+                envelope.optInt("version", -1) != ENCRYPTED_VERSION
+            ) {
                 throw ConfigurationBackupException("不是受支持的 Relay Tester 备份文件")
             }
             val kdf = envelope.optJSONObject("kdf")
@@ -168,6 +184,25 @@ object ConfigurationBackupCodec {
         }
     }
 
+    fun parse(raw: ByteArray): ConfigurationBackup {
+        return try {
+            if (raw.size !in 1..MAX_BACKUP_BYTES) {
+                throw ConfigurationBackupException("备份文件大小无效")
+            }
+            val envelope = JSONObject(raw.toString(Charsets.UTF_8))
+            if (envelope.optString("format") != FORMAT ||
+                envelope.optInt("version", -1) != PLAINTEXT_VERSION
+            ) {
+                throw ConfigurationBackupException("不是受支持的未加密备份文件")
+            }
+            fromJson(envelope.optJSONObject("payload") ?: throw ConfigurationBackupException("备份文件缺少内容"))
+        } catch (error: ConfigurationBackupException) {
+            throw error
+        } catch (_: Throwable) {
+            throw ConfigurationBackupException("未加密备份文件已损坏")
+        }
+    }
+
     fun preview(backup: ConfigurationBackup): ConfigurationBackupPreview = ConfigurationBackupPreview(
         createdAt = backup.createdAt,
         supplierCount = backup.suppliers.size,
@@ -189,7 +224,7 @@ object ConfigurationBackupCodec {
     }
 
     private fun ConfigurationBackup.toJson(): JSONObject = JSONObject()
-        .put("schemaVersion", VERSION)
+        .put("schemaVersion", ENCRYPTED_VERSION)
         .put("createdAt", createdAt)
         .put("activeSupplierId", activeSupplierId)
         .put("suppliers", JSONArray(suppliers.map { supplier -> supplier.toJson() }))
@@ -273,7 +308,7 @@ object ConfigurationBackupCodec {
         .put("updatedAt", updatedAt)
 
     private fun fromJson(root: JSONObject): ConfigurationBackup {
-        if (root.optInt("schemaVersion", -1) != VERSION) {
+        if (root.optInt("schemaVersion", -1) != ENCRYPTED_VERSION) {
             throw ConfigurationBackupException("备份内容版本不受支持")
         }
         val supplierArray = root.optJSONArray("suppliers")

@@ -30,12 +30,12 @@ import okio.Buffer
 import org.json.JSONArray
 import org.json.JSONObject
 
-class RelayApi(
+open class RelayApi(
     private val client: OkHttpClient = OkHttpClient.Builder()
         .retryOnConnectionFailure(false)
         .build(),
 ) {
-    suspend fun fetchModels(
+    open suspend fun fetchModels(
         profile: SupplierProfile,
         apiKey: String,
         timeoutSeconds: Int,
@@ -69,7 +69,7 @@ class RelayApi(
         }
     }
 
-    suspend fun test(
+    open suspend fun test(
         profile: SupplierProfile,
         apiKey: String,
         model: String,

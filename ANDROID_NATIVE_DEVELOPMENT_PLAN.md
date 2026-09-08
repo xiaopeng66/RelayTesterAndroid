@@ -66,7 +66,7 @@
 
 建议初始即按 feature 物理拆分，但避免在一期建立过多无业务的模块。
 
-    RelayTesterAndroid/
+    relay-tester-android/
     ├── app/                    # Application、主导航、Hilt 装配
     ├── core/
     │   ├── model/              # 稳定领域模型与错误模型

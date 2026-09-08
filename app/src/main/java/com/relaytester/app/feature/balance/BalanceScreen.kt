@@ -75,6 +75,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.semantics.Role
@@ -109,6 +110,7 @@ import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
 
+private val BALANCE_SUPPLIER_CARD_HEIGHT = 112.dp
 private val BALANCE_RING_SLOT_SIZE = 44.dp
 private val BALANCE_RING_DIAMETER = 36.dp
 
@@ -165,6 +167,7 @@ fun BalanceScreen(
             onAccessTokenChange = viewModel::updateBalanceAccessToken,
             onUserIdChange = viewModel::updateBalanceUserId,
             onSaveCredentials = viewModel::saveBalanceCredentials,
+            onDismissCredentials = viewModel::discardBalanceCredentialsChanges,
             onTemplateSelected = viewModel::selectBalanceTemplate,
             onNewTemplate = viewModel::beginCreateBalanceTemplate,
             onEditTemplate = viewModel::beginEditBalanceTemplate,
@@ -191,6 +194,7 @@ private fun BalanceHome(
     onAccessTokenChange: (String) -> Unit,
     onUserIdChange: (String) -> Unit,
     onSaveCredentials: () -> Unit,
+    onDismissCredentials: () -> Unit,
     onTemplateSelected: (String) -> Unit,
     onNewTemplate: () -> Unit,
     onEditTemplate: (String) -> Unit,
@@ -216,7 +220,12 @@ private fun BalanceHome(
                 onConfigurationBackup = onConfigurationBackup,
             )
         },
-        snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
+        snackbarHost = {
+            SnackbarHost(
+                hostState = snackbarHostState,
+                modifier = Modifier,
+            )
+        },
     ) { innerPadding ->
         if (state.isInitializing) {
             Box(
@@ -246,6 +255,7 @@ private fun BalanceHome(
                     credentialsSupplierId = supplierId
                     onSelectSupplier(supplierId)
                 },
+                onDismissCredentials = onDismissCredentials,
                 onTemplateSelected = onTemplateSelected,
                 onNewTemplate = onNewTemplate,
                 onEditTemplate = onEditTemplate,
@@ -284,7 +294,10 @@ private fun BalanceHome(
                 credentials = state.credentials,
                 errors = state.credentialErrors,
                 enabled = !isQuerying,
-                onDismiss = { credentialsSupplierId = null },
+                onDismiss = {
+                    onDismissCredentials()
+                    credentialsSupplierId = null
+                },
                 onAccessTokenChange = onAccessTokenChange,
                 onUserIdChange = onUserIdChange,
                 onSave = onSaveCredentials,
@@ -311,6 +324,7 @@ private fun BalanceContent(
     onSelectSupplier: (String) -> Unit,
     onRefreshSupplierBalance: (String) -> Unit,
     onEditCredentials: (String) -> Unit,
+    onDismissCredentials: () -> Unit,
     onTemplateSelected: (String) -> Unit,
     onNewTemplate: () -> Unit,
     onEditTemplate: (String) -> Unit,
@@ -318,7 +332,7 @@ private fun BalanceContent(
     contentPadding: PaddingValues,
 ) {
     LazyVerticalGrid(
-        columns = GridCells.Fixed(1),
+        columns = GridCells.Fixed(2),
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(
             start = 16.dp,
@@ -348,22 +362,17 @@ private fun BalanceContent(
             key = { it.id },
             contentType = { "supplier_balance" },
         ) { supplier ->
-            Box(modifier = Modifier.fillMaxWidth()) {
-                BalanceSupplierCard(
-                    modifier = Modifier
-                        .widthIn(max = 336.dp)
-                        .align(Alignment.Center),
-                    supplier = supplier,
-                    snapshot = snapshots[supplier.id],
-                    errorMessage = errors[supplier.id],
-                    selected = supplier.id == activeSupplier?.id,
-                    isQuerying = supplier.id in queryingSupplierIds,
-                    enabled = !isSecretsHydrating,
-                    onClick = { onSelectSupplier(supplier.id) },
-                    onDoubleClick = { onRefreshSupplierBalance(supplier.id) },
-                    onEditCredentials = { onEditCredentials(supplier.id) },
-                )
-            }
+            BalanceSupplierCard(
+                supplier = supplier,
+                snapshot = snapshots[supplier.id],
+                errorMessage = errors[supplier.id],
+                selected = supplier.id == activeSupplier?.id,
+                isQuerying = supplier.id in queryingSupplierIds,
+                enabled = !isSecretsHydrating,
+                onClick = { onSelectSupplier(supplier.id) },
+                onDoubleClick = { onRefreshSupplierBalance(supplier.id) },
+                onEditCredentials = { onEditCredentials(supplier.id) },
+            )
         }
         if (isSecretsHydrating) {
             item(
@@ -509,62 +518,75 @@ private fun BalanceSupplierCard(
     ) {
         Box(
             modifier = Modifier
-                .fillMaxWidth()
-                .heightIn(min = 118.dp),
+                .height(BALANCE_SUPPLIER_CARD_HEIGHT),
         ) {
             Column(
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 14.dp, vertical = 8.dp)
-                    .padding(end = 50.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp),
+                    .height(BALANCE_SUPPLIER_CARD_HEIGHT)
+                    .padding(start = 14.dp, top = 7.dp, end = 14.dp, bottom = 7.dp),
             ) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(36.dp),
+                        .height(28.dp)
+                        .padding(end = 44.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
                         text = supplier.name,
                         modifier = Modifier.weight(1f),
-                        style = MaterialTheme.typography.titleSmall,
+                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
-                Row(
+                Column(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(16.dp),
                 ) {
-                    BalanceCardMetric(
-                        label = "可用",
-                        value = snapshot?.formatValue(snapshot.availableRaw) ?: "—",
-                        valueColor = MaterialTheme.colorScheme.tertiary,
-                        modifier = Modifier.weight(1f),
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "可用",
+                        modifier = Modifier.height(16.dp),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        softWrap = false,
                     )
-                    BalanceCardMetric(
-                        label = "总额",
-                        value = snapshot?.totalRaw?.let(snapshot::formatValue) ?: "—",
-                        valueColor = MaterialTheme.colorScheme.onSurface,
-                        modifier = Modifier.weight(1f),
+                    Spacer(Modifier.height(1.dp))
+                    Text(
+                        text = snapshot?.formatValue(snapshot.availableRaw) ?: "—",
+                        modifier = Modifier.height(21.dp),
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.tertiary,
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis,
                     )
                 }
-                Text(
-                    text = when {
-                        isQuerying -> "正在查询…"
-                        errorMessage != null -> errorMessage
-                        snapshot?.planName != null -> snapshot.planName.orEmpty()
-                        snapshot != null -> "已更新 ${formatDateTime(snapshot.checkedAt)}"
-                        supplier.baseUrl.isBlank() -> "需要配置站点地址"
-                        else -> "尚未查询"
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = statusColor,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
+                Spacer(Modifier.weight(1f))
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(end = 34.dp),
+                ) {
+                    Text(
+                        text = when {
+                            isQuerying -> "正在查询…"
+                            errorMessage != null -> errorMessage
+                            snapshot?.planName != null -> snapshot.planName.orEmpty()
+                            snapshot != null -> "已更新 ${formatDateTime(snapshot.checkedAt)}"
+                            supplier.baseUrl.isBlank() -> "需要配置站点地址"
+                            else -> "尚未查询"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = statusColor,
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+
+                Spacer(Modifier.weight(1f))
             }
             Box(
                 modifier = Modifier

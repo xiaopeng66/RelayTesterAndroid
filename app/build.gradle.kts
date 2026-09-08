@@ -8,14 +8,24 @@ android {
     namespace = "com.relaytester.app"
     compileSdk = 36
 
+    signingConfigs {
+        create("release") {
+            storeFile = rootProject.file("keystore-relay-tester-120.p12")
+            storePassword = System.getProperty("relaytester.storePassword")
+            keyAlias = "relaytester"
+            keyPassword = System.getProperty("relaytester.keyPassword")
+            storeType = "PKCS12"
+        }
+    }
+
     defaultConfig {
         applicationId = "com.relaytester.app"
         minSdk = 26
         targetSdk = 36
         // Android versionCode must remain monotonic for an in-place upgrade.
         // Encode the public line as major * 10_000 + minor * 100 + patch.
-        versionCode = 10_100
-        versionName = "1.1.0"
+        versionCode = 10_200
+        versionName = "1.2.0"
         ndk {
             abiFilters += "arm64-v8a"
         }
@@ -43,6 +53,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
+            signingConfig = signingConfigs.getByName("release")
         }
         create("optimized") {
             initWith(getByName("release"))
@@ -82,6 +93,10 @@ dependencies {
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("io.github.taoweiji.quickjs:quickjs-android:1.4.6")
+
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
+    testImplementation("org.json:json:20240303")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

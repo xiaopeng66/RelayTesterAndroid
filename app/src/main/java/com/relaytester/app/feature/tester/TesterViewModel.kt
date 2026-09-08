@@ -44,6 +44,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
@@ -210,11 +211,23 @@ data class TesterUiState(
     val catalogPickerSupplierId: String? = null,
     val catalogPickerModels: List<String> = emptyList(),
     val isCatalogFetching: Boolean = false,
+    /** Cross-supplier model search results shown by the advanced test dialog. */
+    val catalogSearchResults: List<CatalogSearchResult> = emptyList(),
+    val isCatalogSearching: Boolean = false,
+    val catalogSearchMessage: String? = null,
+    val isCatalogSearchError: Boolean = false,
     val isUnifiedTesting: Boolean = false,
     val unifiedEntryId: String? = null,
     val unifiedProgressDone: Int = 0,
     val unifiedProgressTotal: Int = 0,
     val unifiedResults: List<UnifiedModelTestResult> = emptyList(),
+)
+
+@Immutable
+data class CatalogSearchResult(
+    val supplierId: String,
+    val supplierName: String,
+    val modelId: String,
 )
 
 @Immutable
@@ -235,6 +248,7 @@ data class ExportPayload(
 
 /** Encrypted bytes waiting only for Android's system file-creation result. */
 data class ConfigurationBackupExportPayload(
+    val encrypted: Boolean,
     val fileName: String,
     val encryptedBytes: ByteArray,
 )
@@ -247,6 +261,7 @@ data class ConfigurationBackupUiState(
     val importPreview: ConfigurationBackupPreview? = null,
     val message: String? = null,
     val isMessageError: Boolean = false,
+    val importIsEncrypted: Boolean = true,
 )
 
 enum class BalanceTemplateField {
@@ -506,6 +521,7 @@ class TesterViewModel(
     private var unifiedTestJob: Job? = null
     /** Serializes profile replacement and persistence when card refreshes finish together. */
     private val profileMutationMutex = Mutex()
+    private val supplierActivationMutex = Mutex()
     /** Prevents concurrent balance responses from overwriting each other's snapshot set. */
     private val balancePersistenceMutex = Mutex()
     /** Encrypted source bytes only; decrypted configuration is never retained for confirmation. */
@@ -627,7 +643,128 @@ class TesterViewModel(
     }
 
     fun clearCatalogPickerModels() {
-        _uiState.update { it.copy(catalogPickerSupplierId = null, catalogPickerModels = emptyList()) }
+        _uiState.update {
+            it.copy(
+                catalogPickerSupplierId = null,
+                catalogPickerModels = emptyList(),
+                catalogSearchResults = emptyList(),
+                catalogSearchMessage = null,
+                isCatalogSearchError = false,
+            )
+        }
+    }
+
+    /**
+     * Fetches every configured supplier's current model directory concurrently,
+     * then keeps only models containing the requested keyword. This is transient
+     * dialog state; no active supplier or normal test selection is changed.
+     */
+    fun searchAllCatalogModels(keyword: String) {
+        if (runningOrInitializing() || _uiState.value.isCatalogSearching) return
+        val terms = parseModelFilterTerms(keyword)
+        if (terms.isEmpty()) {
+            showMessage("请输入要检索的模型关键词", isError = true)
+            return
+        }
+        val supplierSnapshot = profiles.toList()
+        if (supplierSnapshot.isEmpty()) {
+            showMessage("请先添加供应商", isError = true)
+            return
+        }
+        val activeDraft = _uiState.value.draft
+        _uiState.update {
+            it.copy(
+                isCatalogSearching = true,
+                catalogSearchResults = emptyList(),
+                catalogSearchMessage = null,
+                isCatalogSearchError = false,
+                message = null,
+                isMessageError = false,
+            )
+        }
+        viewModelScope.launch {
+            try {
+                val perSupplier = coroutineScope {
+                    supplierSnapshot.map { profile ->
+                        async(Dispatchers.IO) {
+                            try {
+                                val apiKey = if (activeDraft?.id == profile.id &&
+                                    (activeDraft.apiKeyDirty || activeDraft.apiKey.isNotBlank())
+                                ) {
+                                    activeDraft.apiKey
+                                } else {
+                                    withContext(Dispatchers.IO) {
+                                        profile.apiKeySecretId?.let(secretStore::get).orEmpty()
+                                    }
+                                }
+                                if (apiKey.isBlank()) {
+                                    profile to null
+                                } else {
+                                    profile to when (
+                                        val result = relayApi.fetchModels(
+                                            profile = profile,
+                                            apiKey = apiKey,
+                                            timeoutSeconds = profile.testSettings.timeoutSeconds,
+                                        )
+                                    ) {
+                                        is ApiResult.Success -> result.value
+                                        is ApiResult.Failure -> null
+                                    }
+                                }
+                            } catch (error: CancellationException) {
+                                throw error
+                            } catch (_: Throwable) {
+                                // Keep one supplier failure from cancelling the rest of the search.
+                                profile to null
+                            }
+                        }
+                    }.awaitAll()
+                }
+                val matches = perSupplier
+                    .flatMap { (profile, models) ->
+                        models.orEmpty()
+                            .filter { model -> model.matchesAnyModelFilterTerm(terms) }
+                            .map { model -> CatalogSearchResult(profile.id, profile.name, model) }
+                    }
+                    .distinctBy { it.supplierId + "\u0000" + it.modelId }
+                    .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.modelId })
+                val successfulSuppliers = perSupplier.count { (_, result) -> result != null }
+                val failures = perSupplier.size - successfulSuppliers
+                _uiState.update {
+                    it.copy(
+                        isCatalogSearching = false,
+                        catalogSearchResults = matches,
+                        catalogSearchMessage = when {
+                            matches.isNotEmpty() && failures == 0 -> "检索到 ${matches.size} 个模型"
+                            matches.isNotEmpty() -> "检索到 ${matches.size} 个模型，${failures} 个供应商未成功拉取"
+                            failures == perSupplier.size -> "所有供应商模型拉取失败，请检查 API Key 和网络"
+                            else -> "没有找到包含关键词的模型"
+                        },
+                        isCatalogSearchError = matches.isEmpty(),
+                        message = when {
+                            matches.isNotEmpty() && failures == 0 -> "检索到 ${matches.size} 个模型"
+                            matches.isNotEmpty() -> "检索到 ${matches.size} 个模型，${failures} 个供应商未成功拉取"
+                            failures == perSupplier.size -> "所有供应商模型拉取失败，请检查 API Key 和网络"
+                            else -> "没有找到包含关键词的模型"
+                        },
+                        isMessageError = matches.isEmpty(),
+                    )
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Throwable) {
+                _uiState.update {
+                    it.copy(
+                        isCatalogSearching = false,
+                        catalogSearchResults = emptyList(),
+                        catalogSearchMessage = "模型检索已中断，请稍后重试",
+                        isCatalogSearchError = true,
+                        message = "模型检索已中断，请稍后重试",
+                        isMessageError = true,
+                    )
+                }
+            }
+        }
     }
 
     fun saveModelCatalogEntry(name: String, sources: List<ModelSource>) {
@@ -846,6 +983,33 @@ class TesterViewModel(
         }
     }
 
+    fun discardBalanceCredentialsChanges() {
+        val activeId = activeSupplierId
+        val profile = activeId?.let { id -> profiles.firstOrNull { it.id == id } }
+        _balanceUiState.update {
+            it.copy(
+                credentials = profile
+                    ?.let { saved -> BalanceCredentialsDraft.from(saved, "") }
+                    ?: BalanceCredentialsDraft(),
+                credentialErrors = BalanceCredentialsErrors(),
+            )
+        }
+        if (profile != null) {
+            viewModelScope.launch {
+                loadStartupCredentials(profile).let { credentials ->
+                    _balanceUiState.update {
+                        it.copy(
+                            credentials = BalanceCredentialsDraft.from(
+                                profile,
+                                credentials.balanceAccessToken,
+                            ),
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     fun updateBalanceUserId(value: String) {
         if (balanceOperationBlocked()) return
         _balanceUiState.update { state ->
@@ -960,12 +1124,12 @@ class TesterViewModel(
     }
 
     /** Builds an encrypted, cross-device configuration archive after saving visible drafts. */
-    fun createConfigurationBackup(password: String) {
+    fun createConfigurationBackup(password: String, encrypted: Boolean) {
         if (!isConfigurationTransferAllowed()) {
             showConfigurationBackupMessage("请等待当前初始化、测试或余额查询完成", isError = true)
             return
         }
-        if (password.length < ConfigurationBackupCodec.MIN_PASSWORD_LENGTH) {
+        if (encrypted && password.length < ConfigurationBackupCodec.MIN_PASSWORD_LENGTH) {
             showConfigurationBackupMessage(
                 "备份密码至少需要 ${ConfigurationBackupCodec.MIN_PASSWORD_LENGTH} 个字符",
                 isError = true,
@@ -980,15 +1144,20 @@ class TesterViewModel(
                 checkNotNull(persistDraft()) { "当前站点配置无法保存" }
                 checkNotNull(persistBalanceCredentials()) { "当前余额凭据无法保存" }
                 val backup = withContext(Dispatchers.IO) { createConfigurationBackupSnapshot() }
-                val encryptedBytes = withContext(Dispatchers.IO) {
+                val exportBytes = withContext(Dispatchers.IO) {
+                    if (encrypted) {
                     ConfigurationBackupCodec.encrypt(backup, password.toCharArray())
+                    } else {
+                        ConfigurationBackupCodec.exportPlaintext(backup)
+                    }
                 }
                 _configurationBackupUiState.update {
                     it.copy(
                         isBusy = false,
                         exportPayload = ConfigurationBackupExportPayload(
                             fileName = "relay_tester_backup_${System.currentTimeMillis()}.rtbackup",
-                            encryptedBytes = encryptedBytes,
+                            encrypted = encrypted,
+                            encryptedBytes = exportBytes,
                         ),
                     )
                 }
@@ -1026,18 +1195,32 @@ class TesterViewModel(
         }
         pendingConfigurationImportBytes?.fill(0)
         pendingConfigurationImportBytes = bytes.copyOf()
+        val isEncrypted = try {
+            val envelope = JSONObject(bytes.toString(Charsets.UTF_8))
+            envelope.optString("format") == "relay-tester-backup" &&
+                envelope.optInt("version", -1) == 1
+        } catch (_: Throwable) {
+            false
+        }
         _configurationBackupUiState.update {
-            it.copy(importFileSelected = true, importPreview = null, message = null, isMessageError = false)
+            it.copy(
+                importFileSelected = true,
+                importPreview = null,
+                message = null,
+                isMessageError = false,
+                importIsEncrypted = isEncrypted,
+            )
         }
     }
 
     fun previewConfigurationImport(password: String) {
         val encryptedBytes = pendingConfigurationImportBytes
+        val importIsEncrypted = _configurationBackupUiState.value.importIsEncrypted
         if (encryptedBytes == null) {
             showConfigurationBackupMessage("请先选择配置备份文件", isError = true)
             return
         }
-        if (password.length < ConfigurationBackupCodec.MIN_PASSWORD_LENGTH) {
+        if (importIsEncrypted && password.length < ConfigurationBackupCodec.MIN_PASSWORD_LENGTH) {
             showConfigurationBackupMessage(
                 "请输入至少 ${ConfigurationBackupCodec.MIN_PASSWORD_LENGTH} 个字符的备份密码",
                 isError = true,
@@ -1048,9 +1231,12 @@ class TesterViewModel(
             _configurationBackupUiState.update { it.copy(isBusy = true, message = null, isMessageError = false) }
             try {
                 val preview = withContext(Dispatchers.IO) {
-                    ConfigurationBackupCodec.preview(
-                        ConfigurationBackupCodec.decrypt(encryptedBytes, password.toCharArray()),
-                    )
+                    val backup = if (importIsEncrypted) {
+                        ConfigurationBackupCodec.decrypt(encryptedBytes, password.toCharArray())
+                    } else {
+                        ConfigurationBackupCodec.parse(encryptedBytes)
+                    }
+                    ConfigurationBackupCodec.preview(backup)
                 }
                 _configurationBackupUiState.update { it.copy(isBusy = false, importPreview = preview) }
             } catch (error: CancellationException) {
@@ -1071,6 +1257,7 @@ class TesterViewModel(
     /** Re-decrypts the encrypted source and commits it only after the user confirms replacement. */
     fun confirmConfigurationImport(password: String) {
         val encryptedBytes = pendingConfigurationImportBytes
+        val importIsEncrypted = _configurationBackupUiState.value.importIsEncrypted
         if (encryptedBytes == null || _configurationBackupUiState.value.importPreview == null) {
             showConfigurationBackupMessage("请先验证并预览配置备份", isError = true)
             return
@@ -1083,7 +1270,11 @@ class TesterViewModel(
             _configurationBackupUiState.update { it.copy(isBusy = true, message = null, isMessageError = false) }
             try {
                 val backup = withContext(Dispatchers.IO) {
-                    ConfigurationBackupCodec.decrypt(encryptedBytes, password.toCharArray())
+                    if (importIsEncrypted) {
+                        ConfigurationBackupCodec.decrypt(encryptedBytes, password.toCharArray())
+                    } else {
+                        ConfigurationBackupCodec.parse(encryptedBytes)
+                    }
                 }
                 applyConfigurationBackup(backup)
                 pendingConfigurationImportBytes?.fill(0)
@@ -1343,37 +1534,107 @@ class TesterViewModel(
         }
     }
 
-    fun selectSupplier(id: String) {
-        if (runningOrInitializing() || id == activeSupplierId) return
+    fun discardCurrentSupplierChanges() {
+        val profile = activeSupplierId?.let { id -> profiles.firstOrNull { it.id == id } } ?: return
+        _uiState.update {
+            it.copy(
+                draft = SupplierDraft.from(profile, ""),
+                errors = FormErrors(),
+                message = null,
+            )
+        }
         viewModelScope.launch {
-            activateSupplier(id)
+            val credentials = loadStartupCredentials(profile)
+            _uiState.update {
+                it.copy(
+                    draft = SupplierDraft.from(
+                        profile.copy(),
+                        credentials.apiKey,
+                    ),
+                )
+            }
+        }
+    }
+
+    fun selectSupplier(id: String) {
+        if (runningOrInitializing() || id == _uiState.value.activeSupplierId) return
+        viewModelScope.launch {
+            supplierActivationMutex.withLock {
+                activateSupplier(id)
+            }
         }
     }
 
     /** Activates a supplier in the caller coroutine so follow-up work cannot use the previous site. */
     private suspend fun activateSupplier(id: String): Boolean {
         if (profiles.none { it.id == id }) return false
-        if (id == activeSupplierId) return true
-        if (persistDraft() == null || persistBalanceCredentials() == null) return false
+        if (id == _uiState.value.activeSupplierId) return true
+        val nextProfile = profiles.firstOrNull { it.id == id } ?: return false
         val previousActiveSupplierId = activeSupplierId
-        activeSupplierId = id
-        if (!saveProfiles()) {
+        val previousUiState = _uiState.value
+        val previousBalanceUiState = _balanceUiState.value
+
+        fun restoreSelection() {
             activeSupplierId = previousActiveSupplierId
-            return false
+            _uiState.update { state ->
+                state.copy(
+                    activeSupplierId = previousActiveSupplierId,
+                    results = previousUiState.results,
+                    selectedModels = previousUiState.selectedModels,
+                    summary = previousUiState.summary,
+                    progressDone = previousUiState.progressDone,
+                    progressTotal = previousUiState.progressTotal,
+                    errors = previousUiState.errors,
+                )
+            }
+            _balanceUiState.update { state ->
+                state.copy(
+                    activeSupplierId = previousActiveSupplierId,
+                    credentialErrors = previousBalanceUiState.credentialErrors,
+                )
+            }
         }
-        profiles.firstOrNull { it.id == id }?.let { profile -> installDraft(profile) }
+
+        // The visible selection should change in the same frame as the tap.
+        // The draft and credentials remain associated with the previous site
+        // until their durable writes below complete.
         _uiState.update {
             it.copy(
                 activeSupplierId = id,
                 results = emptyList(),
-                selectedModels = profiles.firstOrNull { profile -> profile.id == id }?.models?.toSet().orEmpty(),
+                selectedModels = nextProfile.models.toSet(),
                 summary = null,
                 progressDone = 0,
                 progressTotal = 0,
                 errors = FormErrors(),
             )
         }
-        _balanceUiState.update { it.copy(credentialErrors = BalanceCredentialsErrors()) }
+        _balanceUiState.update {
+            it.copy(
+                activeSupplierId = id,
+                credentialErrors = BalanceCredentialsErrors(),
+            )
+        }
+
+        if (persistDraft() == null || persistBalanceCredentials() == null) {
+            restoreSelection()
+            return false
+        }
+        activeSupplierId = id
+        if (!saveProfiles()) {
+            restoreSelection()
+            return false
+        }
+        installDraft(nextProfile)
+        val nextCredentials = loadStartupCredentials(nextProfile)
+        _balanceUiState.update {
+            it.copy(
+                credentials = BalanceCredentialsDraft.from(
+                    nextProfile,
+                    nextCredentials.balanceAccessToken,
+                ),
+            )
+        }
         return true
     }
 
@@ -1986,9 +2247,8 @@ class TesterViewModel(
     }
 
     /**
-     * Refreshes all suppliers one by one. Sequential execution keeps the tool
-     * predictable for heterogeneous relay stations and lets one failure leave
-     * the remaining sites untouched.
+     * Refreshes every configured supplier in parallel. Each supplier carries its
+     * own persisted credentials, so one failure can never affect another site.
      */
     private suspend fun queryAllBalancesInternal() {
         // Include a user's unsaved active-site values before taking the batch
@@ -2008,92 +2268,99 @@ class TesterViewModel(
             )
         }
 
-        var succeeded = 0
-        targets.forEachIndexed { index, profile ->
-            _balanceUiState.update {
-                it.copy(
-                    queryingSupplierIds = setOf(profile.id),
-                    batchProgressDone = index,
-                    balanceErrors = it.balanceErrors - profile.id,
-                )
-            }
-            val preparation = try {
-                prepareBalanceRequestFor(profile)
-            } catch (error: CancellationException) {
-                throw error
-            } catch (_: Throwable) {
-                _balanceUiState.update {
-                    it.copy(
-                        balanceErrors = it.balanceErrors + (
-                            profile.id to "无法读取此站点的查询凭据，请重新保存后重试"
-                        ),
-                        batchProgressDone = index + 1,
-                    )
-                }
-                return@forEachIndexed
-            }
-            when (preparation) {
-                is BalanceRequestPreparation.Ready -> {
-                    when (
-                        val result = withContext(Dispatchers.IO) {
-                            balanceApi.query(
-                                profile = preparation.request.profile,
-                                apiKey = preparation.request.apiKey,
-                                accessToken = preparation.request.accessToken,
-                                userId = preparation.request.userId,
-                                template = preparation.request.template,
+        try {
+            val succeeded = coroutineScope {
+                targets.map { profile ->
+                    async {
+                        _balanceUiState.update {
+                            it.copy(
+                                queryingSupplierIds = it.queryingSupplierIds + profile.id,
+                                balanceErrors = it.balanceErrors - profile.id,
                             )
                         }
-                    ) {
-                        is BalanceQueryResult.Success -> {
-                            succeeded += 1
+                        val preparation = try {
+                            prepareBalanceRequestFor(profile)
+                        } catch (error: CancellationException) {
+                            throw error
+                        } catch (_: Throwable) {
+                            BalanceRequestPreparation.Invalid(
+                                "无法读取此站点的查询凭据，请重新保存后重试"
+                            )
+                        }
+                        if (preparation is BalanceRequestPreparation.Invalid) {
                             _balanceUiState.update {
                                 it.copy(
-                                    balanceSnapshots = it.balanceSnapshots + (profile.id to result.snapshot),
-                                    balanceErrors = it.balanceErrors - profile.id,
-                                    batchProgressDone = index + 1,
+                                    balanceErrors = it.balanceErrors + (profile.id to preparation.message),
+                                    batchProgressDone = (it.batchProgressDone + 1).coerceAtMost(targets.size),
                                 )
                             }
+                            return@async false
                         }
-
-                        is BalanceQueryResult.Failure -> {
-                            _balanceUiState.update {
-                                it.copy(
-                                    balanceErrors = it.balanceErrors + (profile.id to result.message),
-                                    batchProgressDone = index + 1,
+                        val request = (preparation as BalanceRequestPreparation.Ready).request
+                        when (
+                            val result = withContext(Dispatchers.IO) {
+                                balanceApi.query(
+                                    profile = request.profile,
+                                    apiKey = request.apiKey,
+                                    accessToken = request.accessToken,
+                                    userId = request.userId,
+                                    template = request.template,
                                 )
+                            }
+                        ) {
+                            is BalanceQueryResult.Success -> {
+                                _balanceUiState.update {
+                                    it.copy(
+                                        balanceSnapshots = it.balanceSnapshots + (profile.id to result.snapshot),
+                                        balanceErrors = it.balanceErrors - profile.id,
+                                        batchProgressDone = (it.batchProgressDone + 1).coerceAtMost(targets.size),
+                                    )
+                                }
+                                true
+                            }
+
+                            is BalanceQueryResult.Failure -> {
+                                _balanceUiState.update {
+                                    it.copy(
+                                        balanceErrors = it.balanceErrors + (profile.id to result.message),
+                                        batchProgressDone = (it.batchProgressDone + 1).coerceAtMost(targets.size),
+                                    )
+                                }
+                                false
                             }
                         }
                     }
-                }
-
-                is BalanceRequestPreparation.Invalid -> {
-                    _balanceUiState.update {
-                        it.copy(
-                            balanceErrors = it.balanceErrors + (profile.id to preparation.message),
-                            batchProgressDone = index + 1,
-                        )
-                    }
-                }
+                }.awaitAll().count { it }
             }
-        }
-
-        val failed = targets.size - succeeded
-        _balanceUiState.update {
-            it.copy(
-                isQuerying = false,
-                queryingSupplierIds = emptySet(),
-                batchProgressDone = targets.size,
-                message = if (failed == 0) {
-                    "已更新 $succeeded 个站点"
-                } else {
-                    "已完成：$succeeded 成功，$failed 需要处理"
-                },
-                isMessageError = false,
-            )
-        }
-        if (succeeded > 0) {
-            persistBalanceSnapshots()
+            val failed = targets.size - succeeded
+            _balanceUiState.update {
+                it.copy(
+                    isQuerying = false,
+                    queryingSupplierIds = emptySet(),
+                    batchProgressDone = targets.size,
+                    message = if (failed == 0) {
+                        "已更新 $succeeded 个站点"
+                    } else {
+                        "已完成：$succeeded 成功，$failed 需要处理"
+                    },
+                    isMessageError = false,
+                )
+            }
+            if (succeeded > 0) {
+                persistBalanceSnapshots()
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Throwable) {
+            _balanceUiState.update {
+                it.copy(
+                    isQuerying = false,
+                    queryingSupplierIds = emptySet(),
+                    batchProgressDone = targets.size,
+                    message = "批量余额查询失败，请稍后重试",
+                    isMessageError = true,
+                )
+            }
         }
     }
 
@@ -2147,7 +2414,7 @@ class TesterViewModel(
             return BalanceRequestPreparation.Invalid("此模板需要模型 API Key")
         }
         if (template.referencesBalancePlaceholder("{{accessToken}}") && accessToken.isBlank()) {
-            return BalanceRequestPreparation.Invalid("此模板需要余额查询访问令牌（PAT）")
+            return BalanceRequestPreparation.Invalid("缺少余额令牌")
         }
         return BalanceRequestPreparation.Ready(
             BalancePreparedRequest(
