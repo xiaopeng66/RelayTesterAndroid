@@ -101,6 +101,6 @@ Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询�
 - [v1.2.0 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.2.0)
 - [v1.2.0 发行说明](RELEASE_NOTES_1.2.0.md)
 - APK：`RelayTester-v1.2.0-android.apk`
-- SHA-256：`745b437246a07499b976edc0f7c91e30f69e6cbfff1fbdfbd42ae4caaf462a52`
+- SHA-256：`a8e5ef0bee50c5bf959427f1172d6ae574390ec6fcabdffbd230a00e31807c34`
 
 若有新功能需求或问题反馈，请提交 Issue，或直接在本仓库中继续开发。
