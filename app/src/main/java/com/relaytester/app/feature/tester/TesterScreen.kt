@@ -26,7 +26,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -731,7 +730,9 @@ private fun SupplierConfigurationDialog(
     ) {
         Box(modifier = Modifier.fillMaxWidth(0.94f)) {
             Surface(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 44.dp),
                 shape = MaterialTheme.shapes.extraLarge,
                 tonalElevation = 6.dp,
                 shadowElevation = 10.dp,
@@ -793,7 +794,7 @@ private fun SupplierConfigurationDialog(
                     message = "站点配置已保存",
                     modifier = Modifier
                         .align(Alignment.TopCenter)
-                        .offset(y = (-52).dp),
+                        .padding(top = 4.dp),
                     onToastShown = onToastShown,
                 )
             }
