@@ -52,6 +52,7 @@ import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.StopCircle
+import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
@@ -119,6 +120,7 @@ import com.relaytester.app.feature.tester.UnifiedModelTestResult
 import com.relaytester.app.feature.tester.CatalogSearchResult
 import com.relaytester.app.core.model.matchesAnyModelFilterTerm
 import com.relaytester.app.core.model.mergeModelFilterTerms
+import com.relaytester.app.core.network.RelayBaseUrl
 import com.relaytester.app.ui.navigation.AppDestination
 import com.relaytester.app.ui.components.RelayAppHeader
 import java.io.OutputStreamWriter
@@ -241,7 +243,6 @@ fun TesterScreen(
                     viewModel.selectSupplier(supplierId)
                 },
                 onAddSupplier = viewModel::addSupplier,
-                onDeleteSupplier = { supplierToDeleteId = state.activeSupplierId },
                 onFetchModels = viewModel::fetchModels,
                 onStartTest = viewModel::startTest,
                 onToggleModel = viewModel::toggleModelSelection,
@@ -290,6 +291,7 @@ fun TesterScreen(
             onDeleteEntry = viewModel::deleteModelCatalogEntry,
             onRunEntry = viewModel::startUnifiedCatalogTest,
             onRunSource = viewModel::startUnifiedCatalogSourceTest,
+            onRefreshEntry = viewModel::refreshModelCatalogEntry,
             onCancelRun = viewModel::cancelUnifiedCatalogTest,
         )
     }
@@ -306,10 +308,13 @@ fun TesterScreen(
                     viewModel.discardCurrentSupplierChanges()
                     configurationSupplierId = null
                 },
+                onDelete = { configurationSupplierId?.let { supplierToDeleteId = it } },
+                deleteEnabled = state.suppliers.size > 1,
                 onNameChange = viewModel::updateName,
                 onBaseUrlChange = viewModel::updateBaseUrl,
                 onProtocolChange = viewModel::updateProtocol,
                 onApiKeyChange = viewModel::updateApiKey,
+                onTestingDisabledChange = viewModel::updateTestingDisabled,
                 onSave = {
                     viewModel.saveCurrentSupplier {
                         saveCompletedAt = System.currentTimeMillis()
@@ -330,8 +335,16 @@ fun TesterScreen(
                 confirmButton = {
                     TextButton(
                         onClick = {
+                            val target = supplier.id
                             supplierToDeleteId = null
-                            viewModel.deleteCurrentSupplier()
+                            // Deleting the supplier that is open in the configuration
+                            // sheet must also close that sheet; otherwise the saved id
+                            // outlives the record it points at.
+                            if (configurationSupplierId == target) {
+                                saveCompletedAt = 0L
+                                configurationSupplierId = null
+                            }
+                            viewModel.deleteSupplier(target)
                         },
                         modifier = Modifier.heightIn(min = 48.dp),
                     ) { Text("删除", color = MaterialTheme.colorScheme.error) }
@@ -360,7 +373,6 @@ private fun TesterContent(
     onFetchAllSupplierModels: () -> Unit,
     onEditSupplier: (String) -> Unit,
     onAddSupplier: () -> Unit,
-    onDeleteSupplier: () -> Unit,
     onFetchModels: () -> Unit,
     onStartTest: () -> Unit,
     onToggleModel: (String) -> Unit,
@@ -422,8 +434,12 @@ private fun TesterContent(
                 onFetchAll = onFetchAllSupplierModels,
                 onEditSupplier = onEditSupplier,
                 onAdd = onAddSupplier,
-                onDelete = onDeleteSupplier,
             )
+        }
+        if (state.modelFetchFailures.isNotEmpty()) {
+            item(key = "model_fetch_failures", contentType = "model_fetch_failures") {
+                ModelFetchFailureCard(failures = state.modelFetchFailures)
+            }
         }
         if (showDeferredContent) {
             item(key = "test_settings", contentType = "test_settings") {
@@ -475,6 +491,7 @@ private fun TesterContent(
                         onToggleModel = onToggleModel,
                         onSelectAll = onSelectAll,
                         onClearAll = onClearAll,
+                        onCopyName = { model -> onCopy("模型名", listOf(model)) },
                     )
                 }
             }
@@ -487,6 +504,37 @@ private fun TesterContent(
 
 private const val INITIAL_DEFERRED_CONTENT_DELAY_MS = 350L
 private const val MAX_MODEL_SOURCES_PER_ENTRY = 32
+
+/**
+ * Names every supplier whose model pull failed and why. The snackbar only
+ * carries one line, so the per-supplier reasons live here until the next pull.
+ */
+@Composable
+private fun ModelFetchFailureCard(failures: List<ModelFetchFailure>) {
+    OutlinedCard(
+        colors = CardDefaults.outlinedCardColors(
+            containerColor = MaterialTheme.colorScheme.errorContainer,
+        ),
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                "批量拉取模型失败 ${failures.size} 个供应商",
+                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+                color = MaterialTheme.colorScheme.onErrorContainer,
+            )
+            failures.forEach { failure ->
+                Text(
+                    "${failure.supplierName}：${failure.reason}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                )
+            }
+        }
+    }
+}
 
 @Composable
 @OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
@@ -502,7 +550,6 @@ private fun SupplierSelector(
     onFetchAll: () -> Unit,
     onEditSupplier: (String) -> Unit,
     onAdd: () -> Unit,
-    onDelete: () -> Unit,
 ) {
     val manageEnabled = enabled && fetchingSupplierIds.isEmpty()
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -512,28 +559,15 @@ private fun SupplierSelector(
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
             Text("供应商", style = MaterialTheme.typography.titleMedium)
-            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                IconButton(
-                    onClick = onAdd,
-                    enabled = manageEnabled,
-                    modifier = Modifier.size(48.dp),
-                ) {
-                    Icon(
-                        imageVector = Icons.Outlined.Add,
-                        contentDescription = "添加供应商",
-                    )
-                }
-                IconButton(
-                    onClick = onDelete,
-                    enabled = manageEnabled,
-                    modifier = Modifier.size(48.dp),
-                ) {
-                    Icon(
-                        imageVector = Icons.Outlined.DeleteOutline,
-                        contentDescription = "删除当前供应商",
-                        tint = MaterialTheme.colorScheme.error,
-                    )
-                }
+            IconButton(
+                onClick = onAdd,
+                enabled = manageEnabled,
+                modifier = Modifier.size(48.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.Add,
+                    contentDescription = "添加供应商",
+                )
             }
         }
         Button(
@@ -580,6 +614,7 @@ private fun SupplierSelector(
                     OutlinedCard(
                         modifier = Modifier
                             .width(cardWidth)
+                            // Fixed height so both columns of the grid stay level.
                             .height(58.dp)
                             .clip(cardShape)
                             .combinedClickable(
@@ -591,7 +626,11 @@ private fun SupplierSelector(
                             .semantics {
                                 role = Role.Tab
                                 this.selected = selected
-                                contentDescription = "供应商 ${supplier.name}；双击重新拉取模型列表"
+                                contentDescription = if (supplier.isTestingDisabled) {
+                                    "供应商 ${supplier.name}，已禁止测试，仅拉取模型；双击重新拉取模型列表"
+                                } else {
+                                    "供应商 ${supplier.name}；双击重新拉取模型列表"
+                                }
                             },
                         border = BorderStroke(1.dp, borderColor),
                         shape = cardShape,
@@ -601,10 +640,27 @@ private fun SupplierSelector(
                             modifier = Modifier
                                 .fillMaxSize(),
                         ) {
+                            if (supplier.isTestingDisabled) {
+                                // A pull-only marker that draws over the corner instead of
+                                // taking layout space, so every card keeps the same height
+                                // and the two columns stay level.
+                                Box(
+                                    modifier = Modifier
+                                        .align(Alignment.TopStart)
+                                        .padding(start = 5.dp, top = 7.dp)
+                                        .size(width = 3.dp, height = 18.dp)
+                                        .background(
+                                            color = MaterialTheme.colorScheme.error,
+                                            shape = MaterialTheme.shapes.extraSmall,
+                                        ),
+                                )
+                            }
                             Column(
                                 modifier = Modifier
                                     .fillMaxSize()
-                                    .padding(horizontal = 10.dp)
+                                    // Pull-only cards reserve room for the corner marker.
+                                    .padding(start = if (supplier.isTestingDisabled) 14.dp else 10.dp)
+                                    // Clears the edit control stacked over the corner.
                                     .padding(end = 34.dp),
                                 verticalArrangement = Arrangement.Center,
                             ) {
@@ -677,7 +733,10 @@ private fun SupplierSelector(
                                         MaterialTheme.colorScheme.onSurfaceVariant
                                     },
                                 ) {
-                                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                    Box(
+                                        Modifier.fillMaxSize(),
+                                        contentAlignment = Alignment.Center,
+                                    ) {
                                         Icon(
                                             Icons.Outlined.EditNote,
                                             contentDescription = null,
@@ -718,10 +777,13 @@ private fun SupplierConfigurationDialog(
     saveCompletedAt: Long,
     onToastShown: () -> Unit,
     onDismiss: () -> Unit,
+    onDelete: () -> Unit,
+    deleteEnabled: Boolean,
     onNameChange: (String) -> Unit,
     onBaseUrlChange: (String) -> Unit,
     onProtocolChange: (RelayProtocol) -> Unit,
     onApiKeyChange: (String) -> Unit,
+    onTestingDisabledChange: (Boolean) -> Unit,
     onSave: () -> Unit,
 ) {
     Dialog(
@@ -738,18 +800,45 @@ private fun SupplierConfigurationDialog(
                 shadowElevation = 10.dp,
             ) {
                 Column(modifier = Modifier.fillMaxWidth()) {
-                    Column(
-                        modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
-                        verticalArrangement = Arrangement.spacedBy(2.dp),
-                    ) {
-                        Text("站点配置", style = MaterialTheme.typography.headlineSmall)
-                        Text(
-                            draft.name,
-                            style = MaterialTheme.typography.labelLarge,
-                            color = MaterialTheme.colorScheme.primary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
+                    Box(modifier = Modifier.fillMaxWidth()) {
+                        Column(
+                            modifier = Modifier.padding(
+                                start = 24.dp,
+                                end = 64.dp,
+                                top = 20.dp,
+                                bottom = 20.dp,
+                            ),
+                            verticalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            Text("站点配置", style = MaterialTheme.typography.headlineSmall)
+                            Text(
+                                draft.name,
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.primary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        // Destructive control lives inside the card's own top-right
+                        // corner so it reads as part of this supplier's sheet.
+                        IconButton(
+                            onClick = onDelete,
+                            enabled = enabled && deleteEnabled,
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(end = 12.dp, top = 12.dp)
+                                .size(44.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.DeleteOutline,
+                                contentDescription = if (deleteEnabled) {
+                                    "删除该供应商"
+                                } else {
+                                    "至少保留一个供应商，无法删除"
+                                },
+                                tint = MaterialTheme.colorScheme.error,
+                            )
+                        }
                     }
                     Column(
                         modifier = Modifier
@@ -768,6 +857,7 @@ private fun SupplierConfigurationDialog(
                             onBaseUrlChange = onBaseUrlChange,
                             onProtocolChange = onProtocolChange,
                             onApiKeyChange = onApiKeyChange,
+                            onTestingDisabledChange = onTestingDisabledChange,
                         )
                     }
                     Row(
@@ -812,6 +902,7 @@ private fun SupplierConfigurationForm(
     onBaseUrlChange: (String) -> Unit,
     onProtocolChange: (RelayProtocol) -> Unit,
     onApiKeyChange: (String) -> Unit,
+    onTestingDisabledChange: (Boolean) -> Unit,
 ) {
     var revealApiKey by rememberSaveable(draft.id) { mutableStateOf(false) }
     Column(
@@ -839,6 +930,15 @@ private fun SupplierConfigurationForm(
             errorMessage = errors.baseUrl,
             keyboardType = KeyboardType.Uri,
         )
+        if (RelayBaseUrl.isCleartext(draft.baseUrl)) {
+            // Cleartext is opt-in, so the warning only appears once the user has
+            // actually typed the http:// prefix.
+            Text(
+                "该地址使用明文 HTTP，API Key 与请求内容不加密传输，仅建议用于本机或内网自建站点。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text("接口协议", style = MaterialTheme.typography.labelLarge)
             Row(
@@ -896,6 +996,11 @@ private fun SupplierConfigurationForm(
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        PullOnlyModeRow(
+            checked = draft.isTestingDisabled,
+            enabled = enabled,
+            onCheckedChange = onTestingDisabledChange,
+        )
         if (isSecretsHydrating) {
             Row(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -904,6 +1009,57 @@ private fun SupplierConfigurationForm(
                 CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
                 Text(
                     "正在安全读取本机凭据…",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Pull-only switch for the supplier form. The site still serves its model
+ * directory, but nothing is sent to it for a connectivity check.
+ */
+@Composable
+private fun PullOnlyModeRow(
+    checked: Boolean,
+    enabled: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.medium,
+        color = if (checked) {
+            MaterialTheme.colorScheme.tertiaryContainer
+        } else {
+            MaterialTheme.colorScheme.surfaceVariant
+        },
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(enabled = enabled) { onCheckedChange(!checked) }
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Checkbox(
+                checked = checked,
+                onCheckedChange = onCheckedChange,
+                enabled = enabled,
+            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    "禁止测试（仅拉取模型）",
+                    style = MaterialTheme.typography.labelLarge,
+                )
+                Text(
+                    if (checked) {
+                        "已开启：只刷新模型列表，不会发送测试请求"
+                    } else {
+                        "开启后仅拉取模型列表，不测试连通性，适合按次计费站点"
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -1214,12 +1370,13 @@ private fun TestSettingsCard(
                     }
                     Button(
                         onClick = onStartTest,
-                        enabled = !isFetchingModels,
+                        // Pull-only suppliers keep "获取模型" available but never test.
+                        enabled = !isFetchingModels && !draft.isTestingDisabled,
                         modifier = Modifier.weight(1f),
                     ) {
                         Icon(Icons.Outlined.PlayArrow, contentDescription = null)
                         Spacer(Modifier.width(6.dp))
-                        Text("开始测试")
+                        Text(if (draft.isTestingDisabled) "已禁止测试" else "开始测试")
                     }
                 }
             }
@@ -1360,6 +1517,7 @@ private fun LazyListScope.fetchedModelsSection(
     onToggleModel: (String) -> Unit,
     onSelectAll: (Collection<String>?) -> Unit,
     onClearAll: (Collection<String>?) -> Unit,
+    onCopyName: (String) -> Unit,
 ) {
     item(key = "fetched_models_header", contentType = "fetched_models_header") {
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -1428,6 +1586,7 @@ private fun LazyListScope.fetchedModelsSection(
                 selected = model in selectedModels,
                 enabled = enabled,
                 onToggle = { onToggleModel(model) },
+                onCopyName = onCopyName,
             )
         }
     }
@@ -1501,6 +1660,7 @@ private fun LazyListScope.resultSection(
                 selected = result.model in state.selectedModels,
                 enabled = !state.isRunning,
                 onToggle = { onToggleModel(result.model) },
+                onCopyName = { model -> onCopy("模型名", listOf(model)) },
             )
         }
     }
@@ -1632,6 +1792,7 @@ private fun ResultItem(
     selected: Boolean = false,
     enabled: Boolean = true,
     onToggle: () -> Unit = {},
+    onCopyName: ((String) -> Unit)? = null,
 ) {
     var expanded by rememberSaveable(result.model, result.status) { mutableStateOf(false) }
     val statusColor = when (result.status) {
@@ -1703,6 +1864,18 @@ private fun ResultItem(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
+                    if (onCopyName != null) {
+                        IconButton(
+                            onClick = { onCopyName(result.model) },
+                            modifier = Modifier.size(36.dp),
+                        ) {
+                            Icon(
+                                Icons.Outlined.ContentCopy,
+                                contentDescription = "复制模型名 ${result.model}",
+                                modifier = Modifier.size(16.dp),
+                            )
+                        }
+                    }
                 }
                 when (result.status) {
                     TestStatus.SUCCESS -> {
@@ -1887,7 +2060,7 @@ private fun SecurityNote() {
             tint = MaterialTheme.colorScheme.tertiary,
         )
         Text(
-            "仅支持 HTTPS。测试结果 JSON 不含密钥；加密配置备份会包含密钥。",
+            "默认使用 HTTPS；地址以 http:// 开头时按明文请求。测试结果 JSON 不含密钥；加密配置备份会包含密钥。",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -2071,6 +2244,7 @@ private fun ModelCatalogDialog(
     onDeleteEntry: (String) -> Unit,
     onRunEntry: (String) -> Unit,
     onRunSource: (String, ModelSource) -> Unit,
+    onRefreshEntry: (String) -> Unit,
     onCancelRun: () -> Unit,
 ) {
     var editingEntryId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -2474,6 +2648,13 @@ private fun ModelCatalogDialog(
                                 val entryTestingCount = entryTestingKeys.size
                                 val entrySourceCount = entry.sources.size
                                 val entryCompletedCount = (entrySourceCount - entryTestingCount).coerceIn(0, entrySourceCount)
+                                // A model whose every source is pull-only has nothing to run.
+                                val entryHasTestableSource = entry.sources.any { source ->
+                                    val supplier = state.suppliers.firstOrNull { it.id == source.supplierId }
+                                    val missing = "${source.supplierId}\u0000${source.modelId}" in
+                                        state.catalogMissingSources
+                                    supplier != null && !supplier.isTestingDisabled && !missing
+                                }
                                 ModelCatalogEntryCard(
                                     entry = entry,
                                     suppliers = state.suppliers,
@@ -2482,8 +2663,10 @@ private fun ModelCatalogDialog(
                                     progressDone = entryCompletedCount,
                                     progressTotal = entrySourceCount,
                                     editingEnabled = editingEnabled,
-                                    testingEnabled = true,
+                                    testingEnabled = entryHasTestableSource,
                                     isTesting = entryTestingKeys.isNotEmpty(),
+                                    isRefreshing = entry.id in state.catalogRefreshingEntryIds,
+                                    missingSources = state.catalogMissingSources,
                                     onEdit = {
                                         editingEntryId = entry.id
                                         entryName = entry.name
@@ -2497,6 +2680,7 @@ private fun ModelCatalogDialog(
                                     onRunSource = { source -> onRunSource(entry.id, source) },
                                     onCancel = onCancelRun,
                                     onDelete = { entryToDeleteId = entry.id },
+                                    onRefresh = { onRefreshEntry(entry.id) },
                                 )
                             }
                         }
@@ -2604,12 +2788,16 @@ private fun ModelCatalogEntryCard(
     editingEnabled: Boolean,
     testingEnabled: Boolean,
     isTesting: Boolean,
+    isRefreshing: Boolean,
+    missingSources: Set<String>,
     onEdit: () -> Unit,
     onRun: () -> Unit,
     onRunSource: (ModelSource) -> Unit,
     onCancel: () -> Unit,
     onDelete: () -> Unit,
+    onRefresh: () -> Unit,
 ) {
+    val anySourceMissing = entry.sources.any { "${it.supplierId}\u0000${it.modelId}" in missingSources }
     OutlinedCard(
         colors = CardDefaults.outlinedCardColors(
             containerColor = MaterialTheme.colorScheme.surfaceVariant,
@@ -2631,6 +2819,24 @@ private fun ModelCatalogEntryCard(
                     softWrap = false,
                     overflow = TextOverflow.Ellipsis,
                 )
+                IconButton(
+                    onClick = onRefresh,
+                    enabled = editingEnabled && !isRefreshing,
+                    modifier = Modifier.size(44.dp),
+                ) {
+                    if (isRefreshing) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            strokeWidth = 2.dp,
+                        )
+                    } else {
+                        Icon(
+                            Icons.Outlined.Sync,
+                            contentDescription = "拉取更新 ${entry.name} 的模型来源",
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
+                }
                 IconButton(onClick = onEdit, enabled = editingEnabled, modifier = Modifier.size(44.dp)) {
                     Icon(Icons.Outlined.Edit, contentDescription = "编辑模型来源", modifier = Modifier.size(20.dp))
                 }
@@ -2661,6 +2867,21 @@ private fun ModelCatalogEntryCard(
                     maxLines = 1,
                     softWrap = false,
                 )
+                if (anySourceMissing) {
+                    Surface(
+                        shape = MaterialTheme.shapes.extraSmall,
+                        color = MaterialTheme.colorScheme.errorContainer,
+                        contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                    ) {
+                        Text(
+                            "有模型已不存在",
+                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp),
+                            style = MaterialTheme.typography.labelSmall,
+                            maxLines = 1,
+                            softWrap = false,
+                        )
+                    }
+                }
                 if (testingKeys.any { it.startsWith("${entry.id}\u0000") }) {
                     Spacer(Modifier.width(2.dp))
                     Text(
@@ -2677,14 +2898,17 @@ private fun ModelCatalogEntryCard(
             }
             entry.sources.forEachIndexed { index, source ->
                 if (index > 0) HorizontalDivider(modifier = Modifier.padding(vertical = 2.dp))
-                val supplierName = suppliers.firstOrNull { it.id == source.supplierId }
-                    ?.name
-                    ?: "已删除供应商"
+                val supplier = suppliers.firstOrNull { it.id == source.supplierId }
+                val supplierName = supplier?.name ?: "已删除供应商"
+                val sourceMissing = "${source.supplierId}\u0000${source.modelId}" in missingSources
                 val result = results.firstOrNull {
                     it.supplierId == source.supplierId && it.sourceModel == source.modelId
                 }?.result
                 val sourceKey = "${entry.id}\u0000${source.supplierId}\u0000${source.modelId}"
                 val sourceTesting = sourceKey in testingKeys
+                // A pull-only supplier or a delisted model must not offer a run button.
+                val sourceTestable = testingEnabled && !sourceTesting &&
+                    supplier?.isTestingDisabled != true && !sourceMissing
                 Row(
                     modifier = Modifier.fillMaxWidth().heightIn(min = 38.dp),
                     verticalAlignment = Alignment.CenterVertically,
@@ -2698,28 +2922,42 @@ private fun ModelCatalogEntryCard(
                         softWrap = false,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    if (result != null) {
-                        if (sourceTesting) {
-                            Text(
-                                "进行中",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.tertiary,
-                            )
-                        } else if (result.status == TestStatus.SUCCESS) {
-                            Text(
-                                "可用",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = Color(0xFF15803D),
-                            )
-                        } else {
-                            Text(
-                                result.httpStatus?.toString() ?: result.error?.kind?.label ?: "失败",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.error,
-                            )
+                    when {
+                        sourceMissing -> Text(
+                            "已不存在",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+
+                        supplier?.isTestingDisabled == true -> Text(
+                            "仅拉取",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+
+                        result != null -> {
+                            if (sourceTesting) {
+                                Text(
+                                    "进行中",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.tertiary,
+                                )
+                            } else if (result.status == TestStatus.SUCCESS) {
+                                Text(
+                                    "可用",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = Color(0xFF15803D),
+                                )
+                            } else {
+                                Text(
+                                    result.httpStatus?.toString() ?: result.error?.kind?.label ?: "失败",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.error,
+                                )
+                            }
                         }
-                    } else {
-                        Text(
+
+                        else -> Text(
                             "未测试",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -2727,7 +2965,7 @@ private fun ModelCatalogEntryCard(
                     }
                     IconButton(
                         onClick = { onRunSource(source) },
-                        enabled = testingEnabled && !sourceTesting,
+                        enabled = sourceTestable,
                         modifier = Modifier.size(36.dp),
                     ) {
                         Icon(

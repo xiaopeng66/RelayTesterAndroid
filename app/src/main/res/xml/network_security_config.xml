@@ -1,4 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  Cleartext HTTP is permitted so self-hosted relays reachable only over plain
+  HTTP stay usable. The app still defaults a scheme-less address to HTTPS, so
+  cleartext is opt-in: it happens only when the user types an explicit
+  http:// prefix. API keys sent over cleartext are visible to the network,
+  which is why HTTPS remains the default for every other input.
+-->
 <network-security-config>
-    <base-config cleartextTrafficPermitted="false" />
+    <base-config cleartextTrafficPermitted="true" />
 </network-security-config>

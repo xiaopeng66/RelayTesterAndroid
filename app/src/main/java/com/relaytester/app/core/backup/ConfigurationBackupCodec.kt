@@ -45,6 +45,8 @@ data class ConfigurationBackupSupplier(
     val balanceTemplateId: String?,
     val balanceAccessToken: String,
     val balanceUserId: String,
+    /** Pull-only mode; absent in older backups, which default to false. */
+    val isTestingDisabled: Boolean = false,
 )
 
 data class ConfigurationBackupPreview(
@@ -262,6 +264,7 @@ object ConfigurationBackupCodec {
         .put("balanceTemplateId", balanceTemplateId)
         .put("balanceAccessToken", balanceAccessToken)
         .put("balanceUserId", balanceUserId)
+        .put("isTestingDisabled", isTestingDisabled)
         .put(
             "settings",
             JSONObject()
@@ -466,6 +469,7 @@ object ConfigurationBackupCodec {
             balanceTemplateId = optionalBoundedString("balanceTemplateId", 128),
             balanceAccessToken = optionalBoundedString("balanceAccessToken", 8_192).orEmpty(),
             balanceUserId = optionalBoundedString("balanceUserId", 512).orEmpty(),
+            isTestingDisabled = optBoolean("isTestingDisabled", false),
         )
     }
 

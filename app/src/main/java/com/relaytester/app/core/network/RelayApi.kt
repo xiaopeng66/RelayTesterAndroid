@@ -41,7 +41,7 @@ open class RelayApi(
         timeoutSeconds: Int,
     ): ApiResult<List<String>> {
         val baseUrl = normalizedBaseUrl(profile.baseUrl) ?: return ApiResult.Failure(
-            TestError(ErrorKind.OTHER, "Base URL 必须是有效的 HTTPS 地址"),
+            TestError(ErrorKind.OTHER, "Base URL 必须是有效的 HTTP(S) 地址"),
         )
         val url = (baseUrl + "/models").toHttpUrlOrNull() ?: return ApiResult.Failure(
             TestError(ErrorKind.OTHER, "Base URL 无法组成模型地址"),
@@ -78,7 +78,7 @@ open class RelayApi(
         timeoutSeconds: Int,
     ): ModelTestResult {
         val baseUrl = normalizedBaseUrl(profile.baseUrl)
-            ?: return failed(model, ErrorKind.OTHER, "Base URL 必须是有效的 HTTPS 地址")
+            ?: return failed(model, ErrorKind.OTHER, "Base URL 必须是有效的 HTTP(S) 地址")
         val endpoint = when (profile.protocol) {
             RelayProtocol.CHAT_COMPLETIONS -> "/chat/completions"
             RelayProtocol.RESPONSES -> "/responses"
@@ -280,8 +280,16 @@ open class RelayApi(
 
     private suspend fun execute(request: Request, timeoutSeconds: Int): HttpPayload =
         withContext(Dispatchers.IO) {
+            // Build a per-request client so connect/read/write timeouts scale with
+            // the user's configured timeout. Slow relays that need longer than the
+            // OkHttp default (10s) connect/read window must not fail early, and the
+            // call timeout keeps a hard upper bound on the whole request.
+            val totalSeconds = (timeoutSeconds + CLIENT_GRACE_SECONDS).toLong()
             val call = client.newBuilder()
-                .callTimeout((timeoutSeconds + CLIENT_GRACE_SECONDS).toLong(), TimeUnit.SECONDS)
+                .connectTimeout(totalSeconds, TimeUnit.SECONDS)
+                .readTimeout(totalSeconds, TimeUnit.SECONDS)
+                .writeTimeout(totalSeconds, TimeUnit.SECONDS)
+                .callTimeout(totalSeconds, TimeUnit.SECONDS)
                 .build()
                 .newCall(request)
             call.awaitResponse().use { response ->
@@ -353,14 +361,7 @@ open class RelayApi(
         error = error,
     )
 
-    private fun normalizedBaseUrl(raw: String): String? {
-        val candidate = raw.trim()
-            .let { if (it.startsWith("https://", ignoreCase = true)) it else "https://$it" }
-            .trimEnd('/')
-        val parsed = candidate.toHttpUrlOrNull() ?: return null
-        if (parsed.scheme != "https" || parsed.host.isBlank()) return null
-        return parsed.toString().trimEnd('/')
-    }
+    private fun normalizedBaseUrl(raw: String): String? = RelayBaseUrl.normalize(raw)
 
     private suspend fun Call.awaitResponse(): Response = suspendCancellableCoroutine { continuation ->
         continuation.invokeOnCancellation { cancel() }
@@ -406,4 +407,33 @@ open class RelayApi(
         const val READ_CHUNK_BYTES = 8_192L
         const val MAX_ERROR_CHARS = 300
     }
+}
+
+/**
+ * Base-URL normalization shared by every relay request.
+ *
+ * A scheme-less address defaults to HTTPS, so cleartext is opt-in: it happens
+ * only when the user types an explicit `http://` prefix. That keeps every
+ * existing configuration on TLS while letting a relay that only serves plain
+ * HTTP remain usable.
+ */
+object RelayBaseUrl {
+    fun normalize(raw: String): String? {
+        val candidate = raw.trim()
+            .let {
+                when {
+                    it.startsWith("https://", ignoreCase = true) -> it
+                    it.startsWith("http://", ignoreCase = true) -> it
+                    else -> "https://$it"
+                }
+            }
+            .trimEnd('/')
+        val parsed = candidate.toHttpUrlOrNull() ?: return null
+        if (parsed.host.isBlank()) return null
+        return parsed.toString().trimEnd('/')
+    }
+
+    /** True when [raw] already names a cleartext HTTP endpoint. */
+    fun isCleartext(raw: String): Boolean =
+        raw.trim().startsWith("http://", ignoreCase = true)
 }
