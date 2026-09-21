@@ -11,6 +11,7 @@ local.properties
 ## Local verification output and recoverable source archives
 /artifacts/
 /backups/
+/.verify/
 
 ## Credentials, private signing material, and encrypted user exports
 .env

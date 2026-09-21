@@ -24,6 +24,12 @@ data class SupplierProfile(
     val balanceAccessTokenSecretId: String? = null,
     /** Non-secret account identifier used by templates that reference {{userId}}. */
     val balanceUserId: String = "",
+    /**
+     * When true the supplier is pull-only: its model directory can still be
+     * refreshed, but no connectivity test may be started against it. Used for
+     * sites that bill per request or rate-limit aggressively.
+     */
+    val isTestingDisabled: Boolean = false,
 ) {
     companion object {
         fun empty(index: Int = 1): SupplierProfile = SupplierProfile(
@@ -240,6 +246,8 @@ enum class ErrorKind(val label: String) {
     NETWORK("网络连接失败"),
     INVALID_RESPONSE("响应格式异常"),
     UPSTREAM("上游错误"),
+    /** The supplier is marked pull-only, so no request was sent. */
+    TESTING_DISABLED("已禁止测试"),
     OTHER("其他错误"),
 }
 

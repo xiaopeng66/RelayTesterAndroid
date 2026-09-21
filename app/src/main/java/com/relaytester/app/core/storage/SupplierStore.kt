@@ -68,6 +68,7 @@ open class SupplierStore(private val context: Context?) {
                     .put("apiKeySecretId", supplier.apiKeySecretId)
                     .put("balanceAccessTokenSecretId", supplier.balanceAccessTokenSecretId)
                     .put("balanceUserId", supplier.balanceUserId)
+                    .put("isTestingDisabled", supplier.isTestingDisabled)
                     .put("models", JSONArray(supplier.models))
                     .put("balanceTemplateId", supplier.balanceTemplateId)
                     .put(
@@ -279,6 +280,7 @@ open class SupplierStore(private val context: Context?) {
             balanceAccessTokenSecretId = optString("balanceAccessTokenSecretId")
                 .takeIf(String::isNotBlank),
             balanceUserId = optString("balanceUserId"),
+            isTestingDisabled = optBoolean("isTestingDisabled", false),
             models = models.distinct().sorted(),
             testSettings = TestSettings(
                 timeoutSeconds = settings.optInt("timeoutSeconds", 20).coerceIn(3, 120),
@@ -392,7 +394,20 @@ open class SupplierStore(private val context: Context?) {
         )
     }
 
-    private companion object {
+    /** Decodes an already-parsed root object, for the unit-test seam. */
+    private fun decodeForTest(root: JSONObject): SupplierStoreState =
+        deserialize(root.toString(), root.optString("activeSupplierId").takeIf(String::isNotBlank))
+
+    /** Decodes one supplier object, for the unit-test seam. */
+    private fun decodeSupplierForTest(source: JSONObject): SupplierProfile? =
+        source.optString("id").takeIf(String::isNotBlank)?.let { source.toSupplier() }
+
+    /**
+     * Internal rather than private so the unit-test source set can drive the
+     * JSON round trip through the production serializer. The constants stay
+     * private to this companion.
+     */
+    internal companion object {
         const val MAX_BALANCE_SNAPSHOTS = 128
         const val MAX_MODEL_CATALOG_ENTRIES = 128
         const val MAX_MODEL_SOURCES_PER_ENTRY = 32
@@ -405,5 +420,19 @@ open class SupplierStore(private val context: Context?) {
         const val MAX_SCRIPT_CODE_LENGTH = 16 * 1024
         val SUPPLIERS_KEY: Preferences.Key<String> = stringPreferencesKey("suppliers_json")
         val ACTIVE_SUPPLIER_KEY: Preferences.Key<String> = stringPreferencesKey("active_supplier_id")
+
+        /**
+         * Test seams for the JSON round trip. They expose the same private
+         * serializer the app uses so a unit test can prove a field survives
+         * persistence without an Android Context or a running DataStore.
+         */
+        fun encodeStateForTest(state: SupplierStoreState): String =
+            SupplierStore(null).serialize(state)
+
+        fun decodeStateForTest(root: JSONObject): SupplierStoreState =
+            SupplierStore(null).decodeForTest(root)
+
+        fun decodeSupplierForTest(source: JSONObject): SupplierProfile? =
+            SupplierStore(null).decodeSupplierForTest(source)
     }
 }

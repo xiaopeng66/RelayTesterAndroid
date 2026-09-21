@@ -2,9 +2,9 @@
 
 Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询工具，面向经常使用中转站 / API 代理服务的用户。它不依赖外部服务器，直接从手机向用户配置的 API 站点发起请求，支持模型可用性验证、批量测试、余额查询与配置迁移。
 
-- 当前版本：1.2.0
-- 下载地址：[GitHub Release v1.2.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.2.0)
-- APK 大小：约 2.69 MB
+- 当前版本：1.3.0
+- 下载地址：[GitHub Release v1.3.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.3.0)
+- APK 大小：约 2.79 MB
 - 支持系统：Android 8.0 及以上
 
 ## 核心功能
@@ -20,7 +20,8 @@ Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询�
 
 - 支持 OpenAI Chat Completions、OpenAI Responses 与 Anthropic Messages 三种常用协议。
 - 支持 `GET /models` 模型列表拉取，可自动识别站点的模型目录。
-- 模型测试页支持“批量拉取模型”，并行刷新所有已配置供应商的模型列表。
+- 模型测试页支持“批量拉取模型”，并行刷新所有已配置供应商的模型列表；失败时会逐个列出供应商名称与原因。
+- 支持为站点开启“禁止测试（仅拉取模型）”，开启后只刷新模型列表，不发送连通性测试请求。
 - 批量测试时可配置并发数、超时时间、请求间隔、分批数量、批间暂停、失败重试与取消。
 - 实时显示每个模型的成功 / 失败状态、延迟、完成原因、Token 用量和错误类型。
 - 支持按名称 / 状态 / 延迟 / 错误类型筛选，支持多关键词搜索、结果排序、复制与结果导出。
@@ -33,6 +34,7 @@ Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询�
 - 支持从检索列表中手动勾选，一键添加到测试任务；编辑已有模型时，已添加来源会保持选中并锁定，移除后自动释放。
 - 支持对同一模型配置多个来源，并单独并行测试某个来源；测试中保留旧结果并显示进行中状态。
 - 支持对已有来源进行编辑、删除、重命名和单条测试。
+- 模型卡片支持一键核对来源：站点已下架的模型会标注“已不存在”，并禁止再对其发起测试。
 
 ### 4. 余额查询
 
@@ -60,7 +62,7 @@ Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询�
 
 ## 安全与隐私
 
-- 应用默认仅允许 HTTPS 请求，避免 API Key 与请求内容被明文传输。
+- 应用默认使用 HTTPS 请求；仅当 Base URL 显式填写 `http://` 时按明文请求，并会给出风险提示。
 - API Key、余额查询 PAT 等敏感信息不写入测试结果和历史记录。
 - 配置备份可加密存储，采用 PBKDF2 + AES-256-GCM。
 - 导出测试结果 JSON 时默认不含 API Key、PAT 或用户 ID。
@@ -98,9 +100,9 @@ Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询�
 
 ## 发行版本
 
-- [v1.2.0 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.2.0)
-- [v1.2.0 发行说明](RELEASE_NOTES_1.2.0.md)
-- APK：`RelayTester-v1.2.0-android.apk`
-- SHA-256：`a8e5ef0bee50c5bf959427f1172d6ae574390ec6fcabdffbd230a00e31807c34`
+- [v1.3.0 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.3.0)
+- [v1.3.0 发行说明](RELEASE_NOTES_1.3.0.md)
+- APK：`RelayTester-v1.3.0-android.apk`
+- SHA-256：`aa99624ff84df67acd43c17a0964656a82435dd87204c959205ebe6f17772e6b`
 
 若有新功能需求或问题反馈，请提交 Issue，或直接在本仓库中继续开发。

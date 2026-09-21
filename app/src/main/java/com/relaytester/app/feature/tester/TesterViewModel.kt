@@ -19,11 +19,13 @@ import com.relaytester.app.core.model.BalanceQueryTemplate
 import com.relaytester.app.core.model.BalanceSnapshot
 import com.relaytester.app.core.model.BalanceTemplateHeader
 import com.relaytester.app.core.model.BatchTestConfig
+import com.relaytester.app.core.model.ErrorKind
 import com.relaytester.app.core.model.ModelTestResult
 import com.relaytester.app.core.model.ModelCatalogEntry
 import com.relaytester.app.core.model.ModelSource
 import com.relaytester.app.core.model.RelayProtocol
 import com.relaytester.app.core.model.SupplierProfile
+import com.relaytester.app.core.model.TestError
 import com.relaytester.app.core.model.TestRunSummary
 import com.relaytester.app.core.model.TestSettings
 import com.relaytester.app.core.model.TestStatus
@@ -113,6 +115,8 @@ data class SupplierDraft(
     val delayMaxSeconds: String,
     val batchSize: String,
     val batchPauseSeconds: String,
+    /** Pull-only mode: refresh the model directory but never test connectivity. */
+    val isTestingDisabled: Boolean = false,
 ) {
     fun toProfile(
         apiKeySecretId: String?,
@@ -127,6 +131,7 @@ data class SupplierDraft(
         balanceTemplateId = balanceTemplateId,
         balanceAccessTokenSecretId = balanceAccessTokenSecretId,
         balanceUserId = balanceUserId,
+        isTestingDisabled = isTestingDisabled,
         models = models.distinct().sorted(),
         testSettings = TestSettings(
             timeoutSeconds = timeoutSeconds.toIntOr(20).coerceIn(3, 120),
@@ -165,6 +170,7 @@ data class SupplierDraft(
             delayMaxSeconds = profile.testSettings.delayMaxMs.toSecondsText(),
             batchSize = profile.testSettings.batchSize.toString(),
             batchPauseSeconds = profile.testSettings.batchPauseMs.toSecondsText(),
+            isTestingDisabled = profile.isTestingDisabled,
         )
     }
 }
@@ -189,6 +195,8 @@ data class TesterUiState(
     val fetchingSupplierIds: Set<String> = emptySet(),
     val modelFetchProgressDone: Int = 0,
     val modelFetchProgressTotal: Int = 0,
+    /** Per-supplier reasons collected by the last batch model pull, newest last. */
+    val modelFetchFailures: List<ModelFetchFailure> = emptyList(),
     val isRunning: Boolean = false,
     val progressDone: Int = 0,
     val progressTotal: Int = 0,
@@ -221,6 +229,14 @@ data class TesterUiState(
     val isUnifiedTesting: Boolean = false,
     val unifiedTestingKeys: Set<String> = emptySet(),
     val unifiedResults: List<UnifiedModelTestResult> = emptyList(),
+    /** Entry ids whose sources are being re-checked against the live directory. */
+    val catalogRefreshingEntryIds: Set<String> = emptySet(),
+    /**
+     * Model sources the last refresh could not find in their supplier's live
+     * directory, keyed by `supplierId\u0000modelId`. A source lands here when the
+     * site delisted the model or the supplier was removed.
+     */
+    val catalogMissingSources: Set<String> = emptySet(),
 )
 
 @Immutable
@@ -228,6 +244,24 @@ data class CatalogSearchResult(
     val supplierId: String,
     val supplierName: String,
     val modelId: String,
+)
+
+/** One supplier's model-pull failure, kept so the batch result can name it. */
+@Immutable
+data class ModelFetchFailure(
+    val supplierId: String,
+    val supplierName: String,
+    val reason: String,
+)
+
+/**
+ * Result of one supplier's model-directory refresh. [failureReason] is null for
+ * a clean success; an empty directory reports its own reason while still
+ * counting as a successful request.
+ */
+data class ModelFetchOutcome(
+    val success: Boolean,
+    val failureReason: String? = null,
 )
 
 @Immutable
@@ -552,6 +586,9 @@ class TesterViewModel(
 
     fun updateProtocol(value: RelayProtocol) = updateDraft { copy(protocol = value) }
 
+    /** Toggles pull-only mode for the supplier being edited. */
+    fun updateTestingDisabled(value: Boolean) = updateDraft { copy(isTestingDisabled = value) }
+
     fun updateApiKey(value: String) = updateDraft {
         copy(apiKey = value, apiKeyDirty = true)
     }
@@ -857,6 +894,97 @@ class TesterViewModel(
         }
     }
 
+    /**
+     * Re-checks one entry's sources against each supplier's live model
+     * directory. Sources that no longer appear are recorded in
+     * [TesterUiState.catalogMissingSources] so the card can say the site
+     * delisted them instead of silently failing later.
+     */
+    fun refreshModelCatalogEntry(entryId: String) {
+        if (runningOrInitializing() || _uiState.value.isCatalogFetching) return
+        val entry = modelCatalog.firstOrNull { it.id == entryId } ?: return
+        val supplierIds = entry.sources.map { it.supplierId }.distinct()
+        if (supplierIds.isEmpty()) {
+            showMessage("该模型还没有配置供应商来源", isError = true)
+            return
+        }
+        viewModelScope.launch {
+            _uiState.update {
+                it.copy(catalogRefreshingEntryIds = it.catalogRefreshingEntryIds + entryId)
+            }
+            try {
+                val activeDraft = _uiState.value.draft
+                val directories = coroutineScope {
+                    supplierIds.map { supplierId ->
+                        async(Dispatchers.IO) {
+                            val profile = profiles.firstOrNull { it.id == supplierId }
+                                ?: return@async supplierId to null
+                            val apiKey = if (activeDraft?.id == supplierId &&
+                                (activeDraft.apiKeyDirty || activeDraft.apiKey.isNotBlank())
+                            ) {
+                                activeDraft.apiKey
+                            } else {
+                                profile.apiKeySecretId?.let(secretStore::get).orEmpty()
+                            }
+                            if (apiKey.isBlank()) return@async supplierId to null
+                            supplierId to when (
+                                val result = relayApi.fetchModels(
+                                    profile = profile,
+                                    apiKey = apiKey,
+                                    timeoutSeconds = profile.testSettings.timeoutSeconds,
+                                )
+                            ) {
+                                is ApiResult.Success -> result.value.toSet()
+                                is ApiResult.Failure -> null
+                            }
+                        }
+                    }.awaitAll().toMap()
+                }
+                // A null directory means the supplier could not be reached, so its
+                // sources are left unjudged rather than falsely reported missing.
+                val missing = entry.sources
+                    .filter { source ->
+                        val directory = directories[source.supplierId] ?: return@filter false
+                        source.modelId !in directory
+                    }
+                    .mapTo(mutableSetOf()) { it.missingKey() }
+                val unreachable = entry.sources
+                    .filter { it.supplierId !in directories.keys }
+                    .map { it.supplierId }
+                    .distinct()
+                _uiState.update { state ->
+                    state.copy(
+                        catalogRefreshingEntryIds = state.catalogRefreshingEntryIds - entryId,
+                        catalogMissingSources = state.catalogMissingSources - entry.sources.mapTo(
+                            mutableSetOf(),
+                        ) { it.missingKey() } + missing,
+                        message = when {
+                            missing.isNotEmpty() -> {
+                                val names = missing.map { key -> key.substringAfter('\u0000') }
+                                "${entry.name}：${names.size} 个模型已不存在（${names.joinToString("、")}）"
+                            }
+                            unreachable.isNotEmpty() -> "部分供应商无法访问，未能完成检查"
+                            else -> "${entry.name} 的 ${entry.sources.size} 个来源均存在"
+                        },
+                        isMessageError = missing.isNotEmpty(),
+                    )
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Throwable) {
+                _uiState.update {
+                    it.copy(
+                        catalogRefreshingEntryIds = it.catalogRefreshingEntryIds - entryId,
+                        message = "模型来源检查失败，请稍后重试",
+                        isMessageError = true,
+                    )
+                }
+            }
+        }
+    }
+
+    private fun ModelSource.missingKey(): String = "$supplierId\u0000$modelId"
+
     fun startUnifiedCatalogTest(entryId: String) {
         startUnifiedCatalogTests(entryId)
     }
@@ -943,6 +1071,16 @@ class TesterViewModel(
                         async {
                             val result = semaphore.withPermit {
                                 val profile = profiles.first { it.id == target.supplierId }
+                                if (profile.isTestingDisabled) {
+                                    return@withPermit ModelTestResult(
+                                        model = target.sourceModel,
+                                        status = TestStatus.FAILED,
+                                        error = com.relaytester.app.core.model.TestError(
+                                            com.relaytester.app.core.model.ErrorKind.TESTING_DISABLED,
+                                            "该供应商已禁止测试，仅允许拉取模型",
+                                        ),
+                                    )
+                                }
                                 val activeDraft = _uiState.value.draft
                                 val apiKey = if (activeDraft?.id == profile.id &&
                                     (activeDraft.apiKeyDirty || activeDraft.apiKey.isNotBlank())
@@ -1743,25 +1881,35 @@ class TesterViewModel(
         }
     }
 
-    fun deleteCurrentSupplier() {
+    /**
+     * Deletes one supplier by id. Callers must confirm first: this removes the
+     * profile, its catalog sources and its stored secrets. When the deleted
+     * supplier is not the active one, the active selection is left untouched.
+     */
+    fun deleteSupplier(supplierId: String) {
         if (runningOrInitializing()) return
         if (profiles.size <= 1) {
             showMessage("请至少保留一个供应商", isError = true)
             return
         }
         viewModelScope.launch {
-            val id = activeSupplierId ?: return@launch
-            val removed = profiles.firstOrNull { it.id == id } ?: return@launch
+            val removed = profiles.firstOrNull { it.id == supplierId } ?: return@launch
             val previousProfiles = profiles.toMutableList()
             val previousActiveSupplierId = activeSupplierId
             val previousCatalog = modelCatalog.toList()
-            val nextSnapshots = _balanceUiState.value.balanceSnapshots - id
-            profiles.removeAll { it.id == id }
+            val wasActive = activeSupplierId == supplierId
+            val nextSnapshots = _balanceUiState.value.balanceSnapshots - supplierId
+            profiles.removeAll { it.id == supplierId }
             modelCatalog = modelCatalog.map { entry ->
-                entry.copy(sources = entry.sources.filterNot { it.supplierId == id })
+                entry.copy(sources = entry.sources.filterNot { it.supplierId == supplierId })
             }.filter { it.sources.isNotEmpty() }.toMutableList()
-            val next = profiles.first()
-            activeSupplierId = next.id
+            val next = if (wasActive) {
+                profiles.firstOrNull() ?: return@launch
+            } else {
+                profiles.firstOrNull { it.id == activeSupplierId } ?: profiles.firstOrNull()
+                    ?: return@launch
+            }
+            if (wasActive) activeSupplierId = next.id
             if (!saveProfiles(nextSnapshots)) {
                 profiles = previousProfiles
                 activeSupplierId = previousActiveSupplierId
@@ -1775,23 +1923,23 @@ class TesterViewModel(
                 listOfNotNull(removed.apiKeySecretId, removed.balanceAccessTokenSecretId)
                     .forEach { secretId -> runCatching { secretStore.delete(secretId) } }
             }
-            installDraft(next)
+            if (wasActive) installDraft(next)
             _uiState.update {
                 it.copy(
                     suppliers = profiles.toList(),
-                    activeSupplierId = next.id,
-                    results = emptyList(),
-                    selectedModels = next.models.toSet(),
+                    activeSupplierId = activeSupplierId,
+                    results = if (wasActive) emptyList() else it.results,
+                    selectedModels = if (wasActive) next.models.toSet() else it.selectedModels,
                     modelCatalog = modelCatalog.toList(),
-                    summary = null,
-                    message = "已删除供应商",
+                    summary = if (wasActive) null else it.summary,
+                    message = "已删除供应商 ${removed.name}",
                     isMessageError = false,
                 )
             }
             _balanceUiState.update { state ->
                 state.copy(
                     balanceSnapshots = nextSnapshots,
-                    balanceErrors = state.balanceErrors - id,
+                    balanceErrors = state.balanceErrors - supplierId,
                     credentialErrors = BalanceCredentialsErrors(),
                 )
             }
@@ -1825,10 +1973,14 @@ class TesterViewModel(
                         fetchingSupplierIds = targetIds,
                         modelFetchProgressDone = 0,
                         modelFetchProgressTotal = targets.size,
+                        modelFetchFailures = emptyList(),
                         message = null,
                         isMessageError = false,
                     )
                 }
+                val failures = java.util.Collections.synchronizedList(
+                    mutableListOf<ModelFetchFailure>(),
+                )
                 coroutineScope {
                     val deferred = targets.map { profile ->
                         async {
@@ -1848,18 +2000,34 @@ class TesterViewModel(
                                     }
                                 }
                                 if (apiKey.isBlank()) {
+                                    failures += ModelFetchFailure(
+                                        supplierId = profile.id,
+                                        supplierName = profile.name,
+                                        reason = "未保存 API Key",
+                                    )
                                     completeBatchModelFetch(profile.id)
-                                    showMessage("请先保存 ${profile.name} 的 API Key", isError = true)
                                     return@async false
                                 }
-                                fetchModelsForSupplierInternal(
+                                val outcome = fetchModelsForSupplierInternal(
                                     PreparedRequest(profileNow, apiKey),
                                 )
+                                if (!outcome.success) {
+                                    failures += ModelFetchFailure(
+                                        supplierId = profile.id,
+                                        supplierName = profile.name,
+                                        reason = outcome.failureReason ?: "拉取失败",
+                                    )
+                                }
+                                outcome.success
                             } catch (error: CancellationException) {
                                 throw error
-                            } catch (_: Throwable) {
+                            } catch (error: Throwable) {
+                                failures += ModelFetchFailure(
+                                    supplierId = profile.id,
+                                    supplierName = profile.name,
+                                    reason = error.message?.take(120) ?: "拉取失败",
+                                )
                                 completeBatchModelFetch(profile.id)
-                                showMessage("${profile.name} 模型拉取失败", isError = true)
                                 false
                             }
                         }
@@ -1867,13 +2035,15 @@ class TesterViewModel(
                     val results = deferred.awaitAll()
                     val succeeded = results.count { it }
                     val failed = targets.size - succeeded
+                    val failureList = failures.toList()
                     _uiState.update { state ->
                         state.copy(
-                            message = when {
-                                failed == 0 -> "已拉取 ${targets.size} 个供应商的模型"
-                                failed == targets.size -> "批量拉取模型失败，请检查 API Key 和网络"
-                                else -> "已完成：$succeeded 成功，$failed 需要处理"
-                            },
+                            modelFetchFailures = failureList,
+                            message = batchFetchSummary(
+                                total = targets.size,
+                                succeeded = succeeded,
+                                failures = failureList,
+                            ),
                             isMessageError = failed > 0,
                         )
                     }
@@ -1898,6 +2068,27 @@ class TesterViewModel(
             if (fetchAllModelsStartMutex.isLocked) {
                 fetchAllModelsStartMutex.unlock()
             }
+        }
+    }
+
+    /**
+     * Names the suppliers that failed and why. A bare count leaves the user
+     * guessing which site to fix, so the first two reasons are inlined and the
+     * full list stays in [TesterUiState.modelFetchFailures] for the detail view.
+     */
+    private fun batchFetchSummary(
+        total: Int,
+        succeeded: Int,
+        failures: List<ModelFetchFailure>,
+    ): String {
+        if (failures.isEmpty()) return "已拉取 $total 个供应商的模型"
+        val named = failures.joinToString("；") { failure ->
+            "${failure.supplierName}：${failure.reason}"
+        }
+        return if (succeeded == 0) {
+            "批量拉取模型失败（$named）"
+        } else {
+            "已完成：$succeeded 成功，${failures.size} 失败（$named）"
         }
     }
 
@@ -1953,7 +2144,7 @@ class TesterViewModel(
 
     private suspend fun fetchModelsForSupplierInternal(
         request: PreparedRequest,
-    ): Boolean {
+    ): ModelFetchOutcome {
         val supplierId = request.profile.id
         _uiState.update {
             it.copy(
@@ -1966,7 +2157,9 @@ class TesterViewModel(
             return when (val result = fetchModelsInBackground(request)) {
                 is ApiResult.Success -> {
                     val saved = request.profile.copy(models = result.value)
-                    if (!replaceProfile(saved)) return false
+                    if (!replaceProfile(saved)) {
+                        return ModelFetchOutcome(success = false, failureReason = "配置保存失败")
+                    }
                     _uiState.update { state ->
                         val isActive = state.activeSupplierId == supplierId
                         state.copy(
@@ -1992,14 +2185,17 @@ class TesterViewModel(
                             isMessageError = result.value.isEmpty(),
                         )
                     }
-                    true
+                    ModelFetchOutcome(
+                        success = true,
+                        failureReason = if (result.value.isEmpty()) "站点未返回模型列表" else null,
+                    )
                 }
 
                 is ApiResult.Failure -> {
                     _uiState.update {
                         it.copy(message = result.error.message, isMessageError = true)
                     }
-                    false
+                    ModelFetchOutcome(success = false, failureReason = result.error.message)
                 }
             }
         } finally {
@@ -2681,6 +2877,7 @@ class TesterViewModel(
                 balanceTemplateId = profile.balanceTemplateId,
                 balanceAccessToken = profile.balanceAccessTokenSecretId?.let(secretStore::get).orEmpty(),
                 balanceUserId = profile.balanceUserId,
+                isTestingDisabled = profile.isTestingDisabled,
             )
         },
         balanceTemplates = balanceTemplates.toList(),
@@ -2728,6 +2925,7 @@ class TesterViewModel(
                             balanceTemplateId = source.balanceTemplateId,
                             balanceAccessTokenSecretId = balanceTokenSecretId,
                             balanceUserId = source.balanceUserId.trim(),
+                            isTestingDisabled = source.isTestingDisabled,
                         ),
                         apiKey = source.apiKey.trim(),
                         balanceAccessToken = source.balanceAccessToken.trim(),
@@ -3241,6 +3439,29 @@ class TesterViewModel(
             }
             results
         }
+        // A pull-only supplier never issues a test request: publish the blocked
+        // outcome for every target so the list explains why nothing was sent.
+        if (request.profile.isTestingDisabled) {
+            val blocked = initialResults.map { result ->
+                result.copy(
+                    status = TestStatus.FAILED,
+                    error = TestError(
+                        ErrorKind.TESTING_DISABLED,
+                        "该供应商已禁止测试，仅允许拉取模型",
+                    ),
+                )
+            }
+            _uiState.update { state ->
+                state.copy(
+                    isRunning = false,
+                    results = blocked,
+                    summary = blocked.toDisabledSummary(),
+                    message = "该供应商已禁止测试，仅允许拉取模型",
+                    isMessageError = true,
+                )
+            }
+            return
+        }
         val resultIndexByModel = initialResults.indices.associateBy { index ->
             initialResults[index].model
         }
@@ -3316,6 +3537,19 @@ class TesterViewModel(
     private fun showMessage(message: String, isError: Boolean = false) {
         _uiState.update { it.copy(message = message, isMessageError = isError) }
     }
+
+    /** Summarizes a run that never left the device because the supplier is pull-only. */
+    private fun List<ModelTestResult>.toDisabledSummary(): TestRunSummary = TestRunSummary(
+        total = size,
+        succeeded = 0,
+        failed = size,
+        elapsedMs = 0L,
+        averageLatencyMs = null,
+        fastestLatencyMs = null,
+        slowestLatencyMs = null,
+        totalTokens = 0L,
+        errorCounts = mapOf(ErrorKind.TESTING_DISABLED to size),
+    )
 
     private fun runningOrInitializing(): Boolean =
         _uiState.value.isRunning ||

@@ -60,9 +60,8 @@ class BalanceApi(
             return BalanceQueryResult.Failure("请先配置余额查询访问令牌（PAT）")
         }
         return try {
-            val baseUrl = profile.baseUrl.trim().toHttpUrlOrNull()
-                ?.takeIf { it.isHttps }
-                ?: return BalanceQueryResult.Failure("Base URL 必须是有效的 HTTPS 地址")
+            val baseUrl = RelayBaseUrl.normalize(profile.baseUrl)?.toHttpUrlOrNull()
+                ?: return BalanceQueryResult.Failure("Base URL 必须是有效的 HTTP(S) 地址")
             val endpoint = resolveEndpoint(baseUrl, template.endpointTemplate, apiKey, accessToken, userId)
                 ?: return BalanceQueryResult.Failure("模板地址无效，或目标主机与供应商不一致")
             val request = buildRequest(endpoint, baseUrl, apiKey, accessToken, userId, template)
@@ -183,9 +182,8 @@ class BalanceApi(
             if (scriptRequest.requiresPlaceholder("{{accessToken}}") && accessToken.isBlank()) {
                 return BalanceQueryResult.Failure("请先配置余额查询访问令牌（PAT）")
             }
-            val baseUrl = profile.baseUrl.trim().toHttpUrlOrNull()
-                ?.takeIf { it.isHttps }
-                ?: return BalanceQueryResult.Failure("Base URL 必须是有效的 HTTPS 地址")
+            val baseUrl = RelayBaseUrl.normalize(profile.baseUrl)?.toHttpUrlOrNull()
+                ?: return BalanceQueryResult.Failure("Base URL 必须是有效的 HTTP(S) 地址")
             val endpoint = resolveEndpoint(
                 baseUrl,
                 scriptRequest.urlTemplate,
@@ -325,7 +323,7 @@ class BalanceApi(
         return null
     }
 
-    private fun resolveEndpoint(
+    internal fun resolveEndpoint(
         baseUrl: HttpUrl,
         rawTemplate: String,
         apiKey: String,
@@ -342,8 +340,13 @@ class BalanceApi(
         val candidate = value.toHttpUrlOrNull()
             ?: if (value.startsWith('/')) rootUrl.resolve(value) else baseUrl.resolve(value)
         val resolved = candidate ?: return null
+        // The guard exists to keep a template from redirecting the request to a
+        // different site, not to force TLS: a supplier the user configured as
+        // cleartext HTTP must be able to query its own balance. So the endpoint
+        // has to match the configured origin exactly — same scheme, host and
+        // port — which still blocks a template that points somewhere else.
         return resolved.takeIf {
-            it.isHttps && it.host == baseUrl.host && it.port == baseUrl.port
+            it.scheme == baseUrl.scheme && it.host == baseUrl.host && it.port == baseUrl.port
         }
     }
 
@@ -480,7 +483,11 @@ class BalanceApi(
 
     private class TemplateException(message: String) : IllegalArgumentException(message)
 
-    private companion object {
+    /**
+     * Internal rather than private so the unit-test source set can drive endpoint
+     * resolution through the production code path. The constants stay private.
+     */
+    internal companion object {
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         val HEADER_NAME = Regex("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
         // Both closing braces must be escaped for Android's ICU regex engine.
@@ -507,5 +514,20 @@ class BalanceApi(
         )
         const val MAX_RESPONSE_BYTES = 512 * 1024
         const val MAX_FAILURE_MESSAGE_CHARS = 200
+
+        /** Resolves a template endpoint for the unit-test seam. */
+        fun resolveEndpointForTest(
+            baseUrl: String,
+            template: String,
+        ): String? {
+            val base = RelayBaseUrl.normalize(baseUrl)?.toHttpUrlOrNull() ?: return null
+            return BalanceApi().resolveEndpoint(
+                baseUrl = base,
+                rawTemplate = template,
+                apiKey = "sk-test",
+                accessToken = "token-test",
+                userId = "user-test",
+            )?.toString()
+        }
     }
 }
