@@ -293,6 +293,7 @@ fun TesterScreen(
             onRunSource = viewModel::startUnifiedCatalogSourceTest,
             onRefreshEntry = viewModel::refreshModelCatalogEntry,
             onCancelRun = viewModel::cancelUnifiedCatalogTest,
+            onRemoveSource = viewModel::removeModelSourceFromCatalog,
         )
     }
     configurationSupplierId?.let { supplierId ->
@@ -627,7 +628,7 @@ private fun SupplierSelector(
                                 role = Role.Tab
                                 this.selected = selected
                                 contentDescription = if (supplier.isTestingDisabled) {
-                                    "供应商 ${supplier.name}，已禁止测试，仅拉取模型；双击重新拉取模型列表"
+                                    "供应商 ${supplier.name}，已禁止测试"
                                 } else {
                                     "供应商 ${supplier.name}；双击重新拉取模型列表"
                                 }
@@ -1049,21 +1050,14 @@ private fun PullOnlyModeRow(
                 onCheckedChange = onCheckedChange,
                 enabled = enabled,
             )
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    "禁止测试（仅拉取模型）",
-                    style = MaterialTheme.typography.labelLarge,
-                )
-                Text(
-                    if (checked) {
-                        "已开启：只刷新模型列表，不会发送测试请求"
-                    } else {
-                        "开启后仅拉取模型列表，不测试连通性，适合按次计费站点"
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
+            Text(
+                "禁止测试（禁测活网站请勾选）",
+                style = MaterialTheme.typography.labelLarge,
+                modifier = Modifier.weight(1f),
+                maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }
@@ -1227,50 +1221,50 @@ private fun TestSettingsCard(
                                             this.selected = selected
                                         },
                                     shape = filterShape,
-                                    color = if (selected) {
-                                        MaterialTheme.colorScheme.secondaryContainer
-                                    } else {
-                                        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
-                                    },
-                                    border = BorderStroke(
-                                        1.dp,
-                                        if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
-                                    ),
-                                ) {
-                                    Box(Modifier.fillMaxSize()) {
-                                        Text(
-                                            term,
-                                            modifier = Modifier
-                                                .align(Alignment.CenterStart)
-                                                .padding(start = 12.dp, end = 32.dp),
-                                            maxLines = 1,
-                                            softWrap = false,
-                                            overflow = TextOverflow.Ellipsis,
                                             color = if (selected) {
-                                                MaterialTheme.colorScheme.onSecondaryContainer
+                                                MaterialTheme.colorScheme.secondaryContainer
                                             } else {
-                                                MaterialTheme.colorScheme.onSurfaceVariant
+                                                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
                                             },
-                                            style = MaterialTheme.typography.labelLarge,
-                                        )
-                                        IconButton(
-                                            onClick = { quickFilterToDelete = term },
-                                            enabled = enabled,
-                                            modifier = Modifier
-                                                .align(Alignment.TopEnd)
-                                                .size(36.dp)
-                                                .semantics {
-                                                    contentDescription = "删除快捷筛选词 $term"
-                                                },
+                                            border = BorderStroke(
+                                                1.dp,
+                                                if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
+                                            ),
                                         ) {
-                                            Icon(
-                                                Icons.Outlined.Close,
-                                                contentDescription = null,
-                                                modifier = Modifier.size(16.dp),
-                                            )
+                                            Box(Modifier.fillMaxSize()) {
+                                                Text(
+                                                    term,
+                                                    modifier = Modifier
+                                                        .align(Alignment.CenterStart)
+                                                        .padding(start = 12.dp, end = 32.dp),
+                                                    maxLines = 1,
+                                                    softWrap = false,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                    color = if (selected) {
+                                                        MaterialTheme.colorScheme.onSecondaryContainer
+                                                    } else {
+                                                        MaterialTheme.colorScheme.onSurfaceVariant
+                                                    },
+                                                    style = MaterialTheme.typography.labelLarge,
+                                                )
+                                                IconButton(
+                                                    onClick = { quickFilterToDelete = term },
+                                                    enabled = enabled,
+                                                    modifier = Modifier
+                                                        .align(Alignment.CenterEnd)
+                                                        .size(36.dp)
+                                                        .semantics {
+                                                            contentDescription = "删除快捷筛选词 $term"
+                                                        },
+                                                ) {
+                                                    Icon(
+                                                        Icons.Outlined.Close,
+                                                        contentDescription = null,
+                                                        modifier = Modifier.size(16.dp),
+                                                    )
+                                                }
+                                            }
                                         }
-                                    }
-                                }
                             }
                         }
                     }
@@ -1376,7 +1370,7 @@ private fun TestSettingsCard(
                     ) {
                         Icon(Icons.Outlined.PlayArrow, contentDescription = null)
                         Spacer(Modifier.width(6.dp))
-                        Text(if (draft.isTestingDisabled) "已禁止测试" else "开始测试")
+                        Text(if (draft.isTestingDisabled) "禁止测试" else "开始测试")
                     }
                 }
             }
@@ -1814,7 +1808,7 @@ private fun ResultItem(
                 .heightIn(min = 64.dp)
                 .padding(horizontal = 6.dp, vertical = 6.dp),
             horizontalArrangement = Arrangement.spacedBy(4.dp),
-            verticalAlignment = Alignment.Top,
+            verticalAlignment = Alignment.CenterVertically,
         ) {
             if (selectable) {
                 Box(
@@ -1831,32 +1825,20 @@ private fun ResultItem(
                     )
                 }
             }
-            Box(
-                modifier = Modifier
-                    .width(8.dp)
-                    .height(56.dp),
-                contentAlignment = Alignment.Center,
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                Box(
-                    modifier = Modifier
-                        .size(8.dp)
-                        .clip(MaterialTheme.shapes.extraSmall)
-                        .background(statusColor),
-                )
-            }
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .heightIn(min = 56.dp),
-                contentAlignment = if (expanded) Alignment.TopStart else Alignment.CenterStart,
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = if (expanded) 7.dp else 0.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .size(8.dp)
+                            .clip(MaterialTheme.shapes.extraSmall)
+                            .background(statusColor),
+                    )
                     Text(
                         result.model,
                         modifier = Modifier.weight(1f),
@@ -1886,6 +1868,7 @@ private fun ResultItem(
                         }
                         Text(
                             meta.ifEmpty { listOf("请求成功") }.joinToString("  ·  "),
+                            modifier = Modifier.padding(start = 12.dp),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1,
@@ -1897,6 +1880,7 @@ private fun ResultItem(
                     TestStatus.FAILED -> {
                         Text(
                             listOfNotNull(failureSummary(result), failureDetail).joinToString(" · "),
+                            modifier = Modifier.padding(start = 12.dp),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.error,
                             maxLines = if (expanded) Int.MAX_VALUE else 1,
@@ -1908,6 +1892,7 @@ private fun ResultItem(
                     TestStatus.PENDING -> {
                         Text(
                             if (isFetchedOnly) "已获取，尚未开始测试" else "等待测试…",
+                            modifier = Modifier.padding(start = 12.dp),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1,
@@ -1916,7 +1901,6 @@ private fun ResultItem(
                         )
                     }
                 }
-            }
             }
             if (isFetchedOnly) {
                 Box(
@@ -1939,38 +1923,46 @@ private fun ResultItem(
                         )
                     }
                 }
-            } else {
+            } else if (result.status == TestStatus.FAILED) {
                 Column(
-                    modifier = Modifier
-                        .width(60.dp)
-                        .height(56.dp),
+                    modifier = Modifier.width(60.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Top,
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
                     Box(
-                        modifier = Modifier
-                            .width(56.dp)
-                            .height(28.dp),
+                        modifier = Modifier.height(36.dp),
                         contentAlignment = Alignment.Center,
                     ) {
                         StatusLabel(result.status)
                     }
-                    if (canExpandFailure) {
-                        TextButton(
-                            onClick = { expanded = !expanded },
-                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
-                            modifier = Modifier.width(56.dp).height(28.dp),
-                        ) {
-                            Text(
-                                if (expanded) "收起" else "详情",
-                                style = MaterialTheme.typography.labelMedium,
-                                maxLines = 1,
-                                softWrap = false,
-                            )
+                    Box(
+                        modifier = Modifier.height(16.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        if (canExpandFailure) {
+                            TextButton(
+                                onClick = { expanded = !expanded },
+                                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+                                modifier = Modifier.width(56.dp).height(28.dp),
+                            ) {
+                                Text(
+                                    if (expanded) "收起" else "详情",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    maxLines = 1,
+                                    softWrap = false,
+                                )
+                            }
                         }
-                    } else {
-                        Spacer(Modifier.height(28.dp))
                     }
+                }
+            } else {
+                Box(
+                    modifier = Modifier
+                        .width(60.dp)
+                        .height(56.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    StatusLabel(result.status)
                 }
             }
         }
@@ -2246,6 +2238,7 @@ private fun ModelCatalogDialog(
     onRunSource: (String, ModelSource) -> Unit,
     onRefreshEntry: (String) -> Unit,
     onCancelRun: () -> Unit,
+    onRemoveSource: (String, ModelSource) -> Unit,
 ) {
     var editingEntryId by rememberSaveable { mutableStateOf<String?>(null) }
     var entryName by rememberSaveable { mutableStateOf("") }
@@ -2681,6 +2674,16 @@ private fun ModelCatalogDialog(
                                     onCancel = onCancelRun,
                                     onDelete = { entryToDeleteId = entry.id },
                                     onRefresh = { onRefreshEntry(entry.id) },
+                                    onRemoveSource = { src ->
+                                        // Deleting the entry's last source drops the whole
+                                        // entry in the ViewModel, so an in-progress edit of
+                                        // that entry would point at a model that no longer
+                                        // exists. Reset the draft instead of leaving it stale.
+                                        if (entry.sources.size <= 1 && editingEntryId == entry.id) {
+                                            resetDraft()
+                                        }
+                                        onRemoveSource(entry.id, src)
+                                    },
                                 )
                             }
                         }
@@ -2793,6 +2796,7 @@ private fun ModelCatalogEntryCard(
     onEdit: () -> Unit,
     onRun: () -> Unit,
     onRunSource: (ModelSource) -> Unit,
+    onRemoveSource: (ModelSource) -> Unit,
     onCancel: () -> Unit,
     onDelete: () -> Unit,
     onRefresh: () -> Unit,
@@ -2916,7 +2920,7 @@ private fun ModelCatalogEntryCard(
                 ) {
                     Text(
                         "$supplierName · ${source.modelId}",
-                        modifier = Modifier.weight(1f),
+                        modifier = Modifier.weight(1f).align(Alignment.CenterVertically),
                         style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold),
                         maxLines = 1,
                         softWrap = false,
@@ -2927,6 +2931,7 @@ private fun ModelCatalogEntryCard(
                             "已不存在",
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.align(Alignment.CenterVertically),
                         )
 
                         supplier?.isTestingDisabled == true -> Text(
@@ -2941,18 +2946,21 @@ private fun ModelCatalogEntryCard(
                                     "进行中",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.tertiary,
+                                    modifier = Modifier.align(Alignment.CenterVertically),
                                 )
                             } else if (result.status == TestStatus.SUCCESS) {
                                 Text(
                                     "可用",
                                     style = MaterialTheme.typography.labelMedium,
                                     color = Color(0xFF15803D),
+                                    modifier = Modifier.align(Alignment.CenterVertically),
                                 )
                             } else {
                                 Text(
                                     result.httpStatus?.toString() ?: result.error?.kind?.label ?: "失败",
                                     style = MaterialTheme.typography.labelMedium,
                                     color = MaterialTheme.colorScheme.error,
+                                    modifier = Modifier.align(Alignment.CenterVertically),
                                 )
                             }
                         }
@@ -2964,15 +2972,28 @@ private fun ModelCatalogEntryCard(
                         )
                     }
                     IconButton(
-                        onClick = { onRunSource(source) },
-                        enabled = sourceTestable,
+                        onClick = if (sourceMissing) {
+                            { onRemoveSource(source) }
+                        } else {
+                            { onRunSource(source) }
+                        },
+                        enabled = editingEnabled && (sourceMissing || sourceTestable),
                         modifier = Modifier.size(36.dp),
                     ) {
-                        Icon(
-                            Icons.Outlined.PlayArrow,
-                            contentDescription = "测试 ${entry.name} 的 $supplierName 来源",
-                            modifier = Modifier.size(18.dp),
-                        )
+                        if (sourceMissing) {
+                            Icon(
+                                Icons.Outlined.DeleteOutline,
+                                contentDescription = "删除已不存在的来源 $supplierName · ${source.modelId}",
+                                modifier = Modifier.size(18.dp),
+                                tint = MaterialTheme.colorScheme.error,
+                            )
+                        } else {
+                            Icon(
+                                Icons.Outlined.PlayArrow,
+                                contentDescription = "测试 ${entry.name} 的 $supplierName 来源",
+                                modifier = Modifier.size(18.dp),
+                            )
+                        }
                     }
                 }
             }

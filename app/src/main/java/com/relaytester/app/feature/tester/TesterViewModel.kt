@@ -883,10 +883,16 @@ class TesterViewModel(
         if (runningOrInitializing()) return
         viewModelScope.launch {
             val previous = modelCatalog.toList()
+            val removed = previous.firstOrNull { it.id == entryId } ?: return@launch
             val next = previous.filterNot { it.id == entryId }
-            if (next.size == previous.size) return@launch
+            val removedKeys = removed.sources.mapTo(mutableSetOf()) { it.missingKey() }
             modelCatalog = next.toMutableList()
-            _uiState.update { it.copy(modelCatalog = next) }
+            _uiState.update {
+                it.copy(
+                    modelCatalog = next,
+                    catalogMissingSources = it.catalogMissingSources - removedKeys,
+                )
+            }
             if (!saveProfiles()) {
                 modelCatalog = previous.toMutableList()
                 _uiState.update { it.copy(modelCatalog = previous) }
@@ -979,6 +985,37 @@ class TesterViewModel(
                         isMessageError = true,
                     )
                 }
+            }
+        }
+    }
+
+    fun removeModelSourceFromCatalog(entryId: String, source: ModelSource) {
+        if (runningOrInitializing()) return
+        viewModelScope.launch {
+            val previous = modelCatalog.toList()
+            val entry = previous.firstOrNull { it.id == entryId } ?: return@launch
+            val nextSources = entry.sources.filterNot {
+                it.supplierId == source.supplierId && it.modelId == source.modelId
+            }
+            if (nextSources.size == entry.sources.size) return@launch
+            // An entry with no sources is not a valid stored state: both
+            // persistModelCatalogEntry and SupplierStore.load drop such entries.
+            // Removing the last source therefore removes the whole entry.
+            val next = if (nextSources.isEmpty()) {
+                previous.filterNot { it.id == entryId }
+            } else {
+                previous.map { if (it.id == entryId) it.copy(sources = nextSources) else it }
+            }
+            modelCatalog = next.toMutableList()
+            _uiState.update {
+                it.copy(
+                    modelCatalog = next,
+                    catalogMissingSources = it.catalogMissingSources - source.missingKey(),
+                )
+            }
+            if (!saveProfiles()) {
+                modelCatalog = previous.toMutableList()
+                _uiState.update { it.copy(modelCatalog = previous) }
             }
         }
     }
