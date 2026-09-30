@@ -47,6 +47,7 @@ import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.EditNote
+import androidx.compose.material.icons.outlined.Fingerprint
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
@@ -144,6 +145,7 @@ fun TesterScreen(
     activeDestination: AppDestination = AppDestination.MODEL_TEST,
     onDestinationSelected: (AppDestination) -> Unit = {},
     onConfigurationBackup: () -> Unit = {},
+    onFingerprintModel: (String) -> Unit = {},
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val context = LocalContext.current
@@ -265,6 +267,7 @@ fun TesterScreen(
                     }
                 },
                 onOpenModelCatalog = { showModelCatalog = true },
+                onFingerprintModel = onFingerprintModel,
                 showDeferredContent = showDeferredContent,
                 contentPadding = innerPadding,
             )
@@ -388,6 +391,7 @@ private fun TesterContent(
     onCopy: (String, List<String>) -> Unit,
     onExport: () -> Unit,
     onOpenModelCatalog: () -> Unit,
+    onFingerprintModel: (String) -> Unit,
     showDeferredContent: Boolean,
     contentPadding: PaddingValues,
 ) {
@@ -477,6 +481,7 @@ private fun TesterContent(
                     onRetestAll = onRetestAll,
                     onCopy = onCopy,
                     onExport = onExport,
+                    onFingerprintModel = onFingerprintModel,
                 )
             } else if (draft.models.isNotEmpty()) {
                 if (filteredModels.isLoading) {
@@ -1599,6 +1604,7 @@ private fun LazyListScope.resultSection(
     onRetestAll: () -> Unit,
     onCopy: (String, List<String>) -> Unit,
     onExport: () -> Unit,
+    onFingerprintModel: (String) -> Unit,
 ) {
     item(key = "result_summary", contentType = "result_summary") {
         ResultSummaryCard(state = state)
@@ -1655,6 +1661,7 @@ private fun LazyListScope.resultSection(
                 enabled = !state.isRunning,
                 onToggle = { onToggleModel(result.model) },
                 onCopyName = { model -> onCopy("模型名", listOf(model)) },
+                onFingerprint = onFingerprintModel,
             )
         }
     }
@@ -1787,6 +1794,8 @@ private fun ResultItem(
     enabled: Boolean = true,
     onToggle: () -> Unit = {},
     onCopyName: ((String) -> Unit)? = null,
+    /** Only offered on a reachable model: a failed test has no answer to fingerprint. */
+    onFingerprint: ((String) -> Unit)? = null,
 ) {
     var expanded by rememberSaveable(result.model, result.status) { mutableStateOf(false) }
     val statusColor = when (result.status) {
@@ -1854,6 +1863,19 @@ private fun ResultItem(
                             Icon(
                                 Icons.Outlined.ContentCopy,
                                 contentDescription = "复制模型名 ${result.model}",
+                                modifier = Modifier.size(16.dp),
+                            )
+                        }
+                    }
+                    if (onFingerprint != null && result.status == TestStatus.SUCCESS) {
+                        IconButton(
+                            onClick = { onFingerprint(result.model) },
+                            enabled = enabled,
+                            modifier = Modifier.size(36.dp),
+                        ) {
+                            Icon(
+                                Icons.Outlined.Fingerprint,
+                                contentDescription = "检测 ${result.model} 的模型指纹",
                                 modifier = Modifier.size(16.dp),
                             )
                         }

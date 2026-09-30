@@ -1,10 +1,10 @@
 # Relay Tester Android
 
-Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询工具，面向经常使用中转站 / API 代理服务的用户。它不依赖外部服务器，直接从手机向用户配置的 API 站点发起请求，支持模型可用性验证、批量测试、余额查询与配置迁移。
+Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询工具，面向经常使用中转站 / API 代理服务的用户。它不依赖外部服务器，直接从手机向用户配置的 API 站点发起请求，支持模型可用性验证、批量测试、余额查询、模型指纹检测与配置迁移。
 
-- 当前版本：1.3.0
-- 下载地址：[GitHub Release v1.3.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.3.0)
-- APK 大小：约 2.79 MB
+- 当前版本：1.4.0
+- 下载地址：[GitHub Release v1.4.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.4.0)
+- APK 大小：约 3.04 MB
 - 支持系统：Android 8.0 及以上
 
 ## 核心功能
@@ -45,14 +45,23 @@ Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询�
 - 余额结果以卡片形式展示，包含供应商、可用余额、分组、刷新时间、原始额度与换算后数值。
 - 支持双栏布局，减少超长站点列表的滚动成本。
 
-### 5. 配置备份与迁移
+### 5. 模型指纹检测
+
+- 让目标模型凭第一反应写出约 300 个 1–355 的整数，把结果与内置参考库比对，判断实际响应的是哪个模型。适合核对中转站是否暗中替换了模型。
+- 参考库覆盖 53 个模型、12 个家族，随安装包内置（399 KB），**全程离线，检测过程不额外上传任何数据**。
+- 支持两种模式：**API 直连**（选供应商与模型名，一键发送三道探测题并自动分析）与**手动粘贴**（没有 API Key 时，复制题目发到任意聊天界面，再把回答粘回来即可）。
+- 每题独立显示接收状态与识别到的整数个数，未达标可单独重试；慢速站点可关闭并行、逐题发送。
+- 在“模型测试”的结果卡片上，测试成功的模型会多出一个指纹图标，点击即带着供应商与模型名跳转到指纹面板。
+- 检测结果是**参考库内的封闭集合排序，不是身份证明**：不在库中的模型同样会得到最接近的候选，同家族相邻版本尤其难以区分。
+
+### 6. 配置备份与迁移
 
 - 支持将全部供应商、模型、测试参数、余额模板、API Key、PAT、用户 ID 与当前站点一次性导出。
 - 支持加密备份与明文备份，可根据需要选择是否加密。
 - 导入时可自动识别备份格式，先预览摘要，再确认覆盖，降低误操作风险。
 - 导入完成不会自动请求任何站点，避免恢复配置时意外消耗请求额度或余额。
 
-### 6. 用户体验
+### 7. 用户体验
 
 - 原生 Jetpack Compose 界面，支持浅色 / 深色 Material 3 主题。
 - 供应商卡片、余额卡片和结果列表均针对手机竖屏优化，常用按钮保持足够大的触控区域。
@@ -77,7 +86,8 @@ Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询�
 4. 按需调整测试参数，例如超时、并发、Prompt、过滤词、重试和分批数量。
 5. 开始测试后，可实时查看每个模型的响应结果和错误信息。
 6. 切换到“余额查询”页面，配置模板与访问令牌，即可查询余额。
-7. 通过右上角“导入或导出配置”功能，可迁移全部配置到其他设备。
+7. 切换到“指纹检测”页面，选好供应商与模型名后点击“开始检测”，或改用“手动粘贴”模式把三道题目的回答粘回来分析。
+8. 通过右上角“导入或导出配置”功能，可迁移全部配置到其他设备。
 
 ## 构建开发
 
@@ -97,12 +107,17 @@ Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询�
 - [余额模板指南](BALANCE_TEMPLATE_GUIDE.md)
 - [配置备份与迁移](CONFIG_BACKUP_IMPORT_EXPORT_V5_SPEC.md)
 - [UI 优化规范](UI_STARTUP_POLISH_V6_SPEC.md)
+- [第三方许可声明](THIRD_PARTY_NOTICES.md)
 
 ## 发行版本
 
-- [v1.3.0 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.3.0)
-- [v1.3.0 发行说明](RELEASE_NOTES_1.3.0.md)
-- APK：`RelayTester-v1.3.0-android.apk`
-- SHA-256：`aa99624ff84df67acd43c17a0964656a82435dd87204c959205ebe6f17772e6b`
+- [v1.4.0 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.4.0)
+- [v1.4.0 发行说明](RELEASE_NOTES_1.4.0.md)
+- APK：`RelayTester-v1.4.0-android.apk`
+- SHA-256：`3589484ab4f22af6378f1b16b441312b398d3482c6fe0c14b0204dfd9d0b9740`
+
+历史版本：
+
+- [v1.3.0 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.3.0) · [发行说明](RELEASE_NOTES_1.3.0.md)
 
 若有新功能需求或问题反馈，请提交 Issue，或直接在本仓库中继续开发。
