@@ -10,6 +10,7 @@ import androidx.compose.ui.Modifier
 enum class AppDestination(val label: String) {
     MODEL_TEST("模型测试"),
     BALANCE("余额查询"),
+    FINGERPRINT("指纹检测"),
 }
 
 @Composable

@@ -147,6 +147,95 @@ open class RelayApi(
             .put("stream", false)
     }.toString().toRequestBody(JSON_MEDIA_TYPE)
 
+    /**
+     * Sends one completion and returns the assistant's text.
+     *
+     * [test] only proves a response carries the protocol's envelope — it never reads
+     * the body. Fingerprint detection needs the whole answer, so this extracts the
+     * text per protocol instead of just checking that a field is non-empty.
+     *
+     * [timeoutSeconds] must be generous: a challenge asks for ~300 integers and slow
+     * relays routinely need more than a minute.
+     */
+    open suspend fun completeText(
+        profile: SupplierProfile,
+        apiKey: String,
+        model: String,
+        prompt: String,
+        maxTokens: Int,
+        timeoutSeconds: Int,
+    ): ApiResult<String> {
+        val baseUrl = normalizedBaseUrl(profile.baseUrl)
+            ?: return ApiResult.Failure(TestError(ErrorKind.OTHER, "Base URL 必须是有效的 HTTP(S) 地址"))
+        val endpoint = when (profile.protocol) {
+            RelayProtocol.CHAT_COMPLETIONS -> "/chat/completions"
+            RelayProtocol.RESPONSES -> "/responses"
+            RelayProtocol.ANTHROPIC -> "/messages"
+        }
+        val url = (baseUrl + endpoint).toHttpUrlOrNull()
+            ?: return ApiResult.Failure(TestError(ErrorKind.OTHER, "Base URL 无法组成请求地址"))
+
+        val request = requestBuilder(url.toString(), profile.protocol, apiKey)
+            .post(buildCompletionPayload(profile.protocol, model, prompt, maxTokens))
+            .build()
+
+        return try {
+            val payload = execute(request, timeoutSeconds)
+            if (payload.status !in 200..299) {
+                ApiResult.Failure(
+                    errorForHttp(payload.status, payload.body),
+                    httpStatus = payload.status,
+                )
+            } else {
+                val body = runCatching { JSONObject(payload.body) }.getOrElse {
+                    return ApiResult.Failure(
+                        TestError(ErrorKind.INVALID_RESPONSE, "上游返回非 JSON 响应"),
+                        httpStatus = payload.status,
+                    )
+                }
+                val text = RelayCompletionText.extract(body, profile.protocol)
+                if (text.isBlank()) {
+                    ApiResult.Failure(
+                        TestError(
+                            ErrorKind.INVALID_RESPONSE,
+                            protocolHint(body, "上游返回 HTTP 200 但没有可用的文本内容"),
+                        ),
+                        httpStatus = payload.status,
+                    )
+                } else {
+                    ApiResult.Success(text)
+                }
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            ApiResult.Failure(errorForThrowable(error))
+        }
+    }
+
+    private fun buildCompletionPayload(
+        protocol: RelayProtocol,
+        model: String,
+        prompt: String,
+        maxTokens: Int,
+    ) = when (protocol) {
+        RelayProtocol.RESPONSES -> JSONObject()
+            .put("model", model)
+            .put("input", prompt)
+            .put("max_output_tokens", maxTokens)
+
+        RelayProtocol.ANTHROPIC -> JSONObject()
+            .put("model", model)
+            .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
+            .put("max_tokens", maxTokens)
+
+        RelayProtocol.CHAT_COMPLETIONS -> JSONObject()
+            .put("model", model)
+            .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
+            .put("max_tokens", maxTokens)
+            .put("stream", false)
+    }.toString().toRequestBody(JSON_MEDIA_TYPE)
+
     private fun parseModels(body: JSONObject): List<String> {
         val values = body.optJSONArray("data") ?: body.optJSONArray("models") ?: JSONArray()
         return buildList {
@@ -406,6 +495,54 @@ open class RelayApi(
         const val MAX_RESPONSE_BYTES = 1_048_576L
         const val READ_CHUNK_BYTES = 8_192L
         const val MAX_ERROR_CHARS = 300
+    }
+}
+
+/**
+ * Extracts the assistant text from a completion response.
+ *
+ * Split out from [RelayApi] because it is pure JSON shaping and is the only part of
+ * the request path that can be exercised without a server. Responses and Anthropic
+ * both return a content array that may hold reasoning or tool blocks next to text,
+ * so every text-bearing block is concatenated rather than only the first.
+ */
+object RelayCompletionText {
+    fun extract(body: JSONObject, protocol: RelayProtocol): String = when (protocol) {
+        RelayProtocol.CHAT_COMPLETIONS -> {
+            val message = body.optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("message")
+            when (val content = message?.opt("content")) {
+                is String -> content
+                // Some relays emit the multimodal content-block array here.
+                is JSONArray -> joinBlocks(content)
+                else -> ""
+            }
+        }
+
+        RelayProtocol.RESPONSES -> {
+            val output = body.optJSONArray("output") ?: JSONArray()
+            buildString {
+                for (index in 0 until output.length()) {
+                    val item = output.optJSONObject(index) ?: continue
+                    // Reasoning blocks carry a summary, not the model's answer.
+                    if (item.optString("type") == "reasoning") continue
+                    append(joinBlocks(item.optJSONArray("content")))
+                }
+            }
+        }
+
+        RelayProtocol.ANTHROPIC -> joinBlocks(body.optJSONArray("content"))
+    }
+
+    private fun joinBlocks(blocks: JSONArray?): String {
+        blocks ?: return ""
+        return buildString {
+            for (index in 0 until blocks.length()) {
+                val block = blocks.optJSONObject(index) ?: continue
+                if (block.optString("type") == "thinking") continue
+                val value = block.optString("text")
+                if (value.isNotEmpty()) append(value)
+            }
+        }
     }
 }
 
