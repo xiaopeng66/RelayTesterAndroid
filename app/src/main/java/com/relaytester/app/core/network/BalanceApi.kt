@@ -23,14 +23,16 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /** Executes a saved declarative balance template without logging request secrets or response bodies. */
-class BalanceApi(
+// Open for the same reason as RelayApi: tests substitute a recording fake rather
+// than speak HTTP to no one.
+open class BalanceApi(
     private val client: OkHttpClient = OkHttpClient.Builder()
         .retryOnConnectionFailure(false)
         .build(),
 ) {
     private val scriptRuntime = BalanceQueryScript()
 
-    suspend fun query(
+    open suspend fun query(
         profile: SupplierProfile,
         apiKey: String,
         accessToken: String,

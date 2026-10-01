@@ -1,6 +1,10 @@
 package com.relaytester.app
 
 import com.relaytester.app.core.model.ApiResult
+import com.relaytester.app.core.model.BalanceHttpMethod
+import com.relaytester.app.core.model.BalanceQueryResult
+import com.relaytester.app.core.model.BalanceQueryTemplate
+import com.relaytester.app.core.model.BalanceSnapshot
 import com.relaytester.app.core.model.ModelCatalogEntry
 import com.relaytester.app.core.model.ModelSource
 import com.relaytester.app.core.model.ModelTestResult
@@ -128,17 +132,60 @@ class TesterPanelRegressionTest {
         assertTrue(state.message?.contains("已不存在") == true)
     }
 
+    // ---- The balance fan-out is bounded ----------------------------------
+
+    @Test
+    fun `querying every balance runs at most eight sites at once`() {
+        // One request per supplier, but the fan-out used to be unbounded: with a long
+        // supplier list it opened a socket per site and queued them all on the same
+        // small IO pool. Twelve sites held open long enough to overlap prove the cap.
+        val api = TrackingBalanceApi(holdMs = 250)
+        val subject = viewModel(balanceApi = api)
+        seedBalanceState(subject, suppliers = 12)
+
+        subject.queryAllBalances()
+        runBlocking { delay(1_500) }
+
+        assertEquals("每个站点恰好查询一次", 12, api.calls.get())
+        assertTrue(
+            "批量余额查询的在途请求数不得超过 8",
+            api.maxInFlight <= 8,
+        )
+        assertTrue("上限应当真的被触到（否则判据无意义）", api.maxInFlight >= 2)
+        assertFalse(subject.balanceUiState.value.isQuerying)
+    }
+
+    @Test
+    fun `a double tap on query balance does not launch two queries`() {
+        // The same publish-window race as startTest: isQuerying is published only
+        // after persistDraft() has suspended on the Keystore write, so the second
+        // tap of a double tap lands before any guard the flag could offer.
+        val api = TrackingBalanceApi(holdMs = 200)
+        val subject = viewModel(balanceApi = api)
+        seedBalanceState(subject, suppliers = 1)
+
+        subject.queryBalance()
+        subject.queryBalance()
+        runBlocking { delay(900) }
+
+        assertEquals("双击只允许一次查询", 1, api.calls.get())
+        assertFalse(subject.balanceUiState.value.isQuerying)
+    }
+
     // ---- Harness ---------------------------------------------------------
 
-    private fun viewModel(api: RelayApi): TesterViewModel = TesterViewModel(
+    private fun viewModel(
+        relayApi: RelayApi = ModelsApi(emptyList()),
+        balanceApi: BalanceApi = BalanceApi(),
+    ): TesterViewModel = TesterViewModel(
         supplierStore = SilentStore(),
         secretStore = object : SecretStore {
             override fun put(value: String): String = "secret-1"
             override fun get(secretId: String): String = "api-key"
             override fun delete(secretId: String) = Unit
         },
-        relayApiFactory = { api },
-        balanceApiFactory = { BalanceApi() },
+        relayApiFactory = { relayApi },
+        balanceApiFactory = { balanceApi },
         skipRestore = true,
     )
 
@@ -181,6 +228,67 @@ class TesterPanelRegressionTest {
         @Suppress("UNCHECKED_CAST")
         val state = field.get(subject) as MutableStateFlow<TesterUiState>
         state.value = state.value.copy(isInitializing = false, results = results)
+    }
+
+    /**
+     * A panel with [suppliers] configured sites (all pointing at a template that
+     * references no credentials), the first one active with an editable draft — the
+     * dirty API key makes persistDraft() really suspend, which is the window the
+     * balance start guard has to close.
+     */
+    private fun seedBalanceState(subject: TesterViewModel, suppliers: Int) {
+        val template = BalanceQueryTemplate(
+            id = "tpl-1",
+            name = "tpl",
+            description = "",
+            method = BalanceHttpMethod.GET,
+            endpointTemplate = "{{baseUrl}}/balance",
+            headers = emptyList(),
+            availablePath = "data.available",
+        )
+        val profilesField = TesterViewModel::class.java.getDeclaredField("profiles")
+        profilesField.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val profiles = profilesField.get(subject) as MutableList<SupplierProfile>
+        (1..suppliers).mapTo(profiles) { index ->
+            SupplierProfile(
+                id = "supplier-$index",
+                name = "supplier-$index",
+                baseUrl = "https://relay.test/v1",
+                protocol = com.relaytester.app.core.model.RelayProtocol.CHAT_COMPLETIONS,
+                apiKeySecretId = null,
+                models = listOf("model-a"),
+                testSettings = TestSettings(),
+            )
+        }
+        val templatesField = TesterViewModel::class.java.getDeclaredField("balanceTemplates")
+        templatesField.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        (templatesField.get(subject) as MutableList<BalanceQueryTemplate>) += template
+
+        val stateField = TesterViewModel::class.java.getDeclaredField("_uiState")
+        stateField.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val state = stateField.get(subject) as MutableStateFlow<TesterUiState>
+        state.value = state.value.copy(
+            isInitializing = false,
+            draft = com.relaytester.app.feature.tester.SupplierDraft
+                .from(profiles.first(), "api-key")
+                .copy(apiKeyDirty = true),
+            activeSupplierId = profiles.first().id,
+            suppliers = profiles.toList(),
+        )
+        // BalanceUiState boots as "initializing" until a real restore clears it;
+        // skipRestore never does, and balanceOperationBlocked() would refuse to run.
+        val balanceStateField = TesterViewModel::class.java.getDeclaredField("_balanceUiState")
+        balanceStateField.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val balanceState = balanceStateField.get(subject) as MutableStateFlow<com.relaytester.app.feature.tester.BalanceUiState>
+        balanceState.value = balanceState.value.copy(isInitializing = false)
+        // persistBalanceCredentials reads the ViewModel's own field, not the UI state.
+        val activeIdField = TesterViewModel::class.java.getDeclaredField("activeSupplierId")
+        activeIdField.isAccessible = true
+        activeIdField.set(subject, profiles.first().id)
     }
 
     /** A panel with one real supplier, one ticked model, and an editable draft. */
@@ -265,6 +373,44 @@ class TesterPanelRegressionTest {
             calls.incrementAndGet()
             delay(holdMs)
             return ModelTestResult(model = model, status = TestStatus.SUCCESS)
+        }
+    }
+
+    /**
+     * A balance endpoint that answers after [holdMs] and records how many queries were
+     * in flight at once — the only way to observe the fan-out's concurrency cap.
+     */
+    private class TrackingBalanceApi(private val holdMs: Long) : BalanceApi() {
+        val calls = java.util.concurrent.atomic.AtomicInteger(0)
+        private val inFlight = java.util.concurrent.atomic.AtomicInteger(0)
+        private val peak = java.util.concurrent.atomic.AtomicInteger(0)
+
+        val maxInFlight: Int get() = peak.get()
+
+        override suspend fun query(
+            profile: SupplierProfile,
+            apiKey: String,
+            accessToken: String,
+            userId: String,
+            template: BalanceQueryTemplate,
+        ): BalanceQueryResult {
+            calls.incrementAndGet()
+            val now = inFlight.incrementAndGet()
+            peak.updateAndGet { previous -> maxOf(previous, now) }
+            delay(holdMs)
+            inFlight.decrementAndGet()
+            return BalanceQueryResult.Success(
+                BalanceSnapshot(
+                    supplierId = profile.id,
+                    templateId = template.id,
+                    templateName = template.name,
+                    availableRaw = 1.0,
+                    unitLabel = "USD",
+                    scaleDivisor = 1.0,
+                    checkedAt = 0L,
+                    latencyMs = 1,
+                ),
+            )
         }
     }
 
