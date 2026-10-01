@@ -2,15 +2,26 @@ package com.relaytester.app.feature.fingerprint
 
 import android.content.Context
 import androidx.compose.runtime.Immutable
+import androidx.core.content.pm.PackageInfoCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.CreationExtras
 import com.relaytester.app.core.fingerprint.AnswerDiagnostic
+import com.relaytester.app.core.fingerprint.AndroidBankFileSystem
+import com.relaytester.app.core.fingerprint.BankDiscardResult
+import com.relaytester.app.core.fingerprint.BankInstallResult
+import com.relaytester.app.core.fingerprint.BankManifest
+import com.relaytester.app.core.fingerprint.BankSource
+import com.relaytester.app.core.fingerprint.BankUpdateCheck
+import com.relaytester.app.core.fingerprint.BankUpdateClient
 import com.relaytester.app.core.fingerprint.ChallengeGenerator
 import com.relaytester.app.core.fingerprint.FingerprintAnalysis
 import com.relaytester.app.core.fingerprint.FingerprintBank
+import com.relaytester.app.core.fingerprint.FingerprintBankStore
 import com.relaytester.app.core.fingerprint.FingerprintChallenge
+import com.relaytester.app.core.fingerprint.LoadedBank
+import com.relaytester.app.core.fingerprint.OkHttpBankFetcher
 import com.relaytester.app.core.model.ApiResult
 import com.relaytester.app.core.model.ErrorKind
 import com.relaytester.app.core.network.RelayApi
@@ -85,8 +96,18 @@ data class ModelFingerprintResult(
 data class FingerprintUiState(
     val isLoading: Boolean = true,
     val loadError: String? = null,
+    /** Which copy of the reference bank is in use, and what it is. */
+    val bankSource: BankSource = BankSource.BUILT_IN,
     val referenceBuiltAt: String = "",
+    val bankSha256: String = "",
+    val bankSizeBytes: Long = 0,
     val modelCount: Int = 0,
+    /** True while a user-requested check is talking to the release endpoint. */
+    val isCheckingBankUpdate: Boolean = false,
+    /** True while the checked bank is downloading and being installed. */
+    val isInstallingBank: Boolean = false,
+    /** Set when a check found a different published bank. */
+    val availableBankUpdate: BankManifest? = null,
     val suppliers: List<SupplierOption> = emptyList(),
     val selectedSupplierId: String? = null,
     /** Filters the supplier's model list; it is no longer a free-text model name. */
@@ -130,13 +151,27 @@ class FingerprintViewModel(
     private val supplierStore: SupplierStore,
     private val secretStore: SecretStore,
     private val relayApiFactory: () -> RelayApi,
-    private val bankFactory: () -> FingerprintBank,
+    private val bankStore: FingerprintBankStore,
+    private val bankUpdateClient: BankUpdateClient,
+    /** Installed version code, read by the factory from the package manager. */
+    private val appVersionCode: Long = 0L,
     private val skipRestore: Boolean = false,
     /** Overridden by tests so a round can be observed without racing real threads. */
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) : ViewModel() {
     private val relayApi: RelayApi by lazy { relayApiFactory() }
-    private val bank: FingerprintBank by lazy { bankFactory() }
+
+    /**
+     * The newest readable bank, cached for the round in progress.
+     *
+     * Re-read after an install or a rollback: the copy behind it changes, and a round
+     * must never score against the bank that was active when the panel was opened.
+     */
+    @Volatile
+    private var loadedBank: LoadedBank? = null
+
+    private fun activeBank(): FingerprintBank = loadedBank?.bank
+        ?: throw IllegalStateException("参考库尚未加载")
 
     private val _uiState = MutableStateFlow(FingerprintUiState())
     val uiState = _uiState
@@ -149,6 +184,9 @@ class FingerprintViewModel(
     /** The startup read, tracked so a test can tell a parked load from a finished one. */
     private var loadJob: Job? = null
 
+    /** A check, a download or a rollback; one at a time, tracked so tests can join it. */
+    private var bankUpdateJob: Job? = null
+
     /**
      * Suspends until anything the view model started has settled.
      *
@@ -159,6 +197,7 @@ class FingerprintViewModel(
         loadJob?.join()
         refreshJob?.join()
         runJob?.join()
+        bankUpdateJob?.join()
     }
 
     /**
@@ -173,6 +212,11 @@ class FingerprintViewModel(
     init {
         if (skipRestore) {
             _uiState.update { it.copy(isLoading = false) }
+            // Skipping the restore is about the supplier store; every action on the panel
+            // still scores against a bank, so the bank is loaded either way.
+            loadJob = viewModelScope.launch {
+                loadedBank = withContext(ioDispatcher) { bankStore.load() }
+            }
         } else {
             loadJob = viewModelScope.launch { load() }
         }
@@ -181,12 +225,13 @@ class FingerprintViewModel(
     private suspend fun load() {
         val loaded = withContext(ioDispatcher) {
             runCatching {
-                val bank = bank
+                val bank = bankStore.load()
                 val state = supplierStore.read()
                 bank to state
             }
         }
         loaded.onSuccess { (bank, storeState) ->
+            loadedBank = bank
             knownSuppliers = storeState.suppliers
             // A prefill that arrived while the store was still loading must survive it.
             val supplierId = pendingPrefill?.first
@@ -194,12 +239,9 @@ class FingerprintViewModel(
                 ?: storeState.suppliers.firstOrNull()?.id
             val supplier = storeState.suppliers.firstOrNull { it.id == supplierId }
             _uiState.update {
-                it.copy(
+                it.withBank(bank).copy(
                     isLoading = false,
                     loadError = null,
-                    referenceBuiltAt = bank.referenceBuiltAt,
-                    modelCount = bank.modelCount,
-                    minimumValidNumbers = bank.minimumValidNumbers,
                     suppliers = storeState.suppliers.map { item ->
                         SupplierOption(item.id, item.name)
                     },
@@ -303,23 +345,21 @@ class FingerprintViewModel(
         refreshJob = viewModelScope.launch {
             val read = withContext(ioDispatcher) {
                 runCatching {
-                    val bank = bank
+                    val bank = bankStore.load()
                     bank to supplierStore.read()
                 }
             }
             read.onSuccess { (bank, storeState) ->
+                loadedBank = bank
                 knownSuppliers = storeState.suppliers
                 _uiState.update { state ->
                     val supplierId = candidateSupplierId(state.selectedSupplierId, storeState)
                     val changed = supplierId != state.selectedSupplierId
-                    state.copy(
+                    state.withBank(bank).copy(
                         // A retry that succeeds has to lift the error screen, or a
                         // transient startup failure would strand the panel for good.
                         isLoading = false,
                         loadError = null,
-                        referenceBuiltAt = bank.referenceBuiltAt,
-                        modelCount = bank.modelCount,
-                        minimumValidNumbers = bank.minimumValidNumbers,
                         suppliers = storeState.suppliers.map { item -> SupplierOption(item.id, item.name) },
                         selectedSupplierId = supplierId,
                         models = storeState.suppliers.firstOrNull { it.id == supplierId }?.models.orEmpty(),
@@ -645,7 +685,7 @@ class FingerprintViewModel(
             is ApiResult.Success -> {
                 val numbers = com.relaytester.app.core.fingerprint.NumberFeatures
                     .parseNumbers(result.value).size
-                val minimum = bank.minimumNumbersFor(challenge.expectedCount)
+                val minimum = activeBank().minimumNumbersFor(challenge.expectedCount)
                 if (numbers < minimum) {
                     ChallengeProgress(
                         challenge = challenge,
@@ -710,6 +750,12 @@ class FingerprintViewModel(
      * that own the screen state publish it themselves.
      */
     private fun analyzeAnswers(answers: List<String>, expectedCounts: List<Int>): FingerprintAnalysis? {
+        // Called straight from a button rather than a coroutine, so a bank that is not
+        // loaded yet has to be reported, not thrown.
+        val bank = loadedBank?.bank ?: run {
+            showMessage("参考库尚未加载，请稍后重试", isError = true)
+            return null
+        }
         // The per-answer verdict does not depend on whether anything ends up usable, so
         // it is derived here and applied on both paths. A slot the user never filled
         // stays PENDING: reporting it as a rejected answer would blame them for a
@@ -825,6 +871,142 @@ class FingerprintViewModel(
     private suspend fun suppliers(): List<com.relaytester.app.core.model.SupplierProfile> =
         withContext(ioDispatcher) { supplierStore.read().suppliers }.also { knownSuppliers = it }
 
+    /**
+     * The state fields that describe the bank in use.
+     *
+     * One place, so no caller can publish a bank and forget to describe it.
+     * [FingerprintUiState.minimumValidNumbers] is part of it: a downloaded bank carries
+     * its own floor, and keeping the old one would judge answers by the old bank's rule.
+     */
+    private fun FingerprintUiState.withBank(loaded: LoadedBank): FingerprintUiState = copy(
+        bankSource = loaded.identity.source,
+        referenceBuiltAt = loaded.identity.builtAt,
+        bankSha256 = loaded.identity.sha256,
+        bankSizeBytes = loaded.identity.sizeBytes,
+        modelCount = loaded.identity.modelCount,
+        minimumValidNumbers = loaded.bank.minimumValidNumbers,
+    )
+
+    /**
+     * Asks the release endpoint which bank is published.
+     *
+     * This is the panel's only network call of its own account, and it happens only
+     * because the user pressed the button: detection itself stays offline, and nothing
+     * polls in the background.
+     */
+    fun checkBankUpdate() {
+        if (bankUpdateBusy()) return
+        bankUpdateJob = viewModelScope.launch {
+            _uiState.update { it.copy(isCheckingBankUpdate = true) }
+            try {
+                val loaded = withContext(ioDispatcher) { bankStore.load() }.also { loadedBank = it }
+                _uiState.update { it.withBank(loaded) }
+                applyCheckResult(bankUpdateClient.check(loaded.identity, appVersionCode))
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                showMessage(error.message ?: "检查更新失败", isError = true)
+            } finally {
+                _uiState.update { it.copy(isCheckingBankUpdate = false) }
+            }
+        }
+    }
+
+    private fun applyCheckResult(check: BankUpdateCheck) {
+        when (check) {
+            is BankUpdateCheck.Available -> {
+                _uiState.update { it.copy(availableBankUpdate = check.manifest) }
+                showMessage(
+                    "发现新的参考库：构建于 ${check.manifest.builtAt}，" +
+                        "${check.manifest.modelCount} 个模型",
+                    isError = false,
+                )
+            }
+
+            BankUpdateCheck.UpToDate -> {
+                _uiState.update { it.copy(availableBankUpdate = null) }
+                showMessage("参考库已是最新", isError = false)
+            }
+
+            is BankUpdateCheck.NeedsNewerApp -> {
+                _uiState.update { it.copy(availableBankUpdate = null) }
+                showMessage("发布的参考库需要更新的 App 版本，请先更新应用", isError = true)
+            }
+        }
+    }
+
+    /** Downloads the bank a check found and makes it the one the panel scores with. */
+    fun installBankUpdate() {
+        val manifest = _uiState.value.availableBankUpdate ?: return
+        if (bankUpdateBusy()) return
+        bankUpdateJob = viewModelScope.launch {
+            _uiState.update { it.copy(isInstallingBank = true) }
+            try {
+                val bytes = bankUpdateClient.download(manifest)
+                when (val result = withContext(ioDispatcher) { bankStore.install(bytes) }) {
+                    is BankInstallResult.Installed -> {
+                        val loaded = withContext(ioDispatcher) { bankStore.load() }.also { loadedBank = it }
+                        _uiState.update { it.withBank(loaded).copy(availableBankUpdate = null) }
+                        showMessage(
+                            "参考库已更新：构建于 ${result.identity.builtAt}，" +
+                                "${result.identity.modelCount} 个模型",
+                            isError = false,
+                        )
+                    }
+
+                    is BankInstallResult.Rejected -> showMessage(result.reason, isError = true)
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                showMessage(error.message ?: "更新参考库失败", isError = true)
+            } finally {
+                _uiState.update { it.copy(isInstallingBank = false) }
+            }
+        }
+    }
+
+    /** Drops the installed bank and goes back to the copy packaged in the APK. */
+    fun restoreBuiltInBank() {
+        if (bankUpdateBusy()) return
+        bankUpdateJob = viewModelScope.launch {
+            _uiState.update { it.copy(isInstallingBank = true) }
+            try {
+                val result = withContext(ioDispatcher) { bankStore.discardInstalled() }
+                val loaded = withContext(ioDispatcher) { bankStore.load() }.also { loadedBank = it }
+                _uiState.update { it.withBank(loaded) }
+                when (result) {
+                    BankDiscardResult.Failed -> showMessage("无法删除已安装的参考库", isError = true)
+                    BankDiscardResult.NothingInstalled ->
+                        showMessage("当前已经是内置参考库", isError = false)
+
+                    BankDiscardResult.Restored -> showMessage(
+                        "已恢复内置参考库：构建于 ${loaded.identity.builtAt}",
+                        isError = false,
+                    )
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                showMessage(error.message ?: "恢复内置参考库失败", isError = true)
+            } finally {
+                _uiState.update { it.copy(isInstallingBank = false) }
+            }
+        }
+    }
+
+    /**
+     * True when the panel must not start another bank job.
+     *
+     * A round in flight wins: swapping the bank underneath it would leave it scoring
+     * with one bank while the rows report a ranking from another.
+     */
+    private fun bankUpdateBusy(): Boolean {
+        val state = _uiState.value
+        return state.isRunning || state.isLoading ||
+            state.isCheckingBankUpdate || state.isInstallingBank
+    }
+
     private fun showMessage(message: String, isError: Boolean) {
         _uiState.update { it.copy(message = message, isMessageError = isError) }
     }
@@ -852,9 +1034,27 @@ class FingerprintViewModel(
                     supplierStore = SupplierStore(applicationContext),
                     secretStore = KeystoreSecretStore(applicationContext),
                     relayApiFactory = { RelayApi() },
-                    bankFactory = { FingerprintBank.load(applicationContext) },
+                    bankStore = FingerprintBankStore(AndroidBankFileSystem(applicationContext)),
+                    bankUpdateClient = BankUpdateClient(fetcher = OkHttpBankFetcher()),
+                    appVersionCode = installedVersionCode(applicationContext),
                 ) as T
             }
+        }
+
+        /**
+         * The installed version code.
+         *
+         * This project switches BuildConfig off, so it comes from the package manager;
+         * a manifest that demands a newer app is compared against this.
+         */
+        @Suppress("DEPRECATION")
+        private fun installedVersionCode(context: Context): Long = try {
+            val info = context.packageManager.getPackageInfo(context.packageName, 0)
+            PackageInfoCompat.getLongVersionCode(info)
+        } catch (error: Exception) {
+            // Unreadable means "old": a published bank that demands a newer app is then
+            // refused rather than installed on a guess.
+            0L
         }
     }
 }

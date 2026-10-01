@@ -1,14 +1,11 @@
 package com.relaytester.app.core.fingerprint
 
-import android.content.Context
-import java.io.IOException
-
 /**
- * Loads the packed reference bank from assets and keeps it in memory.
+ * Parses the packed reference bank and keeps it in memory.
  *
- * The asset is ~400 KB and parses in a few milliseconds, so it is cached for the
- * process lifetime on first use rather than re-read per detection. Loading is
- * triggered lazily: the app's own startup never touches this file.
+ * The asset is ~400 KB and parses in a few milliseconds, so it is parsed once per
+ * process rather than per detection. Which copy gets parsed — the packaged one or a
+ * later download — is [FingerprintBankStore]'s decision, not this class's.
  */
 class FingerprintBank private constructor(
     val modelIds: List<String>,
@@ -239,25 +236,14 @@ class FingerprintBank private constructor(
 
         private const val MAGIC = "LMFPA001"
 
-        @Volatile
-        private var cached: FingerprintBank? = null
-
-        /** Loads from assets once per process. Safe to call from any thread. */
-        fun load(context: Context): FingerprintBank = cached ?: synchronized(this) {
-            cached ?: readAsset(context.applicationContext).also { cached = it }
-        }
-
-        /** Parses the packed asset. Exposed so tests can load the shipped bytes directly. */
+        /**
+         * Parses packed bank bytes.
+         *
+         * Every field is bounds-checked against the file itself, and the reader has to
+         * consume it exactly, so bytes that are truncated, padded or not a bank at all
+         * fail here instead of producing a bank that scores nonsense.
+         */
         fun fromAssetBytes(bytes: ByteArray): FingerprintBank = parseInts(bytes)
-
-        private fun readAsset(context: Context): FingerprintBank {
-            val bytes = try {
-                context.assets.open(ASSET_PATH).use { it.readBytes() }
-            } catch (error: IOException) {
-                throw IllegalStateException("无法读取指纹参考库资产", error)
-            }
-            return parseInts(bytes)
-        }
 
         private fun parseInts(bytes: ByteArray): FingerprintBank {
             val reader = BankReader(bytes)
@@ -267,6 +253,9 @@ class FingerprintBank private constructor(
             reader.string() // reference digest
 
             val modelCount = reader.u32()
+            // Four string lists are pre-sized from this count before anything is read,
+            // so it has to be plausible for the file that declared it.
+            reader.requireCapacity(modelCount, 32)
             val ids = ArrayList<String>(modelCount)
             val displays = ArrayList<String>(modelCount)
             val families = ArrayList<String>(modelCount)
@@ -279,6 +268,7 @@ class FingerprintBank private constructor(
             }
 
             val headBlocks = reader.u32()
+            reader.requireCapacity(headBlocks, 16)
             val headMeans = Array(headBlocks) { FloatArray(0) }
             val headScales = Array(headBlocks) { FloatArray(0) }
             for (block in 0 until headBlocks) {
@@ -319,6 +309,7 @@ class FingerprintBank private constructor(
             val orderedCentroidRows = reader.u32()
             val orderedCentroids = reader.matrix(orderedCentroidRows, orderedSize)
             val environmentCount = reader.u32()
+            reader.requireCapacity(environmentCount, 8)
             val environmentCentroids = if (environmentCount > 0) {
                 val models = reader.u32()
                 val columns = reader.u32()
@@ -331,6 +322,10 @@ class FingerprintBank private constructor(
             val accuracy = DoubleArray(3) { reader.float64() }
             val recommended = reader.float64().toInt()
             val minimumValid = reader.float64().toInt()
+
+            // Every count above came out of the file, so a file that stops early or
+            // carries trailing junk is rejected here instead of scoring nonsense later.
+            require(reader.fullyRead) { "指纹库资产长度与内容不一致" }
 
             return FingerprintBank(
                 modelIds = ids,

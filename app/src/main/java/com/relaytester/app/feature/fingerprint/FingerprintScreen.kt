@@ -57,6 +57,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.relaytester.app.core.fingerprint.BankSource
 import com.relaytester.app.core.fingerprint.FingerprintCandidate
 import com.relaytester.app.core.fingerprint.minimumNumbersFor
 import com.relaytester.app.ui.components.RelayAppHeader
@@ -130,6 +131,9 @@ fun FingerprintScreen(
                 onCancel = viewModel::cancelRun,
                 onRegenerate = viewModel::regenerateChallenges,
                 onRetryChallenge = viewModel::retryChallenge,
+                onCheckBankUpdate = viewModel::checkBankUpdate,
+                onInstallBankUpdate = viewModel::installBankUpdate,
+                onRestoreBuiltInBank = viewModel::restoreBuiltInBank,
                 contentPadding = innerPadding,
             )
         }
@@ -151,6 +155,9 @@ private fun FingerprintContent(
     onCancel: () -> Unit,
     onRegenerate: () -> Unit,
     onRetryChallenge: (Int) -> Unit,
+    onCheckBankUpdate: () -> Unit,
+    onInstallBankUpdate: () -> Unit,
+    onRestoreBuiltInBank: () -> Unit,
     contentPadding: androidx.compose.foundation.layout.PaddingValues,
 ) {
     LazyColumn(
@@ -274,9 +281,129 @@ private fun FingerprintContent(
         }
 
         item {
+            ReferenceBankCard(
+                state = state,
+                onCheckBankUpdate = onCheckBankUpdate,
+                onInstallBankUpdate = onInstallBankUpdate,
+                onRestoreBuiltInBank = onRestoreBuiltInBank,
+            )
+        }
+    }
+}
+
+/**
+ * Which reference bank the panel is scoring with, and how to move it forward.
+ *
+ * The check is a button rather than a background poll: detection stays offline unless
+ * the user asks for an update, which is the only network call this panel makes on its
+ * own account. The card says so, because a bank that quietly talked to the network
+ * would make that promise a lie.
+ */
+@Composable
+private fun ReferenceBankCard(
+    state: FingerprintUiState,
+    onCheckBankUpdate: () -> Unit,
+    onInstallBankUpdate: () -> Unit,
+    onRestoreBuiltInBank: () -> Unit,
+) {
+    val busy = state.isCheckingBankUpdate || state.isInstallingBank || state.isRunning
+    OutlinedCard {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "参考库",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium,
+                )
+                Text(
+                    bankSourceLabel(state.bankSource),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = when (state.bankSource) {
+                        BankSource.INSTALLED -> MaterialTheme.colorScheme.primary
+                        BankSource.INSTALLED_UNREADABLE -> MaterialTheme.colorScheme.error
+                        BankSource.BUILT_IN -> MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                )
+            }
+
             Text(
-                "参考库构建于 ${state.referenceBuiltAt.ifBlank { "未知" }} · " +
-                    "${state.modelCount} 个模型标签 · 由 lm-detector (MIT) 提供参考数据",
+                "构建于 ${state.referenceBuiltAt.ifBlank { "未知" }} · " +
+                    "${state.modelCount} 个模型标签 · ${formatBankSize(state.bankSizeBytes)}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            state.availableBankUpdate?.let { update ->
+                Text(
+                    bankUpdateOffer(update.builtAt, update.modelCount, update.sizeBytes),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+
+            if (state.bankSource == BankSource.INSTALLED_UNREADABLE) {
+                Text(
+                    "已安装的参考库无法解析，当前使用内置参考库；点下面的按钮可以清掉它。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                OutlinedButton(
+                    onClick = onCheckBankUpdate,
+                    enabled = !busy,
+                    modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                ) {
+                    if (state.isCheckingBankUpdate) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                        )
+                        Spacer(Modifier.width(8.dp))
+                    }
+                    Text("检查更新", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                if (state.availableBankUpdate != null) {
+                    Button(
+                        onClick = onInstallBankUpdate,
+                        enabled = !busy,
+                        modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                    ) {
+                        if (state.isInstallingBank) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp,
+                            )
+                            Spacer(Modifier.width(8.dp))
+                        }
+                        Text("更新参考库", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+            }
+
+            if (state.bankSource != BankSource.BUILT_IN) {
+                TextButton(
+                    onClick = onRestoreBuiltInBank,
+                    enabled = !busy,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
+                ) { Text("恢复内置参考库") }
+            }
+
+            Text(
+                "检测本身不联网；点「检查更新」只会取一次更新清单，" +
+                    "点「更新参考库」才会下载库文件。参考数据由 lm-detector (MIT) 提供。",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

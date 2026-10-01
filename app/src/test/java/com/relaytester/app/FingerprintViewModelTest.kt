@@ -1,5 +1,7 @@
 package com.relaytester.app
 
+import com.relaytester.app.core.fingerprint.BankSource
+import com.relaytester.app.core.fingerprint.BankUpdateClient
 import com.relaytester.app.core.fingerprint.FingerprintBank
 import com.relaytester.app.core.fingerprint.minimumNumbersFor
 import com.relaytester.app.core.model.ApiResult
@@ -18,6 +20,7 @@ import com.relaytester.app.feature.fingerprint.DetectionMode
 import com.relaytester.app.feature.fingerprint.FingerprintViewModel
 import com.relaytester.app.feature.fingerprint.ModelDetectionStatus
 import java.io.File
+import java.io.IOException
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
@@ -51,6 +54,9 @@ import org.junit.Test
 class FingerprintViewModelTest {
     private val mainDispatcher = UnconfinedTestDispatcher()
 
+    /** A published-bank build stamp; the same length as the packaged one by construction. */
+    private val patchStamp = "2026-09-30T05:12:31.123456+00:00"
+
     @Before
     fun setUp() {
         Dispatchers.setMain(mainDispatcher)
@@ -79,9 +85,14 @@ class FingerprintViewModelTest {
             override fun delete(secretId: String) = Unit
         },
         relayApiFactory = { throw AssertionError("本测试不应发起网络请求") },
-        bankFactory = { bank() },
+        bankStore = MemoryBankFileSystem().store(),
+        bankUpdateClient = BankUpdateClient(fetcher = FakeBankFetcher()),
         skipRestore = true,
-    )
+    ).apply {
+        // The real panel only shows itself once the bank is loaded; these tests skip the
+        // store read, so they wait for the bank load instead of racing it.
+        runBlocking { awaitIdle() }
+    }
 
     /**
      * Drives the API path offline. The relay is always a fake, so nothing here
@@ -95,6 +106,9 @@ class FingerprintViewModelTest {
         skipRestore: Boolean = true,
         /** The main test dispatcher keeps a startup read deterministic; IO would not. */
         ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+        bankFiles: MemoryBankFileSystem = MemoryBankFileSystem(),
+        bankFetcher: FakeBankFetcher = FakeBankFetcher(),
+        appVersionCode: Long = 10_400L,
     ): FingerprintViewModel = FingerprintViewModel(
         supplierStore = store,
         secretStore = object : SecretStore {
@@ -103,17 +117,23 @@ class FingerprintViewModelTest {
             override fun delete(secretId: String) = Unit
         },
         relayApiFactory = { api },
-        bankFactory = { bank() },
+        bankStore = bankFiles.store(),
+        bankUpdateClient = BankUpdateClient(fetcher = bankFetcher),
+        appVersionCode = appVersionCode,
         skipRestore = skipRestore,
         ioDispatcher = ioDispatcher,
-    )
+    ).apply {
+        // A skipped restore still loads the bank, and no test may race that.
+        if (skipRestore) runBlocking { awaitIdle() }
+    }
 
     /** A round ready to dispatch: supplier chosen, models ticked, challenges seeded. */
     private fun readyApiViewModel(
         api: RelayApi,
         parallel: Boolean = true,
         models: List<String> = listOf("test-model"),
-    ): FingerprintViewModel = apiViewModel(api).apply {
+        bankFetcher: FakeBankFetcher = FakeBankFetcher(),
+    ): FingerprintViewModel = apiViewModel(api, bankFetcher = bankFetcher).apply {
         selectSupplier("sup-1")
         // Ticked one at a time, exactly as the checkboxes do; the tick order is what
         // the round follows.
@@ -134,11 +154,17 @@ class FingerprintViewModelTest {
         store: SupplierStore,
         api: RelayApi,
         models: List<String> = listOf("test-model"),
+        bankFiles: MemoryBankFileSystem = MemoryBankFileSystem(),
+        bankFetcher: FakeBankFetcher = FakeBankFetcher(),
+        appVersionCode: Long = 10_400L,
     ): FingerprintViewModel = apiViewModel(
         api = api,
         store = store,
         skipRestore = false,
         ioDispatcher = mainDispatcher,
+        bankFiles = bankFiles,
+        bankFetcher = bankFetcher,
+        appVersionCode = appVersionCode,
     ).apply {
         models.forEach { toggleModelSelection(it) }
         selectMode(DetectionMode.API)
@@ -784,6 +810,277 @@ class FingerprintViewModelTest {
         assertNull(state.activeModel)
         assertTrue("必须把原因告诉用户", state.isMessageError)
         assertEquals("配置读取失败", state.message)
+    }
+
+    @Test
+    fun `the panel describes the bank it actually loaded`() {
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+        )
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertEquals(BankSource.BUILT_IN, state.bankSource)
+        assertEquals(shippedBankBuiltAt(), state.referenceBuiltAt)
+        assertEquals(shippedBankBytes().size.toLong(), state.bankSizeBytes)
+        assertEquals(53, state.modelCount)
+    }
+
+    @Test
+    fun `an installed bank is the one the panel describes and scores with`() {
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFiles = MemoryBankFileSystem(installed = bankWithMinimumValid(123)),
+        )
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertEquals(BankSource.INSTALLED, state.bankSource)
+        // The floor travels with the installed bank; a panel that kept the packaged
+        // bank's floor would judge answers by a rule the active bank does not have.
+        assertEquals(123, state.minimumValidNumbers)
+    }
+
+    @Test
+    fun `an unreadable installed bank falls back instead of failing the panel`() {
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFiles = MemoryBankFileSystem(installed = "broken".toByteArray()),
+        )
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertEquals(BankSource.INSTALLED_UNREADABLE, state.bankSource)
+        assertNull("回退后不能把面板判死", state.loadError)
+        assertEquals(shippedBankBuiltAt(), state.referenceBuiltAt)
+    }
+
+    @Test
+    fun `a check offers the published bank and installing it switches the panel over`() {
+        val patched = bankWithBuiltAt(patchStamp)
+        val fetcher = FakeBankFetcher().apply { publish(patched, builtAt = patchStamp) }
+        val files = MemoryBankFileSystem()
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFiles = files,
+            bankFetcher = fetcher,
+        )
+        runBlocking { subject.awaitIdle() }
+
+        subject.checkBankUpdate()
+        runBlocking { subject.awaitIdle() }
+
+        assertEquals(patchStamp, subject.uiState.value.availableBankUpdate?.builtAt)
+        assertFalse(subject.uiState.value.isCheckingBankUpdate)
+
+        subject.installBankUpdate()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertEquals(BankSource.INSTALLED, state.bankSource)
+        assertEquals(patchStamp, state.referenceBuiltAt)
+        assertNull("装上以后就没有待更新的版本了", state.availableBankUpdate)
+        assertFalse(state.isInstallingBank)
+        assertNotNull("文件必须真的写下去", files.installed)
+    }
+
+    @Test
+    fun `the update survives into the next load of the panel`() {
+        val patched = bankWithBuiltAt(patchStamp)
+        val files = MemoryBankFileSystem()
+        val subject = apiViewModel(
+            api = FakeCompletionApi(goldenCase().answers),
+            store = SingleSupplierStore(testSupplier()),
+            skipRestore = false,
+            ioDispatcher = mainDispatcher,
+            bankFiles = files,
+            bankFetcher = FakeBankFetcher().apply { publish(patched, builtAt = patchStamp) },
+        )
+        runBlocking { subject.awaitIdle() }
+        subject.checkBankUpdate()
+        runBlocking { subject.awaitIdle() }
+        subject.installBankUpdate()
+        runBlocking { subject.awaitIdle() }
+
+        // Re-entering the panel re-reads the bank; it must find the installed one.
+        subject.refreshCatalogue()
+        runBlocking { subject.awaitIdle() }
+
+        assertEquals(BankSource.INSTALLED, subject.uiState.value.bankSource)
+        assertEquals(patchStamp, subject.uiState.value.referenceBuiltAt)
+    }
+
+    @Test
+    fun `a check that finds the same bank keeps the card clean`() {
+        val fetcher = FakeBankFetcher().apply { publish(shippedBankBytes()) }
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFetcher = fetcher,
+        )
+        runBlocking { subject.awaitIdle() }
+
+        subject.checkBankUpdate()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertNull("同一个库不该提示更新", state.availableBankUpdate)
+        assertFalse("这不是错误", state.isMessageError)
+        assertEquals("参考库已是最新", state.message)
+    }
+
+    @Test
+    fun `an install that fails verification leaves the working bank alone`() {
+        val fetcher = FakeBankFetcher().apply {
+            publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp)
+            // The server hands over something other than the manifest promised.
+            bankBytes = bankWithBuiltAt("2026-10-01T00:00:00.000000+00:00")
+        }
+        val files = MemoryBankFileSystem()
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFiles = files,
+            bankFetcher = fetcher,
+        )
+        runBlocking { subject.awaitIdle() }
+
+        subject.checkBankUpdate()
+        runBlocking { subject.awaitIdle() }
+        subject.installBankUpdate()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertTrue("必须说明为什么没装上", state.isMessageError)
+        assertEquals(BankSource.BUILT_IN, state.bankSource)
+        assertEquals(shippedBankBuiltAt(), state.referenceBuiltAt)
+        assertNull(files.installed)
+        assertFalse(state.isInstallingBank)
+    }
+
+    @Test
+    fun `an install without a check does nothing`() {
+        val fetcher = FakeBankFetcher().apply { publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp) }
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFetcher = fetcher,
+        )
+        runBlocking { subject.awaitIdle() }
+
+        subject.installBankUpdate()
+        runBlocking { subject.awaitIdle() }
+
+        assertTrue("没有可装的版本，不该发起下载", fetcher.urls.isEmpty())
+        assertEquals(BankSource.BUILT_IN, subject.uiState.value.bankSource)
+    }
+
+    @Test
+    fun `a check failure is reported and the spinner stops`() {
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFetcher = FakeBankFetcher(failure = IOException("连接中断")),
+        )
+        runBlocking { subject.awaitIdle() }
+
+        subject.checkBankUpdate()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertFalse(state.isCheckingBankUpdate)
+        assertTrue(state.isMessageError)
+        assertEquals("连接中断", state.message)
+    }
+
+    @Test
+    fun `a published bank that needs a newer app is refused`() {
+        val patched = bankWithBuiltAt(patchStamp)
+        val fetcher = FakeBankFetcher().apply {
+            publish(patched, builtAt = patchStamp)
+            manifestBody = manifestJson(patched, builtAt = patchStamp, minAppVersionCode = 10_500L)
+        }
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFetcher = fetcher,
+            appVersionCode = 10_400L,
+        )
+        runBlocking { subject.awaitIdle() }
+
+        subject.checkBankUpdate()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertNull("装不上的库不该出现更新按钮", state.availableBankUpdate)
+        assertTrue(state.isMessageError)
+    }
+
+    @Test
+    fun `restoring goes back to the packaged bank`() {
+        val files = MemoryBankFileSystem(installed = bankWithBuiltAt(patchStamp))
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFiles = files,
+        )
+        runBlocking { subject.awaitIdle() }
+        assertEquals(BankSource.INSTALLED, subject.uiState.value.bankSource)
+
+        subject.restoreBuiltInBank()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertEquals(BankSource.BUILT_IN, state.bankSource)
+        assertEquals(shippedBankBuiltAt(), state.referenceBuiltAt)
+        assertNull(files.installed)
+        assertFalse(state.isMessageError)
+    }
+
+    @Test
+    fun `a delete that fails is reported and the installed bank stays in use`() {
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFiles = MemoryBankFileSystem(
+                installed = bankWithBuiltAt(patchStamp),
+                deleteFails = true,
+            ),
+        )
+        runBlocking { subject.awaitIdle() }
+
+        subject.restoreBuiltInBank()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertTrue("删不掉就必须说，不能假装已恢复", state.isMessageError)
+        assertEquals(BankSource.INSTALLED, state.bankSource)
+    }
+
+    @Test
+    fun `a check is refused while a round is running`() {
+        val api = GatedCompletionApi(goldenCase().answers)
+        val fetcher = FakeBankFetcher().apply { publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp) }
+        val subject = readyApiViewModel(
+            api,
+            parallel = false,
+            models = listOf("m-1"),
+            bankFetcher = fetcher,
+        )
+        subject.runApiDetection()
+        runBlocking { api.started.await() }
+
+        subject.checkBankUpdate()
+
+        // Swapping the bank mid-round would leave the round scoring with one bank while
+        // its rows report a ranking from another.
+        assertTrue("检测进行中不该发起检查", fetcher.urls.isEmpty())
+        assertFalse(subject.uiState.value.isCheckingBankUpdate)
+        subject.cancelRun()
     }
 }
 
