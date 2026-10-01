@@ -1,6 +1,8 @@
 package com.relaytester.app.feature.fingerprint
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -8,20 +10,27 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material3.Button
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -35,6 +44,7 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -63,6 +73,13 @@ fun FingerprintScreen(
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
+
+    // The view model lives with the activity, so the catalogue it read at startup can
+    // be older than what the "模型测试" tab has pulled since; every entry to this panel
+    // re-reads it.
+    LaunchedEffect(activeDestination) {
+        if (activeDestination == AppDestination.FINGERPRINT) viewModel.refreshCatalogue()
+    }
 
     LaunchedEffect(state.message) {
         state.message?.let { message ->
@@ -104,7 +121,9 @@ fun FingerprintScreen(
                 state = state,
                 onModeChange = viewModel::selectMode,
                 onSupplierChange = viewModel::selectSupplier,
-                onModelChange = viewModel::updateModel,
+                onFilterChange = viewModel::updateModelFilter,
+                onToggleModel = viewModel::toggleModelSelection,
+                onClearSelection = viewModel::clearModelSelection,
                 onParallelChange = viewModel::updateParallel,
                 onManualAnswerChange = viewModel::updateManualAnswer,
                 onRun = viewModel::runApiDetection,
@@ -123,7 +142,9 @@ private fun FingerprintContent(
     state: FingerprintUiState,
     onModeChange: (DetectionMode) -> Unit,
     onSupplierChange: (String) -> Unit,
-    onModelChange: (String) -> Unit,
+    onFilterChange: (String) -> Unit,
+    onToggleModel: (String) -> Unit,
+    onClearSelection: () -> Unit,
     onParallelChange: (Boolean) -> Unit,
     onManualAnswerChange: (Int, String) -> Unit,
     onRun: () -> Unit,
@@ -156,25 +177,31 @@ private fun FingerprintContent(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        FilterChip(
+                        SelectionChip(
                             selected = state.mode == DetectionMode.API,
+                            label = "API 直连",
                             onClick = { onModeChange(DetectionMode.API) },
                             enabled = !state.isRunning,
-                            label = { Text("API 直连") },
                         )
-                        FilterChip(
+                        SelectionChip(
                             selected = state.mode == DetectionMode.MANUAL,
+                            label = "手动粘贴",
                             onClick = { onModeChange(DetectionMode.MANUAL) },
                             enabled = !state.isRunning,
-                            label = { Text("手动粘贴") },
                         )
                     }
 
                     if (state.mode == DetectionMode.API) {
-                        SupplierModelPicker(
+                        SupplierPicker(
                             state = state,
                             onSupplierChange = onSupplierChange,
-                            onModelChange = onModelChange,
+                        )
+                        ModelPicker(
+                            state = state,
+                            onFilterChange = onFilterChange,
+                            onToggleModel = onToggleModel,
+                            onClearSelection = onClearSelection,
+                            enabled = !state.isRunning,
                         )
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -183,7 +210,7 @@ private fun FingerprintContent(
                             Column(modifier = Modifier.weight(1f)) {
                                 Text("并行发送三题", style = MaterialTheme.typography.bodyMedium)
                                 Text(
-                                    "关闭后逐题发送，慢速中转站更稳",
+                                    "只影响同一个模型的三道题；多个模型始终按顺序逐个检测",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
@@ -224,12 +251,22 @@ private fun FingerprintContent(
             } else {
                 Button(
                     onClick = if (state.mode == DetectionMode.API) onRun else onAnalyze,
-                    enabled = canRun,
+                    enabled = canRun && (state.mode == DetectionMode.MANUAL || state.selectedModels.isNotEmpty()),
                     modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                 ) {
-                    Text(if (state.mode == DetectionMode.API) "开始检测" else "分析粘贴的回答")
+                    Text(
+                        when {
+                            state.mode == DetectionMode.MANUAL -> "分析粘贴的回答"
+                            state.selectedModels.size > 1 -> "依次检测 ${state.selectedModels.size} 个模型"
+                            else -> "开始检测"
+                        },
+                    )
                 }
             }
+        }
+
+        if (state.batchResults.isNotEmpty()) {
+            item { BatchResultList(state.batchResults) }
         }
 
         state.analysis?.let { analysis ->
@@ -246,6 +283,36 @@ private fun FingerprintContent(
             )
         }
     }
+}
+
+/**
+ * The panel's two pickers, styled the same way on purpose: a filled blue chip is the
+ * selected one, so "which mode" and "which supplier" read at a glance.
+ */
+@Composable
+private fun SelectionChip(
+    selected: Boolean,
+    label: String,
+    onClick: () -> Unit,
+    enabled: Boolean,
+) {
+    FilterChip(
+        selected = selected,
+        onClick = onClick,
+        enabled = enabled,
+        colors = FilterChipDefaults.filterChipColors(
+            selectedContainerColor = MaterialTheme.colorScheme.primary,
+            selectedLabelColor = MaterialTheme.colorScheme.onPrimary,
+        ),
+        label = {
+            Text(
+                label,
+                maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Ellipsis,
+            )
+        },
+    )
 }
 
 @Composable
@@ -275,11 +342,16 @@ private fun IntentNote() {
     }
 }
 
+/**
+ * Supplier chips on one line that scrolls sideways.
+ *
+ * A plain Row clipped every chip past the screen edge, so with more than a handful of
+ * configured suppliers the later ones were simply unreachable.
+ */
 @Composable
-private fun SupplierModelPicker(
+private fun SupplierPicker(
     state: FingerprintUiState,
     onSupplierChange: (String) -> Unit,
-    onModelChange: (String) -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text("供应商", style = MaterialTheme.typography.labelLarge)
@@ -291,46 +363,255 @@ private fun SupplierModelPicker(
             )
         } else {
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 state.suppliers.forEach { supplier ->
-                    FilterChip(
+                    SelectionChip(
                         selected = state.selectedSupplierId == supplier.id,
+                        label = supplier.name,
                         onClick = { onSupplierChange(supplier.id) },
                         enabled = !state.isRunning,
-                        label = {
-                            Text(
-                                supplier.name,
-                                maxLines = 1,
-                                softWrap = false,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        },
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Model filter, tick list and selection summary.
+ *
+ * The text field is a search key over the supplier's catalogue, not a model name;
+ * ticking rows chooses what to detect, in tick order. When the keyword matches nothing
+ * — including a supplier whose models were never pulled — the typed name is offered as
+ * a model of its own, so such a model stays reachable.
+ */
+@Composable
+private fun ModelPicker(
+    state: FingerprintUiState,
+    onFilterChange: (String) -> Unit,
+    onToggleModel: (String) -> Unit,
+    onClearSelection: () -> Unit,
+    enabled: Boolean,
+) {
+    val matches = filterModels(state.models, state.modelFilter)
+    val unmatched = unmatchedKeyword(state.models, state.modelFilter)
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("模型", style = MaterialTheme.typography.labelLarge)
+
+        OutlinedTextField(
+            value = state.modelFilter,
+            onValueChange = onFilterChange,
+            modifier = Modifier.fillMaxWidth(),
+            enabled = enabled,
+            singleLine = true,
+            label = { Text("筛选模型") },
+            placeholder = { Text("输入关键词，筛选该供应商的模型") },
+            leadingIcon = { Icon(Icons.Outlined.Search, contentDescription = null) },
+            trailingIcon = {
+                if (state.modelFilter.isNotEmpty()) {
+                    IconButton(onClick = { onFilterChange("") }, enabled = enabled) {
+                        Icon(Icons.Outlined.Close, contentDescription = "清空筛选")
+                    }
+                }
+            },
+        )
+
+        if (state.models.isEmpty() && unmatched == null) {
+            Text(
+                "该供应商还没有已拉取的模型。到“模型测试”里拉取后即可勾选，或直接输入模型名再勾选“使用…”。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        } else {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    // Five rows at a time; the rest scroll inside this box so the run
+                    // button and the challenge cards are never pushed off the page.
+                    .heightIn(max = MODEL_ROW_HEIGHT * VISIBLE_MODEL_ROWS)
+                    .verticalScroll(rememberScrollState()),
+            ) {
+                unmatched?.let { keyword ->
+                    ModelRow(
+                        label = keyword,
+                        supporting = "该供应商的列表里没有这个名字，将直接用它检测",
+                        order = state.selectedModels.indexOf(keyword).takeIf { it >= 0 }?.plus(1),
+                        selected = keyword in state.selectedModels,
+                        enabled = enabled,
+                        onToggle = { onToggleModel(keyword) },
+                    )
+                }
+                matches.forEach { model ->
+                    ModelRow(
+                        label = model,
+                        supporting = null,
+                        order = state.selectedModels.indexOf(model).takeIf { it >= 0 }?.plus(1),
+                        selected = model in state.selectedModels,
+                        enabled = enabled,
+                        onToggle = { onToggleModel(model) },
                     )
                 }
             }
         }
 
-        OutlinedTextField(
-            value = state.selectedModel,
-            onValueChange = onModelChange,
+        Row(
             modifier = Modifier.fillMaxWidth(),
-            enabled = !state.isRunning,
-            singleLine = true,
-            label = { Text("模型名") },
-            placeholder = { Text("例如 claude-opus-5") },
-        )
-        if (state.models.isNotEmpty()) {
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
             Text(
-                "该供应商已拉取的模型：" + state.models.take(6).joinToString("、") +
-                    if (state.models.size > 6) " 等 ${state.models.size} 个" else "",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                if (state.selectedModels.isEmpty()) {
+                    "勾选要检测的模型；勾一个就测一个，勾多个会按勾选顺序逐个检测。"
+                } else {
+                    "将按顺序检测：" + state.selectedModels.joinToString(" → ")
+                },
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.bodySmall,
+                color = if (state.selectedModels.isEmpty()) {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                } else {
+                    MaterialTheme.colorScheme.primary
+                },
+            )
+            if (state.selectedModels.isNotEmpty()) {
+                TextButton(
+                    onClick = onClearSelection,
+                    enabled = enabled,
+                ) { Text("清空") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ModelRow(
+    label: String,
+    supporting: String?,
+    order: Int?,
+    selected: Boolean,
+    enabled: Boolean,
+    onToggle: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(MODEL_ROW_HEIGHT)
+            .clickable(enabled = enabled) { onToggle() },
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Checkbox(
+            checked = selected,
+            onCheckedChange = { onToggle() },
+            enabled = enabled,
+        )
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                label,
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Ellipsis,
+                color = if (selected) {
+                    MaterialTheme.colorScheme.primary
+                } else {
+                    MaterialTheme.colorScheme.onSurface
+                },
+            )
+            supporting?.let { hint ->
+                Text(
+                    hint,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    softWrap = false,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        // The tick order is the detection order, so it is shown rather than implied.
+        order?.let { index ->
+            Text(
+                "$index",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.primary,
             )
         }
     }
 }
+
+/** The batch output: one row per tested model, in the order they were run. */
+@Composable
+private fun BatchResultList(results: List<ModelFingerprintResult>) {
+    val done = results.count { it.status == ModelDetectionStatus.DONE }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("检测结果", style = MaterialTheme.typography.titleMedium)
+        Text(
+            "已出结果 $done/${results.size} 个模型",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        results.forEachIndexed { index, row ->
+            OutlinedCard {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "${index + 1}",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            row.model,
+                            style = MaterialTheme.typography.bodyLarge,
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            when (row.status) {
+                                ModelDetectionStatus.PENDING -> "等待检测"
+                                ModelDetectionStatus.RUNNING -> "正在检测…"
+                                ModelDetectionStatus.DONE ->
+                                    listOfNotNull(row.candidateName, row.familyName).joinToString(" · ") +
+                                        "（有效回答 ${row.usableAnswers}/${row.submittedAnswers}）"
+                                ModelDetectionStatus.FAILED -> row.error ?: "检测失败"
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = when (row.status) {
+                                ModelDetectionStatus.DONE -> Color(0xFF15803D)
+                                ModelDetectionStatus.FAILED -> MaterialTheme.colorScheme.error
+                                ModelDetectionStatus.RUNNING -> Color(0xFF1D4ED8)
+                                ModelDetectionStatus.PENDING -> MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                            maxLines = 2,
+                        )
+                    }
+                    if (row.status == ModelDetectionStatus.DONE) {
+                        row.probability?.let { probability ->
+                            Text(
+                                "${(probability * 100).toInt()}%",
+                                style = MaterialTheme.typography.titleSmall,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** Row height used to cap the model list at [VISIBLE_MODEL_ROWS] rows. */
+private val MODEL_ROW_HEIGHT = 48.dp
 
 @Composable
 private fun ChallengeList(
@@ -360,7 +641,16 @@ private fun ChallengeList(
             Column(modifier = Modifier.weight(1f)) {
                 Text("三道题目", style = MaterialTheme.typography.titleMedium)
                 Text(
-                    "已收到 $received/${state.progress.size} 条有效回答",
+                    buildString {
+                        if (state.activeModel != null) {
+                            val position = state.selectedModels.indexOf(state.activeModel) + 1
+                            append("正在检测 ")
+                            if (position > 0) append("$position/${state.selectedModels.size} · ")
+                            append(state.activeModel)
+                            append(" · ")
+                        }
+                        append("已收到 $received/${state.progress.size} 条有效回答")
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

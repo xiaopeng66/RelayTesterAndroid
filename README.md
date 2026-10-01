@@ -2,9 +2,9 @@
 
 Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询工具，面向经常使用中转站 / API 代理服务的用户。它不依赖外部服务器，直接从手机向用户配置的 API 站点发起请求，支持模型可用性验证、批量测试、余额查询、模型指纹检测与配置迁移。
 
-- 当前版本：1.4.1
-- 下载地址：[GitHub Release v1.4.1](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.4.1)
-- APK 大小：约 3.04 MB
+- 当前版本：1.4.2
+- 下载地址：[GitHub Release v1.4.2](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.4.2)
+- APK 大小：约 3.05 MB
 - 支持系统：Android 8.0 及以上
 
 ## 核心功能
@@ -50,7 +50,9 @@ Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询�
 - 让目标模型凭第一反应写出约 300 个 1–355 的整数，把结果与内置参考库比对，判断实际响应的是哪个模型。适合核对中转站是否暗中替换了模型。
 - 参考库覆盖 53 个模型、12 个家族，随安装包内置（399 KB），**全程离线，检测过程不额外上传任何数据**。
 - 支持两种模式：**API 直连**（选供应商与模型名，一键发送三道探测题并自动分析）与**手动粘贴**（没有 API Key 时，复制题目发到任意聊天界面，再把回答粘回来即可）。
+- API 直连的模型名输入框同时是**筛选框**：输入关键词筛选该供应商的模型目录，下方列表（一屏五行，可滚动）勾选要检测的模型；勾一个就测一个，勾多个则按**勾选顺序逐个检测**，并在页面下方输出每个模型一行的检测结果。目录里没有的名字可以直接输入，会作为兜底模型被检测。
 - 每题独立显示接收状态与识别到的整数个数，未达标可单独重试；慢速站点可关闭并行、逐题发送。
+- 测试模式与供应商的选中态为蓝色实心 chip；供应商较多时该行可横向滑动。
 - 在“模型测试”的结果卡片上，测试成功的模型会多出一个指纹图标，点击即带着供应商与模型名跳转到指纹面板。
 - 检测结果是**参考库内的封闭集合排序，不是身份证明**：不在库中的模型同样会得到最接近的候选，同家族相邻版本尤其难以区分。
 
@@ -86,7 +88,7 @@ Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询�
 4. 按需调整测试参数，例如超时、并发、Prompt、过滤词、重试和分批数量。
 5. 开始测试后，可实时查看每个模型的响应结果和错误信息。
 6. 切换到“余额查询”页面，配置模板与访问令牌，即可查询余额。
-7. 切换到“指纹检测”页面，选好供应商与模型名后点击“开始检测”，或改用“手动粘贴”模式把三道题目的回答粘回来分析。
+7. 切换到“指纹检测”页面，选好供应商，在筛选框中输入关键词找到模型并勾选（可多选，按勾选顺序逐个检测），然后点击“开始检测”；或改用“手动粘贴”模式把三道题目的回答粘回来分析。
 8. 通过右上角“导入或导出配置”功能，可迁移全部配置到其他设备。
 
 ## 构建开发
@@ -111,13 +113,14 @@ Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询�
 
 ## 发行版本
 
-- [v1.4.1 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.4.1)
-- [v1.4.1 发行说明](RELEASE_NOTES_1.4.1.md)
-- APK：`RelayTester-v1.4.1-android.apk`
-- SHA-256：`23b40c7447cec7ccec4ff3f7b741f2d055ae0e66dce32b34eefcdcd89962e13c`
+- [v1.4.2 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.4.2)
+- [v1.4.2 发行说明](RELEASE_NOTES_1.4.2.md)
+- APK：`RelayTester-v1.4.2-android.apk`
+- SHA-256：`d1039311d4c13c67957b143d863a87e4b5ae424957ccc3ada7903e853a65b6c5`
 
 历史版本：
 
+- [v1.4.1 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.4.1) · [发行说明](RELEASE_NOTES_1.4.1.md)
 - [v1.4.0 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.4.0) · [发行说明](RELEASE_NOTES_1.4.0.md)
 - [v1.3.0 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.3.0) · [发行说明](RELEASE_NOTES_1.3.0.md)
 

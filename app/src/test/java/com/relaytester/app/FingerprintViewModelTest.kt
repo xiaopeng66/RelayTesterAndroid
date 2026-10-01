@@ -16,8 +16,11 @@ import com.relaytester.app.feature.fingerprint.ChallengeProgress
 import com.relaytester.app.feature.fingerprint.ChallengeState
 import com.relaytester.app.feature.fingerprint.DetectionMode
 import com.relaytester.app.feature.fingerprint.FingerprintViewModel
+import com.relaytester.app.feature.fingerprint.ModelDetectionStatus
 import java.io.File
+import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
@@ -25,6 +28,7 @@ import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -83,8 +87,11 @@ class FingerprintViewModelTest {
      * touches the network; `skipRestore` keeps the initial store read out of the way
      * and the supplier is injected through the store instead.
      */
-    private fun apiViewModel(api: RelayApi): FingerprintViewModel = FingerprintViewModel(
-        supplierStore = SingleSupplierStore(testSupplier()),
+    private fun apiViewModel(
+        api: RelayApi,
+        store: SupplierStore = SingleSupplierStore(testSupplier()),
+    ): FingerprintViewModel = FingerprintViewModel(
+        supplierStore = store,
         secretStore = object : SecretStore {
             override fun put(value: String): String = "secret-1"
             override fun get(secretId: String): String = "api-key"
@@ -95,17 +102,35 @@ class FingerprintViewModelTest {
         skipRestore = true,
     )
 
-    /** A round ready to dispatch: supplier chosen, model named, challenges seeded. */
+    /** A round ready to dispatch: supplier chosen, models ticked, challenges seeded. */
     private fun readyApiViewModel(
         api: RelayApi,
         parallel: Boolean = true,
+        models: List<String> = listOf("test-model"),
     ): FingerprintViewModel = apiViewModel(api).apply {
         selectSupplier("sup-1")
-        updateModel("test-model")
+        // Ticked one at a time, exactly as the checkboxes do; the tick order is what
+        // the round follows.
+        models.forEach { toggleModelSelection(it) }
         // Seeds the three challenges; without this the progress list is empty
         // because skipRestore skipped the initial load.
         selectMode(DetectionMode.API)
         updateParallel(parallel)
+    }
+
+    /** Waits for the batch list to leave its interim states, or fails on a stall. */
+    private fun awaitBatchSettled(subject: FingerprintViewModel) {
+        runBlocking {
+            withTimeout(BATCH_SETTLE_TIMEOUT_MS) {
+                while (subject.uiState.value.batchResults.any {
+                        it.status == ModelDetectionStatus.PENDING ||
+                            it.status == ModelDetectionStatus.RUNNING
+                    }
+                ) {
+                    delay(10)
+                }
+            }
+        }
     }
 
     @Test
@@ -355,7 +380,7 @@ class FingerprintViewModelTest {
     }
 
     @Test
-    fun `detection refuses to run without a model name`() {
+    fun `detection refuses to run without a ticked model`() {
         val api = FakeCompletionApi(goldenCase().answers)
         val subject = apiViewModel(api).apply {
             selectSupplier("sup-1")
@@ -365,10 +390,216 @@ class FingerprintViewModelTest {
         subject.runApiDetection()
 
         val state = subject.uiState.value
-        assertEquals("请填写要检测的模型名", state.message)
+        // The field is a filter now, so a typed keyword cannot stand in for a choice:
+        // the round runs on ticks, and typing is not one.
+        assertEquals("请至少勾选一个模型", state.message)
         assertTrue(state.isMessageError)
-        assertEquals("没有模型名就不该发出请求", 0, api.calls.get())
+        assertEquals("没有勾选模型就不该发出请求", 0, api.calls.get())
         assertFalse(state.isRunning)
+    }
+
+    @Test
+    fun `a typed keyword is not a selection`() {
+        val subject = apiViewModel(FakeCompletionApi(goldenCase().answers)).apply {
+            selectSupplier("sup-1")
+            selectMode(DetectionMode.API)
+            updateModelFilter("test-model")
+        }
+
+        assertEquals("筛选词不得被当成模型名", emptyList<String>(), subject.uiState.value.selectedModels)
+        assertTrue(subject.uiState.value.batchResults.isEmpty())
+    }
+
+    @Test
+    fun `a batch tests the ticked models one after another in tick order`() {
+        val api = FakeCompletionApi(goldenCase().answers)
+        val subject = readyApiViewModel(
+            api,
+            models = listOf("zz-last", "aa-first"),
+        )
+
+        subject.runApiDetection()
+        runBlocking { subject.awaitIdle() }
+
+        // Six requests: three challenges each, grouped by model. A model's three
+        // challenges may interleave with each other, but never with the other model's.
+        assertEquals(6, api.calls.get())
+        assertEquals(
+            listOf("zz-last", "zz-last", "zz-last", "aa-first", "aa-first", "aa-first"),
+            api.models.toList(),
+        )
+    }
+
+    @Test
+    fun `a batch publishes one row per model and keeps the single ranking off screen`() {
+        val golden = goldenCase()
+        val api = FakeCompletionApi(golden.answers)
+        val subject = readyApiViewModel(api, models = listOf("first", "second"))
+
+        subject.runApiDetection()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertFalse(state.isRunning)
+        assertNull("批次里每个模型的排名都会误导其他行，所以不进详情卡", state.analysis)
+
+        assertEquals(listOf("first", "second"), state.batchResults.map { it.model })
+        for (row in state.batchResults) {
+            assertEquals(ModelDetectionStatus.DONE, row.status)
+            assertEquals("每一行都要有自己的候选", golden.top1, row.candidateName)
+            assertEquals(3, row.usableAnswers)
+            assertNull(row.error)
+        }
+    }
+
+    @Test
+    fun `a batch continues past a failing model and records its reason`() {
+        val golden = goldenCase()
+        val api = FakeCompletionApi(golden.answers, failingModels = setOf("broken"))
+        val subject = readyApiViewModel(api, models = listOf("broken", "healthy"))
+
+        subject.runApiDetection()
+        runBlocking { subject.awaitIdle() }
+
+        val rows = subject.uiState.value.batchResults
+        assertEquals(2, rows.size)
+        assertEquals(ModelDetectionStatus.FAILED, rows[0].status)
+        assertEquals("上游返回 HTTP 502", rows[0].error)
+        // The point of the batch: a bad model must not take the good ones with it.
+        assertEquals(ModelDetectionStatus.DONE, rows[1].status)
+        assertEquals(golden.top1, rows[1].candidateName)
+    }
+
+    @Test
+    fun `cancelling mid batch closes every row that never got a verdict`() {
+        val api = GatedCompletionApi(goldenCase().answers)
+        val subject = readyApiViewModel(
+            api,
+            parallel = false,
+            models = listOf("m-1", "m-2", "m-3"),
+        )
+
+        subject.runApiDetection()
+        runBlocking { api.started.await() }
+        subject.cancelRun()
+        awaitBatchSettled(subject)
+
+        val state = subject.uiState.value
+        assertFalse(state.isRunning)
+        assertNull(state.activeModel)
+        assertEquals(3, state.batchResults.size)
+        for (row in state.batchResults) {
+            // Neither "running forever" nor silently dropped from the list.
+            assertEquals("${row.model} 行必须收尾", ModelDetectionStatus.FAILED, row.status)
+            assertEquals("已取消", row.error)
+        }
+        // Only the in-flight model ever reached the relay.
+        assertEquals(listOf("m-1"), api.models.toList())
+    }
+
+    @Test
+    fun `switching supplier drops the previous supplier's ticked models`() {
+        val subject = apiViewModel(FakeCompletionApi(goldenCase().answers)).apply {
+            selectSupplier("sup-1")
+            selectMode(DetectionMode.API)
+            toggleModelSelection("test-model")
+            updateModelFilter("test")
+        }
+
+        subject.selectSupplier("sup-1")
+
+        val state = subject.uiState.value
+        assertEquals("换供应商后旧目录的勾选必须清空", emptyList<String>(), state.selectedModels)
+        assertEquals("", state.modelFilter)
+    }
+
+    @Test
+    fun `a single ticked model keeps its detailed ranking and gets one row`() {
+        val golden = goldenCase()
+        val api = FakeCompletionApi(golden.answers)
+        val subject = readyApiViewModel(api, models = listOf("solo"))
+
+        subject.runApiDetection()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertNotNull("单模型必须保留候选详情", state.analysis)
+        assertEquals(golden.top1, state.analysis?.prediction?.displayName)
+        assertEquals(1, state.batchResults.size)
+        assertEquals(ModelDetectionStatus.DONE, state.batchResults[0].status)
+    }
+
+    @Test
+    fun `a model outside the catalogue can still be detected after being ticked`() {
+        // The fallback row in the picker: a supplier without a pulled catalogue must
+        // not be un-testable.
+        val golden = goldenCase()
+        val api = FakeCompletionApi(golden.answers)
+        val subject = readyApiViewModel(api, models = listOf("typed-by-hand"))
+
+        subject.runApiDetection()
+        runBlocking { subject.awaitIdle() }
+
+        assertEquals(listOf("typed-by-hand"), api.models.toSet().toList())
+        assertEquals(ModelDetectionStatus.DONE, subject.uiState.value.batchResults[0].status)
+    }
+
+    @Test
+    fun `re-entering the panel picks up a catalogue that was pulled afterwards`() {
+        // The device path: this view model is built with the activity, the user pulls
+        // models on the "模型测试" tab, then walks over here. Found on the emulator,
+        // where the picker stayed empty with the catalogue already saved.
+        val store = MutableSupplierStore(listOf(testSupplier()))
+        val subject = apiViewModel(FakeCompletionApi(goldenCase().answers), store)
+        assertTrue("起点的目录就是空的", subject.uiState.value.models.isEmpty())
+
+        store.suppliers = listOf(testSupplier(models = listOf("m-one", "m-two")))
+        subject.refreshCatalogue()
+        runBlocking { subject.awaitIdle() }
+
+        assertEquals(listOf("m-one", "m-two"), subject.uiState.value.models)
+    }
+
+    @Test
+    fun `a catalogue refresh keeps the ticks and the filter`() {
+        val store = MutableSupplierStore(listOf(testSupplier(models = listOf("m-one", "m-two"))))
+        val subject = apiViewModel(FakeCompletionApi(goldenCase().answers), store).apply {
+            selectSupplier("sup-1")
+            selectMode(DetectionMode.API)
+            toggleModelSelection("m-two")
+            updateModelFilter("m-")
+        }
+
+        store.suppliers = listOf(testSupplier(models = listOf("m-one", "m-two", "m-three")))
+        subject.refreshCatalogue()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertEquals(listOf("m-one", "m-two", "m-three"), state.models)
+        assertEquals("刷新不得丢掉用户勾选的模型", listOf("m-two"), state.selectedModels)
+        assertEquals("m-", state.modelFilter)
+    }
+
+    @Test
+    fun `a catalogue refresh drops the ticks when the supplier itself is gone`() {
+        val store = MutableSupplierStore(
+            listOf(testSupplier(models = listOf("m-one")), otherSupplier()),
+        )
+        val subject = apiViewModel(FakeCompletionApi(goldenCase().answers), store).apply {
+            selectSupplier("sup-1")
+            selectMode(DetectionMode.API)
+            toggleModelSelection("m-one")
+        }
+
+        // The configured supplier was deleted on the other tab.
+        store.suppliers = listOf(otherSupplier())
+        subject.refreshCatalogue()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertEquals("sup-2", state.selectedSupplierId)
+        assertEquals(listOf("other-model"), state.models)
+        assertEquals("换了供应商，旧目录的勾选必须让位", emptyList<String>(), state.selectedModels)
     }
 }
 
@@ -385,13 +616,31 @@ private class SingleSupplierStore(
     override suspend fun save(state: SupplierStoreState) = Unit
 }
 
-private fun testSupplier(): SupplierProfile = SupplierProfile(
+/** A store whose contents the test can change, standing in for the other tab's edits. */
+private class MutableSupplierStore(
+    var suppliers: List<SupplierProfile>,
+) : SupplierStore(null) {
+    override suspend fun read() = SupplierStoreState(suppliers, suppliers.firstOrNull()?.id)
+    override suspend fun save(state: SupplierStoreState) = Unit
+}
+
+private fun testSupplier(models: List<String> = listOf("test-model")): SupplierProfile = SupplierProfile(
     id = "sup-1",
     name = "测试供应商",
     baseUrl = "https://relay.test/v1",
     protocol = RelayProtocol.CHAT_COMPLETIONS,
     apiKeySecretId = "secret-1",
-    models = listOf("test-model"),
+    models = models,
+    testSettings = TestSettings(),
+)
+
+private fun otherSupplier(): SupplierProfile = SupplierProfile(
+    id = "sup-2",
+    name = "另一个供应商",
+    baseUrl = "https://other.test/v1",
+    protocol = RelayProtocol.CHAT_COMPLETIONS,
+    apiKeySecretId = "secret-2",
+    models = listOf("other-model"),
     testSettings = TestSettings(),
 )
 
@@ -402,14 +651,19 @@ private fun testSupplier(): SupplierProfile = SupplierProfile(
  * unconfined main dispatcher runs each request to completion before the next one
  * starts, so a parallel round and a sequential round become indistinguishable and
  * both concurrency assertions pass for free.
+ *
+ * Every call records the model it was sent for, in arrival order: that list is how a
+ * batch's ordering is asserted.
  */
 private class FakeCompletionApi(
     private val answers: List<String>,
     private val failure: TestError? = null,
+    private val failingModels: Set<String> = emptySet(),
     private val holdMs: Long = 20,
 ) : RelayApi() {
     val calls = AtomicInteger(0)
     val maxConcurrent = AtomicInteger(0)
+    val models = Collections.synchronizedList(mutableListOf<String>())
     private val inFlight = AtomicInteger(0)
 
     override suspend fun completeText(
@@ -423,6 +677,7 @@ private class FakeCompletionApi(
         // The index is taken on entry, so a parallel round still hands each challenge
         // a distinct answer even though the completion order is not fixed.
         val index = calls.getAndIncrement()
+        models += model
         val now = inFlight.incrementAndGet()
         maxConcurrent.updateAndGet { current -> maxOf(current, now) }
         try {
@@ -431,9 +686,45 @@ private class FakeCompletionApi(
             inFlight.decrementAndGet()
         }
         failure?.let { return ApiResult.Failure(it) }
+        if (model in failingModels) {
+            return ApiResult.Failure(TestError(ErrorKind.UPSTREAM, "上游返回 HTTP 502"))
+        }
         return ApiResult.Success(answers[index % answers.size])
     }
 }
+
+/**
+ * Holds the first request open until the test cancels, so mid-batch cancellation is
+ * observed at a known point instead of racing a timer.
+ */
+private class GatedCompletionApi(
+    private val answers: List<String>,
+) : RelayApi() {
+    /** Completed once the first request is inside the relay and parked. */
+    val started = CompletableDeferred<Unit>()
+    private val gate = CompletableDeferred<Unit>()
+    val models = Collections.synchronizedList(mutableListOf<String>())
+
+    override suspend fun completeText(
+        profile: SupplierProfile,
+        apiKey: String,
+        model: String,
+        prompt: String,
+        maxTokens: Int,
+        timeoutSeconds: Int,
+    ): ApiResult<String> {
+        val position = models.size
+        models += model
+        if (position == 0) {
+            started.complete(Unit)
+            gate.await()
+        }
+        return ApiResult.Success(answers[0])
+    }
+}
+
+/** Generous ceiling: only a genuinely stuck batch may hit it. */
+private const val BATCH_SETTLE_TIMEOUT_MS = 10_000L
 
 /** One recorded golden case: the three answers and the model they must rank first. */
 private data class GoldenCase(val answers: List<String>, val top1: String)
