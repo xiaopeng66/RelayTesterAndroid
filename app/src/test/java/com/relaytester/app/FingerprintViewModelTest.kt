@@ -1232,6 +1232,64 @@ class FingerprintViewModelTest {
     }
 
     @Test
+    fun `the silent entry check also flags a package that needs a newer app`() {
+        // A data-only upstream change rides the package channel, but a package whose
+        // format moved cannot be installed by an older app. The user has to hear that
+        // from the automatic per-entry check — someone who never presses the manual
+        // button would otherwise see a panel that silently offers nothing.
+        val patched = bankWithBuiltAt(patchStamp)
+        val fetcher = FakeBankFetcher().apply {
+            publish(patched, builtAt = patchStamp)
+            manifestBody = manifestJson(patched, builtAt = patchStamp, minAppVersionCode = 10_500L)
+        }
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFetcher = fetcher,
+            appVersionCode = 10_400L,
+        )
+        runBlocking { subject.awaitIdle() }
+
+        subject.refreshBankOnEntry()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertNotNull("静默检查也必须把「先更新应用」摆出来", state.bankRequiringNewerApp)
+        assertEquals(10_500L, state.bankRequiringNewerApp?.minAppVersionCode)
+        assertNull("装不上的包不得出现更新按钮", state.availableBankUpdate)
+        assertNull("静默检查不弹气泡", state.message)
+    }
+
+    @Test
+    fun `an installable offer clears the newer-app requirement`() {
+        // The flag describes the currently published manifest, not a permanent state:
+        // once the publisher ships something this app can parse, the hint must go.
+        val patched = bankWithBuiltAt(patchStamp)
+        val fetcher = FakeBankFetcher().apply { publish(patched, builtAt = patchStamp) }
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFetcher = fetcher,
+            appVersionCode = 10_400L,
+        )
+        runBlocking { subject.awaitIdle() }
+        fetcher.manifestBody =
+            manifestJson(patched, builtAt = patchStamp, minAppVersionCode = 10_500L)
+        subject.refreshBankOnEntry()
+        runBlocking { subject.awaitIdle() }
+        assertNotNull(subject.uiState.value.bankRequiringNewerApp)
+
+        fetcher.manifestBody =
+            manifestJson(patched, builtAt = patchStamp, minAppVersionCode = 10_400L)
+        subject.refreshBankOnEntry()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertNull("能装的包一发布，「先更新应用」的提示必须消失", state.bankRequiringNewerApp)
+        assertNotNull("可安装的更新照常摆出按钮", state.availableBankUpdate)
+    }
+
+    @Test
     fun `removing the package empties the panel`() {
         val files = MemoryBankFileSystem(installed = bankWithBuiltAt(patchStamp))
         val subject = readyApiViewModelFor(

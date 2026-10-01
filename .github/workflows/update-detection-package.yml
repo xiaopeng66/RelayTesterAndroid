@@ -45,7 +45,11 @@ on:
         default: false
 
 permissions:
+  # Uploading the release assets needs contents: write; the publish record on the
+  # tracking issue ("检测包自动更新记录") is what turns a real publish into an
+  # owner notification, and that needs issues: write.
   contents: write
+  issues: write
 
 # Two runs replacing the same two assets at once would race.
 concurrency:
