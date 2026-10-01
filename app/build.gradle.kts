@@ -24,8 +24,8 @@ android {
         targetSdk = 36
         // Android versionCode must remain monotonic for an in-place upgrade.
         // Encode the public line as major * 10_000 + minor * 100 + patch.
-        versionCode = 10_303
-        versionName = "1.4.1"
+        versionCode = 10_304
+        versionName = "1.4.2"
         ndk {
             abiFilters += "arm64-v8a"
         }
