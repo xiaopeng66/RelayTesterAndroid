@@ -884,14 +884,98 @@ class FingerprintViewModelTest {
             bankFetcher = fetcher,
         )
         runBlocking { subject.awaitIdle() }
+        assertEquals("构造本身不联网：检查由进入面板触发", emptyList<String>(), fetcher.urls)
+
+        subject.refreshBankOnEntry()
+        runBlocking { subject.awaitIdle() }
 
         val state = subject.uiState.value
         assertEquals(BankSource.NOT_PROVISIONED, state.bankSource)
-        // The panel is useless without a package, so it asks once by itself — and only
-        // once: the manifest request is the whole of its unprompted networking.
+        // The panel is useless without a package, so entering it asks once by itself —
+        // and only once: the manifest request is the whole of its unprompted networking.
         assertEquals(listOf(FakeBankFetcher.MANIFEST_URL), fetcher.urls)
         assertNotNull("未安装时必须把下载入口摆出来", state.availableBankUpdate)
-        assertFalse(state.isMessageError)
+        assertNull("自动检查不上气泡，下载入口在卡片上", state.message)
+    }
+
+    @Test
+    fun `the panel lists the models the installed package supports`() {
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+        )
+        runBlocking { subject.awaitIdle() }
+
+        val models = subject.uiState.value.bankModels
+        assertEquals("列表条数必须与包内模型数一致", shippedBankModelCount(), models.size)
+        assertEquals(
+            "按包内顺序给出显示名与家族名",
+            listOf(
+                "gpt-5.4" to "GPT",
+                "claude-sonnet-4.6" to "Claude",
+                "gemini-3.7-flash" to "Gemini",
+                "grok-4.5" to "Grok",
+                "glm-5.3" to "GLM",
+                "deepseek-v4-pro" to "DeepSeek",
+            ),
+            models.map { it.displayName to it.familyName },
+        )
+    }
+
+    @Test
+    fun `a device with no package lists no models`() {
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFiles = MemoryBankFileSystem(installed = null),
+        )
+        runBlocking { subject.awaitIdle() }
+
+        assertEquals(
+            "没有检测包就没有可列出的模型",
+            emptyList<Any>(),
+            subject.uiState.value.bankModels,
+        )
+    }
+
+    @Test
+    fun `entering the panel looks for a newer package even when one is installed`() {
+        val fetcher = FakeBankFetcher().apply {
+            publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp)
+        }
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFetcher = fetcher,
+        )
+        runBlocking { subject.awaitIdle() }
+        assertEquals("装上以后不再自动联网，只有进面板才查", emptyList<String>(), fetcher.urls)
+
+        subject.refreshBankOnEntry()
+        runBlocking { subject.awaitIdle() }
+
+        assertEquals(listOf(FakeBankFetcher.MANIFEST_URL), fetcher.urls)
+        assertEquals(patchStamp, subject.uiState.value.availableBankUpdate?.builtAt)
+        assertNull("自动检查只把按钮摆出来，不弹气泡", subject.uiState.value.message)
+    }
+
+    @Test
+    fun `an entry check that fails does not greet the user with an error`() {
+        val fetcher = FakeBankFetcher(failure = IOException("网络不可用"))
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFetcher = fetcher,
+        )
+        runBlocking { subject.awaitIdle() }
+
+        subject.refreshBankOnEntry()
+        runBlocking { subject.awaitIdle() }
+
+        assertEquals(listOf(FakeBankFetcher.MANIFEST_URL), fetcher.urls)
+        assertNull("用户没点的检查失败了不该弹错", subject.uiState.value.message)
+        assertNull(subject.uiState.value.availableBankUpdate)
+        assertFalse(subject.uiState.value.isCheckingBankUpdate)
     }
 
     @Test

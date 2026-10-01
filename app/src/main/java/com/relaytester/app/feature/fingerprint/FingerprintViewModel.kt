@@ -114,6 +114,13 @@ data class FingerprintUiState(
     val bankSha256: String = "",
     val bankSizeBytes: Long = 0,
     val modelCount: Int = 0,
+    /**
+     * The models the installed package supports, in the package's own order.
+     *
+     * Carried so the panel can list what it can actually identify; empty when nothing is
+     * installed, which is what hides the list instead of showing an empty one.
+     */
+    val bankModels: List<BankModelInfo> = emptyList(),
     /** True while a user-requested check is talking to the release endpoint. */
     val isCheckingBankUpdate: Boolean = false,
     /** True while the checked bank is downloading and being installed. */
@@ -149,6 +156,18 @@ data class FingerprintUiState(
 data class SupplierOption(
     val id: String,
     val name: String,
+)
+
+/**
+ * One model the installed package can identify, as the panel lists it.
+ *
+ * The package carries both names per model, so the panel can answer "which models are in
+ * the library I am using" without shipping a second copy of the roster.
+ */
+@Immutable
+data class BankModelInfo(
+    val displayName: String,
+    val familyName: String,
 )
 
 /**
@@ -242,9 +261,6 @@ class FingerprintViewModel(
     /** Supplier/model pair requested before the store finished loading. */
     private var pendingPrefill: Pair<String?, String>? = null
 
-    /** Set once the automatic first-run check has been started, so it never repeats. */
-    private var autoProvisionStarted = false
-
     init {
         if (skipRestore) {
             _uiState.update { it.copy(isLoading = false) }
@@ -293,23 +309,11 @@ class FingerprintViewModel(
             }
             pendingPrefill = null
             refreshProgress()
-            if (bank.loaded == null) maybeAutoProvision()
         }.onFailure { error ->
             _uiState.update {
                 it.copy(isLoading = false, loadError = error.message ?: "检测包加载失败")
             }
         }
-    }
-
-    /**
-     * The one automatic network call: on a device with no detection package the panel
-     * cannot score anything, so the manifest is fetched once to put the download one tap
-     * away. Everything after that is a button press.
-     */
-    private fun maybeAutoProvision() {
-        if (autoProvisionStarted) return
-        autoProvisionStarted = true
-        checkBankUpdate()
     }
 
     /**
@@ -937,65 +941,88 @@ class FingerprintViewModel(
         bankSha256 = result.loaded?.identity?.sha256.orEmpty(),
         bankSizeBytes = result.loaded?.identity?.sizeBytes ?: result.installedBytes,
         modelCount = result.loaded?.identity?.modelCount ?: 0,
+        bankModels = result.loaded?.bank?.let { bank ->
+            bank.modelIds.indices.map { index ->
+                BankModelInfo(bank.displayNames[index], bank.familyNames[index])
+            }
+        }.orEmpty(),
         minimumValidNumbers = result.loaded?.bank?.minimumValidNumbers ?: DEFAULT_MINIMUM_VALID_NUMBERS,
     )
 
     /**
-     * Asks the release endpoint which detection package is published.
+     * Asks the release endpoint which detection package is published, and says what it
+     * found.
      *
-     * This is the panel's only network call of its own account. Without a package the
-     * panel cannot score anything, so the first entry does this once on its own; after
-     * that it happens only because the user pressed the button. Detection itself never
-     * touches the network, and nothing polls.
+     * The button path: the user pressed "检查更新", so both the offer and the outcome are
+     * reported — including "已是最新" and any failure.
      */
-    fun checkBankUpdate() {
+    fun checkBankUpdate() = startBankCheck(silent = false)
+
+    /**
+     * The check every panel entry does, so an update published since the last visit is
+     * already on the card.
+     *
+     * This is the only way the panel learns about a new package without being asked, and
+     * it is deliberately the quiet version: the card shows "可更新到…" and the button, but
+     * a phone with no network does not get an error snackbar on every visit for a check
+     * the user did not ask for. Detection itself stays offline either way.
+     */
+    fun refreshBankOnEntry() = startBankCheck(silent = true)
+
+    private fun startBankCheck(silent: Boolean) {
         if (bankUpdateBusy()) return
-        bankUpdateJob = viewModelScope.launch { checkBankUpdateNow() }
+        bankUpdateJob = viewModelScope.launch { checkBankUpdateNow(silent) }
     }
 
     /**
      * The check itself, callable from a job that is already running.
      *
-     * Split out of [checkBankUpdate] for the removal path: it runs inside the job that
+     * Split out of [startBankCheck] for the removal path: it runs inside the job that
      * deleted the package, and launching a second job there would move [bankUpdateJob]
-     * out from under whoever is waiting on it.
+     * out from under whoever is waiting on it. [silent] suppresses the messages, not the
+     * state: [FingerprintUiState.availableBankUpdate] is set either way.
      */
-    private suspend fun checkBankUpdateNow() {
+    private suspend fun checkBankUpdateNow(silent: Boolean = false) {
         _uiState.update { it.copy(isCheckingBankUpdate = true) }
         try {
             val loaded = withContext(ioDispatcher) { bankStore.load() }.also { loadedBank = it.loaded }
             _uiState.update { it.withBank(loaded) }
             applyCheckResult(
                 bankUpdateClient.check(loaded.loaded?.identity?.sha256, appVersionCode),
+                silent = silent,
             )
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {
-            showMessage(error.message ?: "检查更新失败", isError = true)
+            if (!silent) showMessage(error.message ?: "检查更新失败", isError = true)
         } finally {
             _uiState.update { it.copy(isCheckingBankUpdate = false) }
         }
     }
 
-    private fun applyCheckResult(check: BankUpdateCheck) {
+    private fun applyCheckResult(check: BankUpdateCheck, silent: Boolean) {
         when (check) {
             is BankUpdateCheck.Available -> {
                 _uiState.update { it.copy(availableBankUpdate = check.manifest) }
-                showMessage(
-                    "发现新的检测包：构建于 ${check.manifest.builtAt}，" +
-                        "${check.manifest.modelCount} 个模型",
-                    isError = false,
-                )
+                if (!silent) {
+                    showMessage(
+                        "发现新的检测包：构建于 ${check.manifest.builtAt}，" +
+                            "${check.manifest.modelCount} 个模型",
+                        isError = false,
+                    )
+                }
             }
 
             BankUpdateCheck.UpToDate -> {
                 _uiState.update { it.copy(availableBankUpdate = null) }
-                showMessage("检测包已是最新", isError = false)
+                if (!silent) showMessage("检测包已是最新", isError = false)
             }
 
             is BankUpdateCheck.NeedsNewerApp -> {
                 _uiState.update { it.copy(availableBankUpdate = null) }
-                showMessage("发布的检测包需要更新的 App 版本，请先更新应用", isError = true)
+                if (!silent) {
+                    showMessage("发布的检测包需要更新的 App 版本，请先更新应用", isError = true)
+                }
             }
         }
     }
@@ -1038,10 +1065,10 @@ class FingerprintViewModel(
      * Nothing else can produce that state, so it is also the way out of a file that no
      * longer parses: the download that follows starts from a clean slate.
      *
-     * A removal that succeeded is followed by the same check a first run does. Deleting
-     * puts the panel back in the unprovisioned state the check exists for, and without
-     * it the download button only comes back after the user finds "检查更新" again —
-     * the empty card would otherwise advertise "下载检测包" and not offer it.
+     * A removal that succeeded is followed by a check, so the download the empty card
+     * advertises is actually offered. It is the silent kind: the removal's own message
+     * ("已删除检测包…") is the one the user needs to read, and the offer it produces
+     * shows up on the card as a button rather than as a second snackbar.
      */
     fun removeInstalledPackage() {
         if (bankUpdateBusy()) return
@@ -1074,7 +1101,7 @@ class FingerprintViewModel(
                 _uiState.update { it.copy(isInstallingBank = false) }
             }
             // After the flag is cleared: the check refuses to start while one is set.
-            if (removed) checkBankUpdateNow()
+            if (removed) checkBankUpdateNow(silent = true)
         }
     }
 
