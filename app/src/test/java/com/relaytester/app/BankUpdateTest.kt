@@ -1,10 +1,8 @@
 package com.relaytester.app
 
 import com.relaytester.app.core.fingerprint.BankFetcher
-import com.relaytester.app.core.fingerprint.BankIdentity
 import com.relaytester.app.core.fingerprint.BankManifest
 import com.relaytester.app.core.fingerprint.BankManifestParser
-import com.relaytester.app.core.fingerprint.BankSource
 import com.relaytester.app.core.fingerprint.BankUpdateCheck
 import com.relaytester.app.core.fingerprint.BankUpdateClient
 import com.relaytester.app.core.fingerprint.BankUpdateDefaults
@@ -19,32 +17,27 @@ import org.junit.Test
 /**
  * Covers what the panel accepts as an update.
  *
- * The manifest is fetched over the network and the bank follows from it, so both are
- * treated as claims: the digest identifies a bank, the size and digest of the download
- * are checked before the store ever sees it, and a manifest that asks for a newer app
- * is refused rather than half-honoured.
+ * The manifest is fetched over the network and the package follows from it, so both
+ * are treated as claims: the digest identifies a package, the size and digest of the
+ * download are checked before the store ever sees it, and a manifest that asks for a
+ * newer app is refused rather than half-honoured.
  */
 class BankUpdateTest {
     private val patchStamp = "2026-09-30T05:12:31.123456+00:00"
 
-    private fun identityFor(bytes: ByteArray) = BankIdentity(
-        source = BankSource.BUILT_IN,
-        builtAt = shippedBankBuiltAt(),
-        modelCount = 53,
-        sizeBytes = bytes.size.toLong(),
-        sha256 = sha256Hex(bytes),
-    )
+    /** The digest of the package in use; null would stand for "nothing installed". */
+    private fun digestOf(bytes: ByteArray) = sha256Hex(bytes)
 
     private fun client(fetcher: BankFetcher) = BankUpdateClient(fetcher = fetcher)
 
     @Test
-    fun `a manifest that describes a bank parses`() {
+    fun `a manifest that describes a package parses`() {
         val patched = bankWithBuiltAt(patchStamp)
         val manifest = BankManifestParser.parse(manifestJson(patched, builtAt = patchStamp))
 
-        assertEquals(1, manifest.formatVersion)
+        assertEquals(2, manifest.formatVersion)
         assertEquals(patchStamp, manifest.builtAt)
-        assertEquals(53, manifest.modelCount)
+        assertEquals(shippedBankModelCount(), manifest.modelCount)
         assertEquals(patched.size.toLong(), manifest.sizeBytes)
         assertEquals(sha256Hex(patched), manifest.sha256)
         assertEquals(FakeBankFetcher.BANK_URL, manifest.url)
@@ -54,7 +47,7 @@ class BankUpdateTest {
     @Test
     fun `a manifest from another format version is refused`() {
         val failure = runCatching {
-            BankManifestParser.parse(manifestJson(shippedBankBytes(), formatVersion = 2))
+            BankManifestParser.parse(manifestJson(fixtureBankBytes(), formatVersion = 1))
         }.exceptionOrNull()
 
         assertTrue(failure is BankUpdateException)
@@ -63,7 +56,7 @@ class BankUpdateTest {
     @Test
     fun `a manifest without a digest is refused`() {
         val failure = runCatching {
-            BankManifestParser.parse(manifestJson(shippedBankBytes(), sha256 = "abc"))
+            BankManifestParser.parse(manifestJson(fixtureBankBytes(), sha256 = "abc"))
         }.exceptionOrNull()
 
         assertTrue(failure is BankUpdateException)
@@ -72,7 +65,7 @@ class BankUpdateTest {
     @Test
     fun `a manifest without a build stamp is refused`() {
         val failure = runCatching {
-            BankManifestParser.parse(manifestJson(shippedBankBytes(), builtAt = ""))
+            BankManifestParser.parse(manifestJson(fixtureBankBytes(), builtAt = ""))
         }.exceptionOrNull()
 
         assertTrue(failure is BankUpdateException)
@@ -81,7 +74,7 @@ class BankUpdateTest {
     @Test
     fun `a manifest pointing somewhere that is not http is refused`() {
         val failure = runCatching {
-            BankManifestParser.parse(manifestJson(shippedBankBytes(), url = "file:///etc/passwd"))
+            BankManifestParser.parse(manifestJson(fixtureBankBytes(), url = "file:///etc/passwd"))
         }.exceptionOrNull()
 
         assertTrue(failure is BankUpdateException)
@@ -90,7 +83,7 @@ class BankUpdateTest {
     @Test
     fun `a manifest with an impossible size is refused`() {
         val failure = runCatching {
-            BankManifestParser.parse(manifestJson(shippedBankBytes(), sizeBytes = -1))
+            BankManifestParser.parse(manifestJson(fixtureBankBytes(), sizeBytes = -1))
         }.exceptionOrNull()
 
         assertTrue(failure is BankUpdateException)
@@ -104,46 +97,58 @@ class BankUpdateTest {
     }
 
     @Test
-    fun `a check reports a different bank as available`() = runBlocking {
+    fun `a check reports a different package as available`() = runBlocking {
         val patched = bankWithBuiltAt(patchStamp)
         val fetcher = FakeBankFetcher().apply { publish(patched, builtAt = patchStamp) }
 
-        val result = client(fetcher).check(identityFor(shippedBankBytes()), appVersionCode = 10_400L)
+        val result = client(fetcher).check(digestOf(fixtureBankBytes()), appVersionCode = 10_400L)
 
         assertTrue(result is BankUpdateCheck.Available)
         assertEquals(patchStamp, (result as BankUpdateCheck.Available).manifest.builtAt)
     }
 
     @Test
-    fun `a check reports the published bank as current when the digest matches`() = runBlocking {
-        val shipped = shippedBankBytes()
+    fun `a check reports the published package as current when the digest matches`() = runBlocking {
+        val shipped = fixtureBankBytes()
         val fetcher = FakeBankFetcher().apply { publish(shipped) }
 
-        val result = client(fetcher).check(identityFor(shipped), appVersionCode = 10_400L)
+        val result = client(fetcher).check(digestOf(shipped), appVersionCode = 10_400L)
 
         assertEquals(BankUpdateCheck.UpToDate, result)
     }
 
     @Test
-    fun `a check refuses a bank that needs a newer app`() = runBlocking {
+    fun `a check without an installed package always offers the published one`() = runBlocking {
+        // Nothing installed means the panel cannot score at all, so whatever is
+        // published is an install rather than an update.
+        val shipped = fixtureBankBytes()
+        val fetcher = FakeBankFetcher().apply { publish(shipped) }
+
+        val result = client(fetcher).check(localSha256 = null, appVersionCode = 10_400L)
+
+        assertTrue(result is BankUpdateCheck.Available)
+    }
+
+    @Test
+    fun `a check refuses a package that needs a newer app`() = runBlocking {
         val patched = bankWithBuiltAt(patchStamp)
         val fetcher = FakeBankFetcher().apply { publish(patched, builtAt = patchStamp) }
         fetcher.manifestBody = manifestJson(patched, minAppVersionCode = 10_500L)
 
-        val result = client(fetcher).check(identityFor(shippedBankBytes()), appVersionCode = 10_400L)
+        val result = client(fetcher).check(digestOf(fixtureBankBytes()), appVersionCode = 10_400L)
 
         assertTrue(result is BankUpdateCheck.NeedsNewerApp)
     }
 
     @Test
-    fun `a bank already in use is current even when the manifest asks for a newer app`() = runBlocking {
+    fun `a package already in use is current even when the manifest asks for a newer app`() = runBlocking {
         // Nothing to install, so there is nothing for the app-version gate to refuse: an
         // "update your app" prompt here would be noise.
-        val shipped = shippedBankBytes()
+        val shipped = fixtureBankBytes()
         val fetcher = FakeBankFetcher().apply { publish(shipped) }
         fetcher.manifestBody = manifestJson(shipped, minAppVersionCode = 10_500L)
 
-        val result = client(fetcher).check(identityFor(shipped), appVersionCode = 10_400L)
+        val result = client(fetcher).check(digestOf(shipped), appVersionCode = 10_400L)
 
         assertEquals(BankUpdateCheck.UpToDate, result)
     }
@@ -191,7 +196,7 @@ class BankUpdateTest {
     fun `a check reports a network failure instead of pretending nothing is published`() = runBlocking {
         val fetcher = FakeBankFetcher(failure = IOException("连接中断"))
 
-        val failure = runCatching { client(fetcher).check(identityFor(shippedBankBytes()), 10_400L) }
+        val failure = runCatching { client(fetcher).check(digestOf(fixtureBankBytes()), 10_400L) }
             .exceptionOrNull()
 
         assertTrue(failure is IOException)
@@ -199,9 +204,9 @@ class BankUpdateTest {
 
     @Test
     fun `the check only asks the configured manifest url`() = runBlocking {
-        val fetcher = FakeBankFetcher().apply { publish(shippedBankBytes()) }
+        val fetcher = FakeBankFetcher().apply { publish(fixtureBankBytes()) }
 
-        client(fetcher).check(identityFor(shippedBankBytes()), appVersionCode = 10_400L)
+        client(fetcher).check(digestOf(fixtureBankBytes()), appVersionCode = 10_400L)
 
         assertEquals(listOf(BankUpdateDefaults.MANIFEST_URL), fetcher.urls)
     }
@@ -215,7 +220,7 @@ class BankUpdateTest {
 
     @Test
     fun `the manifest url and the download url are different endpoints`() {
-        val manifest: BankManifest = BankManifestParser.parse(manifestJson(shippedBankBytes()))
+        val manifest: BankManifest = BankManifestParser.parse(manifestJson(fixtureBankBytes()))
 
         assertTrue(manifest.url != BankUpdateDefaults.MANIFEST_URL)
     }

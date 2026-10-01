@@ -2,54 +2,78 @@ package com.relaytester.app
 
 import com.relaytester.app.core.fingerprint.BankFetcher
 import com.relaytester.app.core.fingerprint.BankFileSystem
+import com.relaytester.app.core.fingerprint.BankReader
 import com.relaytester.app.core.fingerprint.BankUpdateDefaults
 import com.relaytester.app.core.fingerprint.FingerprintBank
 import com.relaytester.app.core.fingerprint.FingerprintBankStore
 import com.relaytester.app.core.fingerprint.sha256Hex
-import java.io.File
 import java.io.IOException
 import org.json.JSONObject
 
 /**
- * The bytes of the bank actually packaged in the APK.
+ * The detection package the tests score against.
  *
- * Read from the module rather than from a fixture: the update policy is only worth
- * testing against the artifact that ships, and a parse failure here is a failure of
- * the artifact itself.
+ * A committed fixture built from the same upstream files the shipped package is built
+ * from, restricted to six models (`build_fingerprint_asset.py --pick ...`). It is small
+ * enough to keep in the repository while still exercising every code path: the ranker's
+ * three terms, the verifier (whose ranking-margin feature needs at least two candidates)
+ * and the family roll-up. Only the six-model roster distinguishes it from the published
+ * package — the algorithm is identical, which is what makes the golden vectors below
+ * meaningful.
+ *
+ * It is a *test* resource rather than an APK asset on purpose: the app ships without a
+ * package and downloads one.
  */
-internal fun shippedBankBytes(): ByteArray {
-    val candidates = listOf(
-        File("app/src/main/assets/lm-fingerprint/lite-bank.bin"),
-        File("src/main/assets/lm-fingerprint/lite-bank.bin"),
-    )
-    val file = candidates.firstOrNull(File::isFile)
-        ?: error("找不到指纹资产文件：${File(".").absolutePath}")
-    return file.readBytes()
+internal object BankFixtures {
+    private const val PACKAGE_RESOURCE = "lm-fingerprint/lite-bank-small.bin"
+
+    val loader: ClassLoader get() = BankFixtures::class.java.classLoader!!
+
+    fun packageBytes(): ByteArray {
+        val stream = loader.getResourceAsStream(PACKAGE_RESOURCE)
+            ?: error("找不到检测包夹具 $PACKAGE_RESOURCE")
+        return stream.use { it.readBytes() }
+    }
+
+    fun bank(bytes: ByteArray = packageBytes()): FingerprintBank = FingerprintBank.fromPackageBytes(bytes)
+
+    fun builtAt(): String = bank().referenceBuiltAt
+
+    fun modelCount(): Int = bank().modelCount
+
+    fun minimumValidNumbers(): Int = bank().minimumValidNumbers
 }
 
-/** The reference build stamp the packaged bank carries. */
-internal fun shippedBankBuiltAt(): String = FingerprintBank.fromAssetBytes(shippedBankBytes()).referenceBuiltAt
+/** The fixture package's bytes; the name the older tests used. */
+internal fun fixtureBankBytes(): ByteArray = BankFixtures.packageBytes()
+
+/** The reference build stamp the fixture carries. */
+internal fun shippedBankBuiltAt(): String = BankFixtures.builtAt()
+
+internal fun shippedBankModelCount(): Int = BankFixtures.modelCount()
 
 /**
- * The packaged bank with a different build stamp, same length so the layout is untouched.
+ * The fixture with a different build stamp, same length so the layout is untouched.
  *
  * A same-length rewrite keeps every following offset valid, which is what makes this a
- * usable stand-in for "the publisher released a new bank": it parses, it is a valid
- * bank, and it is recognisably not the packaged one.
+ * usable stand-in for "the publisher released a new package": it parses, it is a valid
+ * package, and it is recognisably not the fixture.
  */
 internal fun bankWithBuiltAt(stamp: String): ByteArray {
-    val original = shippedBankBuiltAt()
+    val original = BankFixtures.builtAt()
     require(stamp.length == original.length) {
         "构建时间戳长度必须一致：${original.length} != ${stamp.length}"
     }
-    val bytes = shippedBankBytes()
+    val bytes = BankFixtures.packageBytes()
     val needle = original.toByteArray(Charsets.UTF_8)
     val at = bytes.indexOfSlice(needle)
-    require(at >= 0) { "资产里找不到构建时间戳" }
-    require(bytes.indexOfSlice(needle, at + 1) < 0) { "构建时间戳在资产里出现了多次" }
+    require(at >= 0) { "检测包里找不到构建时间戳" }
+    require(bytes.indexOfSlice(needle, at + 1) < 0) { "构建时间戳在检测包里出现了多次" }
     stamp.toByteArray(Charsets.UTF_8).copyInto(bytes, at)
     // Self-check: a patch that landed somewhere else would produce a different stamp.
-    require(FingerprintBank.fromAssetBytes(bytes).referenceBuiltAt == stamp) { "构建时间戳改写未生效" }
+    require(FingerprintBank.fromPackageBytes(bytes).referenceBuiltAt == stamp) {
+        "构建时间戳改写未生效"
+    }
     return bytes
 }
 
@@ -66,27 +90,43 @@ private fun ByteArray.indexOfSlice(needle: ByteArray, from: Int = 0): Int {
 }
 
 /**
- * The packaged bank with a different validity floor.
+ * The fixture with a different validity floor.
  *
- * The floor is the last value in the asset, so this rewrites the final eight bytes.
- * It stands in for a published bank that asks for more or fewer numbers per answer.
+ * The floor is an f64 in the header, right after `tau` and `recommended_queries`, so the
+ * offset is derived by walking the header rather than hard-coded: a hard-coded offset
+ * would silently patch the wrong double the next time the header changes shape.
  */
 internal fun bankWithMinimumValid(value: Int): ByteArray {
-    val bytes = shippedBankBytes()
+    val bytes = BankFixtures.packageBytes()
+    val reader = BankReader(bytes)
+    reader.expectMagic("LMFPA002")
+    reader.string() // source reference digest
+    reader.string() // build stamp
+    reader.string() // reference digest
+    val modelCount = reader.u32()
+    repeat(modelCount) {
+        reader.string()
+        reader.string()
+        reader.string()
+        reader.string()
+    }
+    reader.float64() // tau
+    reader.float64() // recommended queries
+    val at = reader.consumed
     val bits = java.lang.Double.doubleToLongBits(value.toDouble())
     for (index in 0 until 8) {
         // The format stores f64 little-endian, so the first byte holds the low bits.
         val shift = 8 * index
-        bytes[bytes.size - 8 + index] = ((bits shr shift) and 0xFF).toByte()
+        bytes[at + index] = ((bits shr shift) and 0xFF).toByte()
     }
-    require(FingerprintBank.fromAssetBytes(bytes).minimumValidNumbers == value) {
+    require(FingerprintBank.fromPackageBytes(bytes).minimumValidNumbers == value) {
         "有效数字下限改写未生效"
     }
     return bytes
 }
 
-/** A copy of the packaged bank carrying one extra byte, which no reader should accept. */
-internal fun bankWithTrailingByte(): ByteArray = shippedBankBytes() + byteArrayOf(0)
+/** A copy of the fixture carrying one extra byte, which no reader should accept. */
+internal fun bankWithTrailingByte(): ByteArray = BankFixtures.packageBytes() + byteArrayOf(0)
 
 /**
  * An in-memory [BankFileSystem].
@@ -94,35 +134,46 @@ internal fun bankWithTrailingByte(): ByteArray = shippedBankBytes() + byteArrayO
  * The real one needs a Context, and none of this behaviour needs a device: whether a
  * file is present, whether reading it fails, whether a write lands or a delete fails
  * are all just states of this fake.
+ *
+ * [installed] defaults to the fixture, because "the app has a detection package" is the
+ * ordinary state once a device has been provisioned; a test that wants the first-run
+ * state passes null.
  */
 internal class MemoryBankFileSystem(
-    private val packaged: ByteArray = shippedBankBytes(),
-    /** The installed bank, or null when none is installed. */
-    var installed: ByteArray? = null,
-    /** Reading the installed bank throws, standing in for an unreadable private file. */
+    var installed: ByteArray? = BankFixtures.packageBytes(),
+    /** The rollback copy, as [BankFileSystem.writeInstalled] keeps it. */
+    var backup: ByteArray? = null,
+    /** Reading the installed package throws, standing in for an unreadable private file. */
     var readFails: Boolean = false,
     /** Writing throws, standing in for a full disk. */
     var writeFails: Boolean = false,
     /** Deleting throws, standing in for a file that cannot be removed. */
     var deleteFails: Boolean = false,
 ) : BankFileSystem {
-    override fun readBuiltIn(): ByteArray = packaged
-
     override fun installedLength(): Long? = installed?.size?.toLong()
 
     override fun readInstalled(): ByteArray? {
-        if (installed != null && readFails) throw IOException("读取已安装参考库失败")
+        if (installed != null && readFails) throw IOException("读取已安装检测包失败")
         return installed
     }
 
+    override fun readBackup(): ByteArray? = backup
+
     override fun writeInstalled(bytes: ByteArray) {
-        if (writeFails) throw IOException("写入参考库失败")
+        if (writeFails) throw IOException("写入检测包失败")
+        // Mirrors AndroidBankFileSystem: the outgoing file becomes the rollback copy.
+        installed?.let { backup = it }
         installed = bytes
     }
 
     override fun deleteInstalled() {
-        if (deleteFails) throw IOException("删除参考库失败")
+        if (deleteFails) throw IOException("删除检测包失败")
         installed = null
+    }
+
+    override fun deleteBackup() {
+        if (deleteFails) throw IOException("删除检测包备份失败")
+        backup = null
     }
 
     fun store(maxInstalledBytes: Long = FingerprintBankStore.MAX_INSTALLED_BYTES) =
@@ -134,11 +185,11 @@ internal fun manifestJson(
     bankBytes: ByteArray,
     builtAt: String = "2026-09-30T05:12:31+00:00",
     url: String = "https://example.test/bank/lite-bank.bin",
-    modelCount: Int = FingerprintBank.fromAssetBytes(bankBytes).modelCount,
+    modelCount: Int = FingerprintBank.fromPackageBytes(bankBytes).modelCount,
     minAppVersionCode: Long = 0L,
     sha256: String = sha256Hex(bankBytes),
     sizeBytes: Long = bankBytes.size.toLong(),
-    formatVersion: Int = 1,
+    formatVersion: Int = 2,
 ): String = JSONObject().apply {
     put("formatVersion", formatVersion)
     put("builtAt", builtAt)

@@ -2,6 +2,7 @@ package com.relaytester.app
 
 import com.relaytester.app.core.fingerprint.BankSource
 import com.relaytester.app.core.fingerprint.BankUpdateClient
+import com.relaytester.app.core.fingerprint.sha256Hex
 import com.relaytester.app.core.fingerprint.FingerprintBank
 import com.relaytester.app.core.fingerprint.minimumNumbersFor
 import com.relaytester.app.core.model.ApiResult
@@ -38,6 +39,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -67,15 +69,7 @@ class FingerprintViewModelTest {
         Dispatchers.resetMain()
     }
 
-    private fun bank(): FingerprintBank {
-        val candidates = listOf(
-            File("app/src/main/assets/lm-fingerprint/lite-bank.bin"),
-            File("src/main/assets/lm-fingerprint/lite-bank.bin"),
-        )
-        val file = candidates.firstOrNull(File::isFile)
-            ?: error("找不到指纹资产文件：${File(".").absolutePath}")
-        return FingerprintBank.fromAssetBytes(file.readBytes())
-    }
+    private fun bank(): FingerprintBank = BankFixtures.bank()
 
     private fun viewModel(): FingerprintViewModel = FingerprintViewModel(
         supplierStore = EmptyStore(),
@@ -416,7 +410,7 @@ class FingerprintViewModelTest {
     @Test
     fun `a successful round ranks the reference top candidate`() {
         val golden = goldenCase()
-        assertEquals("夹具必须仍是文档记录的那一条样例", "gpt-4o", golden.top1)
+        assertEquals("夹具必须仍是文档记录的那一条样例", "gpt-5.4", golden.top1)
         val api = FakeCompletionApi(golden.answers)
         val subject = readyApiViewModel(api)
 
@@ -813,7 +807,7 @@ class FingerprintViewModelTest {
     }
 
     @Test
-    fun `the panel describes the bank it actually loaded`() {
+    fun `the panel describes the detection package it actually loaded`() {
         val subject = readyApiViewModelFor(
             SingleSupplierStore(testSupplier()),
             FakeCompletionApi(goldenCase().answers),
@@ -821,10 +815,11 @@ class FingerprintViewModelTest {
         runBlocking { subject.awaitIdle() }
 
         val state = subject.uiState.value
-        assertEquals(BankSource.BUILT_IN, state.bankSource)
+        assertEquals(BankSource.INSTALLED, state.bankSource)
         assertEquals(shippedBankBuiltAt(), state.referenceBuiltAt)
-        assertEquals(shippedBankBytes().size.toLong(), state.bankSizeBytes)
-        assertEquals(53, state.modelCount)
+        assertEquals(fixtureBankBytes().size.toLong(), state.bankSizeBytes)
+        assertEquals(shippedBankModelCount(), state.modelCount)
+        assertNull(state.bankProblem)
     }
 
     @Test
@@ -844,7 +839,7 @@ class FingerprintViewModelTest {
     }
 
     @Test
-    fun `an unreadable installed bank falls back instead of failing the panel`() {
+    fun `a package that cannot be parsed leaves the panel asking for a fresh download`() {
         val subject = readyApiViewModelFor(
             SingleSupplierStore(testSupplier()),
             FakeCompletionApi(goldenCase().answers),
@@ -854,8 +849,74 @@ class FingerprintViewModelTest {
 
         val state = subject.uiState.value
         assertEquals(BankSource.INSTALLED_UNREADABLE, state.bankSource)
-        assertNull("回退后不能把面板判死", state.loadError)
+        // Not an error screen: the panel stays operable and says what to do about it.
+        assertNull("坏包不能把面板判死", state.loadError)
+        assertTrue("必须说明包已无法解析", state.bankProblem!!.contains("无法解析"))
+        assertEquals("", state.referenceBuiltAt)
+        assertEquals(0, state.modelCount)
+    }
+
+    @Test
+    fun `a corrupt file falls back to the package it replaced`() {
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFiles = MemoryBankFileSystem(
+                installed = "broken".toByteArray(),
+                backup = fixtureBankBytes(),
+            ),
+        )
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertEquals(BankSource.INSTALLED, state.bankSource)
+        assertTrue(state.bankUsedBackup)
         assertEquals(shippedBankBuiltAt(), state.referenceBuiltAt)
+    }
+
+    @Test
+    fun `a device with no package is told to download one`() {
+        val fetcher = FakeBankFetcher().apply { publish(fixtureBankBytes()) }
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFiles = MemoryBankFileSystem(installed = null),
+            bankFetcher = fetcher,
+        )
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertEquals(BankSource.NOT_PROVISIONED, state.bankSource)
+        // The panel is useless without a package, so it asks once by itself — and only
+        // once: the manifest request is the whole of its unprompted networking.
+        assertEquals(listOf(FakeBankFetcher.MANIFEST_URL), fetcher.urls)
+        assertNotNull("未安装时必须把下载入口摆出来", state.availableBankUpdate)
+        assertFalse(state.isMessageError)
+    }
+
+    @Test
+    fun `a round on a device with no package reports the missing package`() {
+        val api = FakeCompletionApi(goldenCase().answers)
+        val bare = apiViewModel(
+            api = api,
+            bankFiles = MemoryBankFileSystem(installed = null),
+            bankFetcher = FakeBankFetcher(),
+        ).apply {
+            selectSupplier("sup-1")
+            toggleModelSelection("test-model")
+            selectMode(DetectionMode.API)
+        }
+        runBlocking { bare.awaitIdle() }
+
+        bare.runApiDetection()
+        runBlocking { bare.awaitIdle() }
+
+        val state = bare.uiState.value
+        assertTrue("必须说清楚是缺检测包，实际「${state.message}」", state.message!!.contains("检测包"))
+        assertTrue(state.isMessageError)
+        // Nothing can be scored without a package, so refusing up front must also mean
+        // spending no request: a challenge-level rejection would blame the model.
+        assertEquals("缺检测包时不得发出任何请求", 0, api.calls.get())
     }
 
     @Test
@@ -916,7 +977,7 @@ class FingerprintViewModelTest {
 
     @Test
     fun `a check that finds the same bank keeps the card clean`() {
-        val fetcher = FakeBankFetcher().apply { publish(shippedBankBytes()) }
+        val fetcher = FakeBankFetcher().apply { publish(fixtureBankBytes()) }
         val subject = readyApiViewModelFor(
             SingleSupplierStore(testSupplier()),
             FakeCompletionApi(goldenCase().answers),
@@ -928,9 +989,9 @@ class FingerprintViewModelTest {
         runBlocking { subject.awaitIdle() }
 
         val state = subject.uiState.value
-        assertNull("同一个库不该提示更新", state.availableBankUpdate)
+        assertNull("同一个包不该提示更新", state.availableBankUpdate)
         assertFalse("这不是错误", state.isMessageError)
-        assertEquals("参考库已是最新", state.message)
+        assertEquals("检测包已是最新", state.message)
     }
 
     @Test
@@ -956,9 +1017,9 @@ class FingerprintViewModelTest {
 
         val state = subject.uiState.value
         assertTrue("必须说明为什么没装上", state.isMessageError)
-        assertEquals(BankSource.BUILT_IN, state.bankSource)
+        assertEquals(BankSource.INSTALLED, state.bankSource)
         assertEquals(shippedBankBuiltAt(), state.referenceBuiltAt)
-        assertNull(files.installed)
+        assertEquals("被拒绝的下载不得写进文件", sha256Hex(fixtureBankBytes()), sha256Hex(files.installed!!))
         assertFalse(state.isInstallingBank)
     }
 
@@ -976,7 +1037,7 @@ class FingerprintViewModelTest {
         runBlocking { subject.awaitIdle() }
 
         assertTrue("没有可装的版本，不该发起下载", fetcher.urls.isEmpty())
-        assertEquals(BankSource.BUILT_IN, subject.uiState.value.bankSource)
+        assertEquals(BankSource.INSTALLED, subject.uiState.value.bankSource)
     }
 
     @Test
@@ -1021,24 +1082,80 @@ class FingerprintViewModelTest {
     }
 
     @Test
-    fun `restoring goes back to the packaged bank`() {
+    fun `removing the package empties the panel`() {
         val files = MemoryBankFileSystem(installed = bankWithBuiltAt(patchStamp))
         val subject = readyApiViewModelFor(
             SingleSupplierStore(testSupplier()),
             FakeCompletionApi(goldenCase().answers),
             bankFiles = files,
+            // Removing is followed by a check, so the fake has to answer like a publisher.
+            bankFetcher = FakeBankFetcher().apply {
+                publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp)
+            },
         )
         runBlocking { subject.awaitIdle() }
         assertEquals(BankSource.INSTALLED, subject.uiState.value.bankSource)
 
-        subject.restoreBuiltInBank()
+        subject.removeInstalledPackage()
         runBlocking { subject.awaitIdle() }
 
         val state = subject.uiState.value
-        assertEquals(BankSource.BUILT_IN, state.bankSource)
-        assertEquals(shippedBankBuiltAt(), state.referenceBuiltAt)
+        assertEquals(BankSource.NOT_PROVISIONED, state.bankSource)
+        assertEquals("", state.referenceBuiltAt)
+        assertEquals(0, state.modelCount)
         assertNull(files.installed)
+        assertNull(files.backup)
         assertFalse(state.isMessageError)
+    }
+
+    @Test
+    fun `deleting the package leaves the download one tap away`() {
+        val fetcher = FakeBankFetcher().apply {
+            publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp)
+        }
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFiles = MemoryBankFileSystem(installed = bankWithBuiltAt(patchStamp)),
+            bankFetcher = fetcher,
+        )
+        runBlocking { subject.awaitIdle() }
+        assertEquals("已装有检测包时不该自动联网", emptyList<String>(), fetcher.urls)
+
+        subject.removeInstalledPackage()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertEquals(BankSource.NOT_PROVISIONED, state.bankSource)
+        assertNotNull("删除后「下载检测包」必须马上回来", state.availableBankUpdate)
+        assertEquals(
+            "删除成功只重查一次清单",
+            listOf(FakeBankFetcher.MANIFEST_URL),
+            fetcher.urls,
+        )
+    }
+
+    @Test
+    fun `a delete that failed does not re-check the manifest`() {
+        val fetcher = FakeBankFetcher().apply {
+            publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp)
+        }
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFiles = MemoryBankFileSystem(
+                installed = bankWithBuiltAt(patchStamp),
+                deleteFails = true,
+            ),
+            bankFetcher = fetcher,
+        )
+        runBlocking { subject.awaitIdle() }
+
+        subject.removeInstalledPackage()
+        runBlocking { subject.awaitIdle() }
+
+        assertTrue("删除失败时不该顺手联网", fetcher.urls.isEmpty())
+        assertEquals(BankSource.INSTALLED, subject.uiState.value.bankSource)
     }
 
     @Test
@@ -1053,11 +1170,11 @@ class FingerprintViewModelTest {
         )
         runBlocking { subject.awaitIdle() }
 
-        subject.restoreBuiltInBank()
+        subject.removeInstalledPackage()
         runBlocking { subject.awaitIdle() }
 
         val state = subject.uiState.value
-        assertTrue("删不掉就必须说，不能假装已恢复", state.isMessageError)
+        assertTrue("删不掉就必须说，不能假装已删除", state.isMessageError)
         assertEquals(BankSource.INSTALLED, state.bankSource)
     }
 
@@ -1249,7 +1366,7 @@ private fun goldenCase(): GoldenCase {
     val answers = first.getJSONArray("answers").let { array ->
         List(array.length()) { array.getString(it) }
     }
-    return GoldenCase(answers, first.getJSONObject("expected").getString("top1"))
+    return GoldenCase(answers, first.getJSONObject("expected").getString("prediction"))
 }
 
 private fun assertNotNull(message: String, value: Any?) {

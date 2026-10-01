@@ -8,19 +8,22 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 
-/** Which copy of the reference bank a load resolved to. */
+/** Where the package in use came from. */
 enum class BankSource {
-    /** The copy packaged in the APK. */
-    BUILT_IN,
-
-    /** A copy the user installed over the network. */
+    /** A package the user downloaded and installed. */
     INSTALLED,
 
-    /** A file is installed but no longer usable; the panel fell back to the packaged copy. */
+    /**
+     * A file is installed but no longer parses, and no usable backup is left.
+     * The panel cannot score anything and has to offer a fresh download.
+     */
     INSTALLED_UNREADABLE,
+
+    /** Nothing is installed; the panel is unusable until a package is downloaded. */
+    NOT_PROVISIONED,
 }
 
-/** What the panel shows about the bank it is scoring with. */
+/** What the panel shows about the package it is scoring with. */
 data class BankIdentity(
     val source: BankSource,
     /** Reference build stamp from upstream, e.g. `2026-09-29T19:11:50+00:00`. */
@@ -30,10 +33,28 @@ data class BankIdentity(
     val sha256: String,
 )
 
-/** A parsed bank together with where it came from. */
+/** A parsed package together with where it came from. */
 data class LoadedBank(
     val bank: FingerprintBank,
     val identity: BankIdentity,
+)
+
+/**
+ * What one load found.
+ *
+ * [loaded] is null when nothing usable is installed; [source] then says whether the
+ * device is empty or holding a file that no longer parses, which is the difference
+ * between "download the detection package" and "your file is broken, download again".
+ */
+data class BankLoadResult(
+    val loaded: LoadedBank?,
+    val source: BankSource,
+    /** Bytes of the installed file, or 0 when there is none. */
+    val installedBytes: Long,
+    /** True when the primary file was unusable and its backup was used instead. */
+    val usedBackup: Boolean,
+    /** User-facing reason an installed file was refused, or null when there is none. */
+    val problem: String?,
 )
 
 /** Outcome of an install attempt. */
@@ -44,65 +65,71 @@ sealed interface BankInstallResult {
     data class Rejected(val reason: String) : BankInstallResult
 }
 
-/** Outcome of dropping the installed bank. */
+/** Outcome of deleting the installed package. */
 sealed interface BankDiscardResult {
-    /** The packaged bank is the active one again. */
-    data object Restored : BankDiscardResult
+    /** The installed package (and its backup) are gone; the panel is unprovisioned. */
+    data object Removed : BankDiscardResult
 
-    /** Nothing was installed, so there was nothing to drop. */
+    /** Nothing was installed, so there was nothing to remove. */
     data object NothingInstalled : BankDiscardResult
 
-    /** The file could not be removed; the installed bank is still the active one. */
+    /** The file could not be removed; it is still the installed package. */
     data object Failed : BankDiscardResult
 }
 
 /**
- * Where the two copies of the bank live.
+ * Where the installed package and its backup live.
  *
- * An interface so the store's policy — which copy wins, what counts as valid, how a
- * swap stays crash-safe — can be tested without an Android context.
+ * An interface so the store's policy — what counts as valid, how a swap stays
+ * crash-safe, when the backup is used — can be tested without an Android context.
  */
 interface BankFileSystem {
-    /** The bank packaged in the APK. */
-    fun readBuiltIn(): ByteArray
-
-    /** Length of an installed bank, or null when none exists. */
+    /** Length of the installed package, or null when none exists. */
     fun installedLength(): Long?
 
-    /** An installed bank, or null when none exists. */
+    /** The installed package, or null when none exists. */
     fun readInstalled(): ByteArray?
 
-    /** Replaces the installed bank with [bytes]; a reader never sees a half-written file. */
+    /** The previous package kept for rollback, or null when there is none. */
+    fun readBackup(): ByteArray?
+
+    /**
+     * Replaces the installed package with [bytes].
+     *
+     * A reader never sees a half-written file, and the package being replaced is kept
+     * as the backup first, so a corrupt install can always fall back one step.
+     */
     fun writeInstalled(bytes: ByteArray)
 
     fun deleteInstalled()
+
+    fun deleteBackup()
 }
 
-/** The real filesystem: assets for the packaged copy, a private file for the installed one. */
+/** The real filesystem: one private file for the package, one for the rollback copy. */
 class AndroidBankFileSystem(context: Context) : BankFileSystem {
     private val appContext = context.applicationContext
-    private val installed = File(appContext.filesDir, FingerprintBank.ASSET_PATH)
-
-    override fun readBuiltIn(): ByteArray = try {
-        appContext.assets.open(FingerprintBank.ASSET_PATH).use { it.readBytes() }
-    } catch (error: IOException) {
-        throw IllegalStateException("无法读取指纹参考库资产", error)
-    }
+    private val installed = File(appContext.filesDir, FingerprintBank.INSTALLED_FILE_NAME)
+    private val backup = File(installed.parentFile, "${installed.name}.bak")
 
     override fun installedLength(): Long? = if (installed.isFile) installed.length() else null
 
     override fun readInstalled(): ByteArray? =
         if (installed.isFile) installed.readBytes() else null
 
+    override fun readBackup(): ByteArray? =
+        if (backup.isFile) backup.readBytes() else null
+
     override fun writeInstalled(bytes: ByteArray) {
         val directory = installed.parentFile
         if (directory != null && !directory.isDirectory && !directory.mkdirs()) {
-            throw IOException("无法创建参考库目录")
+            throw IOException("无法创建检测包目录")
         }
         // Staged next to the target so the rename below stays within one filesystem.
         val staging = File(directory, "${installed.name}.staging")
         try {
             staging.writeBytes(bytes)
+            rotateBackup()
             move(staging, installed)
         } catch (error: IOException) {
             staging.delete()
@@ -112,7 +139,24 @@ class AndroidBankFileSystem(context: Context) : BankFileSystem {
 
     override fun deleteInstalled() {
         if (installed.isFile && !installed.delete()) {
-            throw IOException("无法删除已安装的参考库")
+            throw IOException("无法删除已安装的检测包")
+        }
+    }
+
+    override fun deleteBackup() {
+        if (backup.isFile && !backup.delete()) {
+            throw IOException("无法删除检测包备份")
+        }
+    }
+
+    /** Keeps the outgoing package as the backup; best effort, never blocks the install. */
+    private fun rotateBackup() {
+        if (!installed.isFile) return
+        try {
+            backup.delete()
+            Files.move(installed.toPath(), backup.toPath(), StandardCopyOption.REPLACE_EXISTING)
+        } catch (error: IOException) {
+            // Losing the rollback copy is survivable; failing the install is not.
         }
     }
 
@@ -131,16 +175,18 @@ class AndroidBankFileSystem(context: Context) : BankFileSystem {
 }
 
 /**
- * Picks between the packaged bank and one the user installed, and swaps them safely.
+ * Owns the installed detection package: validating it, swapping it, and telling the
+ * panel when there is nothing to score with.
  *
- * An installed bank wins as long as it parses; if it stops parsing the packaged copy is
- * used and the panel is told, so a bad download can never leave the panel worse off than
- * a fresh install. Nothing is written until the whole file has been validated, and the
- * write itself is a rename, so an interrupted install leaves the previous bank intact.
+ * The package ships separately from the APK, so the panel has to work before anything
+ * is installed — its job here is to report that state precisely enough for the UI to
+ * offer the download rather than an error screen. Nothing is written until the whole
+ * file has been validated and the write itself is a rename, so an interrupted install
+ * leaves the previous package (or the previous nothing) intact.
  */
 class FingerprintBankStore(
     private val files: BankFileSystem,
-    /** Ceiling for an installed bank; the packaged one is ~400 KB and a download is not trusted. */
+    /** Ceiling for an installed package; a download is not trusted to be small. */
     private val maxInstalledBytes: Long = MAX_INSTALLED_BYTES,
 ) {
     private class Cached(
@@ -150,43 +196,50 @@ class FingerprintBankStore(
     )
 
     @Volatile
-    private var builtIn: Cached? = null
+    private var cached: Cached? = null
 
     @Volatile
-    private var installed: Cached? = null
+    private var source = BankSource.NOT_PROVISIONED
 
-    /** Set when a file is installed but unusable, so the panel can offer to drop it. */
     @Volatile
-    private var installedUnreadable = false
+    private var installedBytes = 0L
+
+    @Volatile
+    private var usedBackup = false
+
+    @Volatile
+    private var problem: String? = null
 
     @Volatile
     private var probed = false
 
-    /** The bank to score with, plus where it came from. */
+    /** The package to score with, plus where it came from, or the reason there is none. */
     @Synchronized
-    fun load(): LoadedBank {
+    fun load(): BankLoadResult {
         if (!probed) probe()
-        val active = installed
-        val source = when {
-            active != null -> BankSource.INSTALLED
-            installedUnreadable -> BankSource.INSTALLED_UNREADABLE
-            else -> BankSource.BUILT_IN
-        }
-        val cached = active ?: packaged()
-        return LoadedBank(
-            bank = cached.bank,
-            identity = BankIdentity(
-                source = source,
-                builtAt = cached.bank.referenceBuiltAt,
-                modelCount = cached.bank.modelCount,
-                sizeBytes = cached.sizeBytes,
-                sha256 = cached.sha256,
-            ),
+        val active = cached
+        return BankLoadResult(
+            loaded = active?.let {
+                LoadedBank(
+                    bank = it.bank,
+                    identity = BankIdentity(
+                        source = BankSource.INSTALLED,
+                        builtAt = it.bank.referenceBuiltAt,
+                        modelCount = it.bank.modelCount,
+                        sizeBytes = it.sizeBytes,
+                        sha256 = it.sha256,
+                    ),
+                )
+            },
+            source = source,
+            installedBytes = installedBytes,
+            usedBackup = usedBackup,
+            problem = problem,
         )
     }
 
     /**
-     * Validates [bytes] and installs them as the active bank.
+     * Validates [bytes] and installs them as the active package.
      *
      * The file is parsed in full before anything is written, so a rejected download
      * leaves the panel on the copy it was already using.
@@ -199,33 +252,36 @@ class FingerprintBankStore(
             )
         }
         val bank = parse(bytes)
-            ?: return BankInstallResult.Rejected("文件不是有效的参考库，已放弃安装")
+            ?: return BankInstallResult.Rejected("文件不是有效的检测包，已放弃安装")
         val digest = sha256Hex(bytes)
         try {
             files.writeInstalled(bytes)
         } catch (error: IOException) {
-            return BankInstallResult.Rejected(error.message ?: "写入参考库失败")
+            return BankInstallResult.Rejected(error.message ?: "写入检测包失败")
         }
-        val cached = Cached(bank, bytes.size.toLong(), digest)
-        installed = cached
-        installedUnreadable = false
+        val fresh = Cached(bank, bytes.size.toLong(), digest)
+        cached = fresh
+        source = BankSource.INSTALLED
+        installedBytes = fresh.sizeBytes
+        usedBackup = false
+        problem = null
         probed = true
         return BankInstallResult.Installed(
             BankIdentity(
                 source = BankSource.INSTALLED,
                 builtAt = bank.referenceBuiltAt,
                 modelCount = bank.modelCount,
-                sizeBytes = cached.sizeBytes,
+                sizeBytes = fresh.sizeBytes,
                 sha256 = digest,
             ),
         )
     }
 
     /**
-     * Drops the installed bank so the packaged one is used again.
+     * Deletes the installed package so the panel is unprovisioned again.
      *
-     * A file that cannot be removed stays the active bank, which the panel has to say
-     * instead of claiming the rollback happened.
+     * A file that cannot be removed stays the active package, which the panel has to
+     * say instead of claiming the removal happened.
      */
     @Synchronized
     fun discardInstalled(): BankDiscardResult {
@@ -237,59 +293,101 @@ class FingerprintBankStore(
         if (present) {
             try {
                 files.deleteInstalled()
+                files.deleteBackup()
             } catch (error: IOException) {
                 return BankDiscardResult.Failed
             }
         }
-        installed = null
-        installedUnreadable = false
+        cached = null
+        source = BankSource.NOT_PROVISIONED
+        installedBytes = 0L
+        usedBackup = false
+        problem = null
         probed = true
-        return if (present) BankDiscardResult.Restored else BankDiscardResult.NothingInstalled
-    }
-
-    private fun probe() {
-        probed = true
-        val present = try {
-            files.installedLength() != null
-        } catch (error: IOException) {
-            false
-        }
-        if (!present) return
-        val bytes = try {
-            files.readInstalled()
-        } catch (error: IOException) {
-            null
-        }
-        val bank = bytes
-            ?.takeIf { it.size.toLong() <= maxInstalledBytes }
-            ?.let { parse(it) }
-        if (bytes == null || bank == null) {
-            installedUnreadable = true
-            return
-        }
-        installed = Cached(bank, bytes.size.toLong(), sha256Hex(bytes))
-    }
-
-    private fun packaged(): Cached = builtIn ?: run {
-        val bytes = files.readBuiltIn()
-        val bank = parse(bytes) ?: throw IllegalStateException("内置参考库无法解析")
-        Cached(bank, bytes.size.toLong(), sha256Hex(bytes)).also { builtIn = it }
+        return if (present) BankDiscardResult.Removed else BankDiscardResult.NothingInstalled
     }
 
     /**
-     * Parses the packed format, treating every failure as "not a bank".
+     * Reads the installed file once and records why it could not be used.
      *
-     * An installed bank is untrusted input: a truncated file, a stray HTML error page
-     * or a hand-made one all have to end up as a rejection rather than a crash.
+     * The backup is tried before giving up: it is the package the previous install
+     * replaced, so a file that is corrupted (or a package built by an incompatible
+     * revision) still leaves the panel able to score.
+     */
+    private fun probe() {
+        probed = true
+        val length = try {
+            files.installedLength()
+        } catch (error: IOException) {
+            null
+        }
+        if (length == null) {
+            source = BankSource.NOT_PROVISIONED
+            return
+        }
+        installedBytes = length
+        // A read that fails is a file that cannot be used, not a crash: the panel has to
+        // keep working and say so.
+        var unreadable = false
+        val primary = try {
+            files.readInstalled()
+        } catch (error: IOException) {
+            unreadable = true
+            null
+        }
+        if (installFrom(primary, backup = false)) return
+
+        val fallback = try {
+            files.readBackup()
+        } catch (error: IOException) {
+            unreadable = true
+            null
+        }
+        if (installFrom(fallback, backup = true)) {
+            usedBackup = true
+            problem = "已安装的检测包不可用，已回退到上一份"
+            source = BankSource.INSTALLED
+            return
+        }
+        source = BankSource.INSTALLED_UNREADABLE
+        problem = if (unreadable) {
+            "已安装的检测包无法读取，请重新下载"
+        } else {
+            "已安装的检测包无法解析，请重新下载"
+        }
+    }
+
+    /** Parses [bytes] and adopts them when they form a usable package. */
+    private fun installFrom(bytes: ByteArray?, backup: Boolean): Boolean {
+        if (bytes == null || bytes.size.toLong() > maxInstalledBytes) return false
+        val bank = parse(bytes) ?: return false
+        cached = Cached(bank, bytes.size.toLong(), sha256Hex(bytes))
+        source = BankSource.INSTALLED
+        if (backup) installedBytes = bytes.size.toLong()
+        return true
+    }
+
+    /**
+     * Parses the packed format, treating every failure as "not a package".
+     *
+     * An installed package is untrusted input: a truncated file, a stray HTML error
+     * page or a hand-made one all have to end up as a rejection rather than a crash.
      */
     private fun parse(bytes: ByteArray): FingerprintBank? = try {
-        FingerprintBank.fromAssetBytes(bytes)
+        FingerprintBank.fromPackageBytes(bytes)
     } catch (error: Exception) {
         null
     }
 
     companion object {
-        const val MAX_INSTALLED_BYTES = 4L * 1024 * 1024
+        /**
+         * Ceiling for an installed package.
+         *
+         * The full package is ~3.5 MB today (53 models, 16-bit references); the ceiling
+         * leaves room for upstream to roughly double the roster before a legitimate
+         * download would be refused.
+         */
+        const val MAX_INSTALLED_BYTES = 8L * 1024 * 1024
     }
 }
 

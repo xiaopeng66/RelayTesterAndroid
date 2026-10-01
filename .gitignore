@@ -8,6 +8,10 @@
 local.properties
 *.iml
 
+## Python tooling caches
+__pycache__/
+*.pyc
+
 ## Local verification output and recoverable source archives
 /artifacts/
 /backups/
