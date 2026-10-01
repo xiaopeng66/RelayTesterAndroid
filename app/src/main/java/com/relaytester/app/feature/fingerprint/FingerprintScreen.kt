@@ -47,7 +47,10 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -78,7 +81,12 @@ fun FingerprintScreen(
     // be older than what the "模型测试" tab has pulled since; every entry to this panel
     // re-reads it.
     LaunchedEffect(activeDestination) {
-        if (activeDestination == AppDestination.FINGERPRINT) viewModel.refreshCatalogue()
+        if (activeDestination == AppDestination.FINGERPRINT) {
+            viewModel.refreshCatalogue()
+            // A package published since the last visit should be on the card already,
+            // rather than waiting for the user to think of pressing "检查更新".
+            viewModel.refreshBankOnEntry()
+        }
     }
 
     LaunchedEffect(state.message) {
@@ -422,13 +430,62 @@ private fun ReferenceBankCard(
                 ) { Text("删除已安装的检测包") }
             }
 
+            SupportedModelsSection(models = state.bankModels)
+
             Text(
-                "检测本身不联网：点「检查更新」只会取一次更新清单，点「下载/更新检测包」才会下载文件。" +
-                    "没有检测包时（第一次进入面板，或刚把它删掉）会自动查一次清单，其余检查都要手动触发。" +
+                "检测本身不联网：每次进入本面板会取一次更新清单（只有版本信息，不上传任何数据），" +
+                    "点「检查更新」也会取一次；点「下载/更新检测包」才会下载文件。" +
                     "参考数据由 lm-detector (MIT) 提供。",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+        }
+    }
+}
+
+/**
+ * Which models the package in use can identify.
+ *
+ * The roster is 53 entries in the published package, so it stays folded behind a button
+ * and scrolls inside a bounded box: expanded by default it would push the rest of the
+ * panel off screen. Nothing here is shown without a readable package, which is also why
+ * the empty case renders nothing at all rather than an empty list.
+ *
+ * The fold is [rememberSaveable] because this sits in a LazyColumn item: a plain
+ * `remember` is dropped when the card scrolls out of composition, so reading a few rows,
+ * scrolling up and coming back would silently collapse the list again (found on device).
+ */
+@Composable
+private fun SupportedModelsSection(models: List<BankModelInfo>) {
+    if (models.isEmpty()) return
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    Column(modifier = Modifier.fillMaxWidth()) {
+        TextButton(
+            onClick = { expanded = !expanded },
+            modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
+        ) {
+            Text(
+                if (expanded) "收起支持的模型" else "查看支持的模型（${models.size} 个）",
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (expanded) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 260.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                models.forEach { model ->
+                    Text(
+                        "${model.displayName} · ${model.familyName}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
         }
     }
 }
