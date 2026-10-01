@@ -485,11 +485,18 @@ private fun ChallengeCard(
     }
 }
 
-private fun stateLabel(entry: ChallengeProgress): String = when (entry.state) {
+/**
+ * Short status word for a challenge card.
+ *
+ * A rejection must not repeat [ChallengeProgress.error] here: the reason already
+ * renders on its own line directly below, and echoing it in the status line prints
+ * the same sentence twice on every failed card.
+ */
+internal fun stateLabel(entry: ChallengeProgress): String = when (entry.state) {
     ChallengeState.PENDING -> "等待发送"
     ChallengeState.REQUESTING -> "正在接收…"
     ChallengeState.RECEIVED -> "已接收 ${entry.parsedNumbers} 个有效数字"
-    ChallengeState.REJECTED -> entry.error ?: "未采用"
+    ChallengeState.REJECTED -> "未采用"
 }
 
 private fun stateColor(state: ChallengeState): Color = when (state) {

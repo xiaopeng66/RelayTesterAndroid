@@ -2,6 +2,13 @@ package com.relaytester.app
 
 import com.relaytester.app.core.fingerprint.FingerprintBank
 import com.relaytester.app.core.fingerprint.minimumNumbersFor
+import com.relaytester.app.core.model.ApiResult
+import com.relaytester.app.core.model.ErrorKind
+import com.relaytester.app.core.model.RelayProtocol
+import com.relaytester.app.core.model.SupplierProfile
+import com.relaytester.app.core.model.TestError
+import com.relaytester.app.core.model.TestSettings
+import com.relaytester.app.core.network.RelayApi
 import com.relaytester.app.core.security.SecretStore
 import com.relaytester.app.core.storage.SupplierStore
 import com.relaytester.app.core.storage.SupplierStoreState
@@ -10,10 +17,15 @@ import com.relaytester.app.feature.fingerprint.ChallengeState
 import com.relaytester.app.feature.fingerprint.DetectionMode
 import com.relaytester.app.feature.fingerprint.FingerprintViewModel
 import java.io.File
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -65,6 +77,36 @@ class FingerprintViewModelTest {
         bankFactory = { bank() },
         skipRestore = true,
     )
+
+    /**
+     * Drives the API path offline. The relay is always a fake, so nothing here
+     * touches the network; `skipRestore` keeps the initial store read out of the way
+     * and the supplier is injected through the store instead.
+     */
+    private fun apiViewModel(api: RelayApi): FingerprintViewModel = FingerprintViewModel(
+        supplierStore = SingleSupplierStore(testSupplier()),
+        secretStore = object : SecretStore {
+            override fun put(value: String): String = "secret-1"
+            override fun get(secretId: String): String = "api-key"
+            override fun delete(secretId: String) = Unit
+        },
+        relayApiFactory = { api },
+        bankFactory = { bank() },
+        skipRestore = true,
+    )
+
+    /** A round ready to dispatch: supplier chosen, model named, challenges seeded. */
+    private fun readyApiViewModel(
+        api: RelayApi,
+        parallel: Boolean = true,
+    ): FingerprintViewModel = apiViewModel(api).apply {
+        selectSupplier("sup-1")
+        updateModel("test-model")
+        // Seeds the three challenges; without this the progress list is empty
+        // because skipRestore skipped the initial load.
+        selectMode(DetectionMode.API)
+        updateParallel(parallel)
+    }
 
     @Test
     fun `manual paste survives in the same field the card renders`() {
@@ -237,11 +279,176 @@ class FingerprintViewModelTest {
         assertEquals(ChallengeState.PENDING, state.progress[2].state)
         assertEquals(0, state.progress[2].parsedNumbers)
     }
+
+    @Test
+    fun `a failed api request keeps its reason and retry affordance`() {
+        val api = FakeCompletionApi(
+            answers = emptyList(),
+            failure = TestError(ErrorKind.UPSTREAM, "上游返回 HTTP 502"),
+        )
+        val subject = readyApiViewModel(api)
+
+        subject.runApiDetection()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertFalse(state.isRunning)
+        assertEquals("三条题目各发一次请求", 3, api.calls.get())
+        for (entry in state.progress) {
+            // A blank answer and a failure look alike, so the reason must survive the
+            // scoring pass; dropping it also drops the per-question retry button.
+            assertEquals(ChallengeState.REJECTED, entry.state)
+            assertEquals("失败原因必须留在卡片上", "上游返回 HTTP 502", entry.error)
+        }
+        assertNull("三条回答都没能用于检测", state.analysis)
+        assertTrue(state.isMessageError)
+
+        val before = state.progress[0].challenge.id
+        subject.retryChallenge(0)
+        assertNotEquals(
+            "失败后仍必须能重试该题",
+            before,
+            subject.uiState.value.progress[0].challenge.id,
+        )
+    }
+
+    @Test
+    fun `parallel detection issues the three requests concurrently`() {
+        val api = FakeCompletionApi(goldenCase().answers)
+        val subject = readyApiViewModel(api, parallel = true)
+
+        subject.runApiDetection()
+        runBlocking { subject.awaitIdle() }
+
+        assertEquals("并行模式下三条请求必须同时在飞", 3, api.maxConcurrent.get())
+        assertEquals(3, api.calls.get())
+        assertEquals(ChallengeState.RECEIVED, subject.uiState.value.progress[0].state)
+    }
+
+    @Test
+    fun `sequential detection never overlaps requests`() {
+        val api = FakeCompletionApi(goldenCase().answers)
+        val subject = readyApiViewModel(api, parallel = false)
+
+        subject.runApiDetection()
+        runBlocking { subject.awaitIdle() }
+
+        assertEquals("顺序模式下同一时刻只能有一条请求在飞", 1, api.maxConcurrent.get())
+        assertEquals(3, api.calls.get())
+    }
+
+    @Test
+    fun `a successful round ranks the reference top candidate`() {
+        val golden = goldenCase()
+        assertEquals("夹具必须仍是文档记录的那一条样例", "gpt-4o", golden.top1)
+        val api = FakeCompletionApi(golden.answers)
+        val subject = readyApiViewModel(api)
+
+        subject.runApiDetection()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertNotNull("检测必须给出候选", state.analysis)
+        assertEquals(3, state.analysis!!.usableAnswers)
+        assertEquals(golden.top1, state.analysis!!.prediction?.modelId)
+        assertTrue(state.progress.all { it.state == ChallengeState.RECEIVED })
+    }
+
+    @Test
+    fun `detection refuses to run without a model name`() {
+        val api = FakeCompletionApi(goldenCase().answers)
+        val subject = apiViewModel(api).apply {
+            selectSupplier("sup-1")
+            selectMode(DetectionMode.API)
+        }
+
+        subject.runApiDetection()
+
+        val state = subject.uiState.value
+        assertEquals("请填写要检测的模型名", state.message)
+        assertTrue(state.isMessageError)
+        assertEquals("没有模型名就不该发出请求", 0, api.calls.get())
+        assertFalse(state.isRunning)
+    }
 }
 
 private class EmptyStore : SupplierStore(null) {
     override suspend fun read() = SupplierStoreState(emptyList(), null)
     override suspend fun save(state: SupplierStoreState) = Unit
+}
+
+/** A store with one usable supplier so the API path can be driven offline. */
+private class SingleSupplierStore(
+    private val supplier: SupplierProfile,
+) : SupplierStore(null) {
+    override suspend fun read() = SupplierStoreState(listOf(supplier), supplier.id)
+    override suspend fun save(state: SupplierStoreState) = Unit
+}
+
+private fun testSupplier(): SupplierProfile = SupplierProfile(
+    id = "sup-1",
+    name = "测试供应商",
+    baseUrl = "https://relay.test/v1",
+    protocol = RelayProtocol.CHAT_COMPLETIONS,
+    apiKeySecretId = "secret-1",
+    models = listOf("test-model"),
+    testSettings = TestSettings(),
+)
+
+/**
+ * Answers every challenge from [answers] in call order, optionally failing instead.
+ *
+ * The hold inside the request is load bearing: without a suspension point the
+ * unconfined main dispatcher runs each request to completion before the next one
+ * starts, so a parallel round and a sequential round become indistinguishable and
+ * both concurrency assertions pass for free.
+ */
+private class FakeCompletionApi(
+    private val answers: List<String>,
+    private val failure: TestError? = null,
+    private val holdMs: Long = 20,
+) : RelayApi() {
+    val calls = AtomicInteger(0)
+    val maxConcurrent = AtomicInteger(0)
+    private val inFlight = AtomicInteger(0)
+
+    override suspend fun completeText(
+        profile: SupplierProfile,
+        apiKey: String,
+        model: String,
+        prompt: String,
+        maxTokens: Int,
+        timeoutSeconds: Int,
+    ): ApiResult<String> {
+        // The index is taken on entry, so a parallel round still hands each challenge
+        // a distinct answer even though the completion order is not fixed.
+        val index = calls.getAndIncrement()
+        val now = inFlight.incrementAndGet()
+        maxConcurrent.updateAndGet { current -> maxOf(current, now) }
+        try {
+            withContext(Dispatchers.Default) { delay(holdMs) }
+        } finally {
+            inFlight.decrementAndGet()
+        }
+        failure?.let { return ApiResult.Failure(it) }
+        return ApiResult.Success(answers[index % answers.size])
+    }
+}
+
+/** One recorded golden case: the three answers and the model they must rank first. */
+private data class GoldenCase(val answers: List<String>, val top1: String)
+
+private fun goldenCase(): GoldenCase {
+    val text = (FingerprintViewModelTest::class.java.classLoader ?: ClassLoader.getSystemClassLoader())
+        .getResourceAsStream("fingerprint-golden.json")
+        ?.bufferedReader(Charsets.UTF_8)
+        ?.use { it.readText() }
+        ?: error("找不到 fingerprint-golden.json 测试资源")
+    val first = JSONArray(text).getJSONObject(0)
+    val answers = first.getJSONArray("answers").let { array ->
+        List(array.length()) { array.getString(it) }
+    }
+    return GoldenCase(answers, first.getJSONObject("expected").getString("top1"))
 }
 
 private fun assertNotNull(message: String, value: Any?) {
