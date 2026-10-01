@@ -146,13 +146,17 @@ class FingerprintViewModel(
     /** The catalogue refresh, tracked so tests can join it deterministically. */
     private var refreshJob: Job? = null
 
+    /** The startup read, tracked so a test can tell a parked load from a finished one. */
+    private var loadJob: Job? = null
+
     /**
-     * Suspends until an in-flight detection round settles.
+     * Suspends until anything the view model started has settled.
      *
      * Tests drive a round through a dispatcher they control and need a
      * deterministic join; polling the UI state would be racy.
      */
     internal suspend fun awaitIdle() {
+        loadJob?.join()
         refreshJob?.join()
         runJob?.join()
     }
@@ -170,7 +174,7 @@ class FingerprintViewModel(
         if (skipRestore) {
             _uiState.update { it.copy(isLoading = false) }
         } else {
-            viewModelScope.launch { load() }
+            loadJob = viewModelScope.launch { load() }
         }
     }
 
@@ -202,6 +206,9 @@ class FingerprintViewModel(
                     selectedSupplierId = supplierId,
                     models = supplier?.models.orEmpty(),
                     selectedModels = pendingPrefill?.second?.let { listOf(it) } ?: it.selectedModels,
+                    // A prefill came with a model the user must be able to see and
+                    // re-tick; a filter left over from earlier typing can hide it.
+                    modelFilter = if (pendingPrefill != null) "" else it.modelFilter,
                 )
             }
             pendingPrefill = null
@@ -226,6 +233,9 @@ class FingerprintViewModel(
                 it.copy(
                     mode = DetectionMode.API,
                     selectedModels = listOf(model),
+                    // The prefilled model is on screen from this moment, so any filter
+                    // that would hide it has to go with the old selection.
+                    modelFilter = "",
                     analysis = null,
                     batchResults = emptyList(),
                 )
@@ -278,34 +288,60 @@ class FingerprintViewModel(
     }
 
     /**
-     * Re-reads the suppliers and the current one's model catalogue from the store.
+     * Re-reads the reference bank, the suppliers and the current one's model catalogue.
      *
      * This view model is built with the activity, so the catalogue it read at startup
      * is often older than the one the "模型测试" tab has since pulled; without this the
-     * picker would show an empty list until the app was restarted.
+     * picker would show an empty list until the app was restarted. It is also the only
+     * way back from a startup read that failed: nothing else ever clears [loadError].
      */
     fun refreshCatalogue() {
-        if (_uiState.value.isRunning) return
+        // A read already in flight observes the same store and its result is the newer
+        // one; letting this one write too would risk the older snapshot landing last.
+        val current = _uiState.value
+        if (current.isRunning || current.isLoading) return
         refreshJob = viewModelScope.launch {
-            val storeState = withContext(ioDispatcher) {
-                runCatching { supplierStore.read() }.getOrNull()
-            } ?: return@launch
-            knownSuppliers = storeState.suppliers
-            _uiState.update { state ->
-                val supplierId = candidateSupplierId(state.selectedSupplierId, storeState)
-                val changed = supplierId != state.selectedSupplierId
-                state.copy(
-                    suppliers = storeState.suppliers.map { item -> SupplierOption(item.id, item.name) },
-                    selectedSupplierId = supplierId,
-                    models = storeState.suppliers.firstOrNull { it.id == supplierId }?.models.orEmpty(),
-                    // A refresh must never silently drop the user's ticks: the picker
-                    // also offers a hand-typed model that no catalogue carries. Only a
-                    // supplier change invalidates them.
-                    selectedModels = if (changed) emptyList() else state.selectedModels,
-                    modelFilter = if (changed) "" else state.modelFilter,
-                    analysis = if (changed) null else state.analysis,
-                    batchResults = if (changed) emptyList() else state.batchResults,
-                )
+            val read = withContext(ioDispatcher) {
+                runCatching {
+                    val bank = bank
+                    bank to supplierStore.read()
+                }
+            }
+            read.onSuccess { (bank, storeState) ->
+                knownSuppliers = storeState.suppliers
+                _uiState.update { state ->
+                    val supplierId = candidateSupplierId(state.selectedSupplierId, storeState)
+                    val changed = supplierId != state.selectedSupplierId
+                    state.copy(
+                        // A retry that succeeds has to lift the error screen, or a
+                        // transient startup failure would strand the panel for good.
+                        isLoading = false,
+                        loadError = null,
+                        referenceBuiltAt = bank.referenceBuiltAt,
+                        modelCount = bank.modelCount,
+                        minimumValidNumbers = bank.minimumValidNumbers,
+                        suppliers = storeState.suppliers.map { item -> SupplierOption(item.id, item.name) },
+                        selectedSupplierId = supplierId,
+                        models = storeState.suppliers.firstOrNull { it.id == supplierId }?.models.orEmpty(),
+                        // A refresh must never silently drop the user's ticks: the picker
+                        // also offers a hand-typed model that no catalogue carries. Only a
+                        // supplier change invalidates them.
+                        selectedModels = if (changed) emptyList() else state.selectedModels,
+                        modelFilter = if (changed) "" else state.modelFilter,
+                        analysis = if (changed) null else state.analysis,
+                        batchResults = if (changed) emptyList() else state.batchResults,
+                    )
+                }
+            }.onFailure { error ->
+                // A failed refresh must not blank a panel that is working fine, but it
+                // should refresh the reason on one that is already showing the error.
+                _uiState.update { state ->
+                    if (state.loadError == null) {
+                        state
+                    } else {
+                        state.copy(loadError = error.message ?: "参考库加载失败")
+                    }
+                }
             }
         }
     }
@@ -426,60 +462,78 @@ class FingerprintViewModel(
         }
 
         runJob = viewModelScope.launch {
-            val prepared = withContext(ioDispatcher) {
-                val supplier = suppliers().firstOrNull { it.id == supplierId }
-                if (supplier == null) {
-                    null
-                } else {
-                    val apiKey = supplier.apiKeySecretId
-                        ?.let { secretId -> secretStore.get(secretId) }
-                        .orEmpty()
-                    supplier to apiKey
-                }
+            try {
+                runRounds(supplierId, models, challenges)
+            } catch (error: CancellationException) {
+                // The user cancelled: the cancelled state is the whole outcome, and
+                // swallowing this would break structured cancellation.
+                _uiState.update { it.copy(isRunning = false, activeModel = null) }
+                throw error
+            } catch (error: Throwable) {
+                // Last-resort net, the same shape as the batch runner in TesterViewModel:
+                // an unexpected failure must release the panel and say what happened
+                // rather than escape the view model scope and take the app down.
+                val reason = error.message ?: "检测中断"
+                _uiState.update { it.copy(isRunning = false, activeModel = null, analysis = null) }
+                abandonUnfinishedRows(reason)
+                showMessage(reason, isError = true)
             }
-            if (prepared == null) {
-                showMessage("供应商配置已不存在", isError = true)
-                return@launch
-            }
-            val (supplier, apiKey) = prepared
-            if (apiKey.isBlank()) {
-                showMessage("该供应商没有可用的 API Key", isError = true)
-                return@launch
-            }
+        }
+    }
 
+    private suspend fun runRounds(
+        supplierId: String,
+        models: List<String>,
+        challenges: List<FingerprintChallenge>,
+    ) {
+        val prepared = withContext(ioDispatcher) {
+            val supplier = suppliers().firstOrNull { it.id == supplierId }
+            if (supplier == null) {
+                null
+            } else {
+                val apiKey = supplier.apiKeySecretId
+                    ?.let { secretId -> secretStore.get(secretId) }
+                    .orEmpty()
+                supplier to apiKey
+            }
+        }
+        if (prepared == null) {
+            showMessage("供应商配置已不存在", isError = true)
+            return
+        }
+        val (supplier, apiKey) = prepared
+        if (apiKey.isBlank()) {
+            showMessage("该供应商没有可用的 API Key", isError = true)
+            return
+        }
+
+        _uiState.update {
+            it.copy(
+                isRunning = true,
+                // Models are always tested one after another: the rounds share the
+                // provider's rate limit, and a serial order is what makes the result
+                // list readable top to bottom.
+                batchResults = models.map { model -> ModelFingerprintResult(model) },
+                activeModel = models.first(),
+                analysis = null,
+                progress = freshProgress(it.progress.map { entry -> entry.challenge }),
+            )
+        }
+
+        for (model in models) {
             _uiState.update {
                 it.copy(
-                    isRunning = true,
-                    // Models are always tested one after another: the rounds share the
-                    // provider's rate limit, and a serial order is what makes the result
-                    // list readable top to bottom.
-                    batchResults = models.map { model -> ModelFingerprintResult(model) },
-                    activeModel = models.first(),
-                    analysis = null,
+                    activeModel = model,
                     progress = freshProgress(it.progress.map { entry -> entry.challenge }),
                 )
             }
+            updateResult(model) { it.copy(status = ModelDetectionStatus.RUNNING) }
 
-            for (model in models) {
-                _uiState.update {
-                    it.copy(
-                        activeModel = model,
-                        progress = freshProgress(it.progress.map { entry -> entry.challenge }),
-                    )
-                }
-                updateResult(model) { it.copy(status = ModelDetectionStatus.RUNNING) }
-
-                val results = try {
-                    requestRound(challenges, supplier, apiKey, model)
-                } catch (error: CancellationException) {
-                    _uiState.update { it.copy(isRunning = false, activeModel = null) }
-                    throw error
-                }
-                recordRound(model, results, challenges)
-            }
-
-            _uiState.update { it.copy(isRunning = false, activeModel = null) }
+            val results = requestRound(challenges, supplier, apiKey, model)
+            recordRound(model, results, challenges)
         }
+
+        _uiState.update { it.copy(isRunning = false, activeModel = null) }
     }
 
     /** Sends every challenge for one model, in parallel or one at a time. */
@@ -563,14 +617,30 @@ class FingerprintViewModel(
         challenge: FingerprintChallenge,
     ): ChallengeProgress {
         updateProgress(index) { it.copy(state = ChallengeState.REQUESTING, answer = "", error = null) }
-        val result = relayApi.completeText(
-            profile = supplier,
-            apiKey = apiKey,
-            model = model,
-            prompt = challenge.prompt,
-            maxTokens = CHALLENGE_MAX_TOKENS,
-            timeoutSeconds = CHALLENGE_TIMEOUT_SECONDS,
-        )
+        val result = try {
+            relayApi.completeText(
+                profile = supplier,
+                apiKey = apiKey,
+                model = model,
+                prompt = challenge.prompt,
+                maxTokens = CHALLENGE_MAX_TOKENS,
+                timeoutSeconds = CHALLENGE_TIMEOUT_SECONDS,
+            )
+        } catch (error: CancellationException) {
+            // A cancelled round is not a failed answer.
+            throw error
+        } catch (error: Throwable) {
+            // One challenge's unexpected failure stays that challenge's failure. Letting
+            // it escape would cancel its parallel siblings and take the rest of the
+            // batch with it, so the user would lose three models to one bad request.
+            val rejected = ChallengeProgress(
+                challenge = challenge,
+                state = ChallengeState.REJECTED,
+                error = error.message ?: "请求异常",
+            )
+            updateProgress(index) { rejected }
+            return rejected
+        }
         val progress = when (result) {
             is ApiResult.Success -> {
                 val numbers = com.relaytester.app.core.fingerprint.NumberFeatures
@@ -705,13 +775,25 @@ class FingerprintViewModel(
                         entry
                     }
                 },
-                // Rows that never got a verdict say so, instead of sitting on
-                // "running" forever or silently disappearing from the list.
-                batchResults = it.batchResults.map { row ->
+            )
+        }
+        abandonUnfinishedRows("已取消")
+    }
+
+    /**
+     * Closes every row that never got a verdict.
+     *
+     * Rows that are still queued or in flight must say so, instead of sitting on
+     * "running" forever or silently disappearing from the list.
+     */
+    private fun abandonUnfinishedRows(reason: String) {
+        _uiState.update { state ->
+            state.copy(
+                batchResults = state.batchResults.map { row ->
                     if (row.status == ModelDetectionStatus.PENDING ||
                         row.status == ModelDetectionStatus.RUNNING
                     ) {
-                        row.copy(status = ModelDetectionStatus.FAILED, error = "已取消")
+                        row.copy(status = ModelDetectionStatus.FAILED, error = reason)
                     } else {
                         row
                     }

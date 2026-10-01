@@ -1,6 +1,9 @@
 package com.relaytester.app
 
+import com.relaytester.app.feature.fingerprint.ModelDetectionStatus
+import com.relaytester.app.feature.fingerprint.ModelFingerprintResult
 import com.relaytester.app.feature.fingerprint.filterModels
+import com.relaytester.app.feature.fingerprint.settledModelCount
 import com.relaytester.app.feature.fingerprint.toggleModel
 import com.relaytester.app.feature.fingerprint.unmatchedKeyword
 import org.junit.Assert.assertEquals
@@ -101,5 +104,20 @@ class ModelSelectionTest {
         // supplier can be given a model to detect.
         assertEquals("gpt-4o", unmatchedKeyword(emptyList(), "gpt-4o"))
         assertEquals(emptyList<String>(), filterModels(emptyList(), "gpt-4o"))
+    }
+
+    @Test
+    fun `a failed row counts as a settled result`() {
+        // The counter sits above rows that print their own outcome; counting only the
+        // successes would show "1/4" over four rows the user can already read.
+        val rows = listOf(
+            ModelFingerprintResult("a", ModelDetectionStatus.DONE),
+            ModelFingerprintResult("b", ModelDetectionStatus.FAILED, error = "上游返回 HTTP 502"),
+            ModelFingerprintResult("c", ModelDetectionStatus.RUNNING),
+            ModelFingerprintResult("d", ModelDetectionStatus.PENDING),
+        )
+
+        assertEquals(2, settledModelCount(rows))
+        assertEquals(0, settledModelCount(emptyList()))
     }
 }

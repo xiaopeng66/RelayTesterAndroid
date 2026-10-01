@@ -44,3 +44,15 @@ internal fun unmatchedKeyword(models: List<String>, keyword: String): String? {
     if (filterModels(models, needle).isNotEmpty()) return null
     return needle
 }
+
+/**
+ * How many rows have reached a verdict.
+ *
+ * A failure is a result too: the row prints its reason right below this counter, so
+ * counting only successes would show "已出结果 1/3" while three settled rows sit on
+ * screen. Queued and in-flight rows are the ones still missing an outcome.
+ */
+internal fun settledModelCount(results: List<ModelFingerprintResult>): Int =
+    results.count {
+        it.status == ModelDetectionStatus.DONE || it.status == ModelDetectionStatus.FAILED
+    }

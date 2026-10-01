@@ -10,7 +10,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -423,7 +422,8 @@ private fun ModelPicker(
 
         if (state.models.isEmpty() && unmatched == null) {
             Text(
-                "该供应商还没有已拉取的模型。到“模型测试”里拉取后即可勾选，或直接输入模型名再勾选“使用…”。",
+                "该供应商还没有已拉取的模型。到“模型测试”里拉取后即可勾选；也可以直接把模型名" +
+                    "输入上面的筛选框，列表里会出现一行供你勾选。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -499,7 +499,9 @@ private fun ModelRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .height(MODEL_ROW_HEIGHT)
+            // A minimum, not a fixed height: the fallback row carries a second line of
+            // hint text, which a fixed 48.dp clips once the user's font scale grows.
+            .heightIn(min = MODEL_ROW_HEIGHT)
             .clickable(enabled = enabled) { onToggle() },
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp),
@@ -547,11 +549,11 @@ private fun ModelRow(
 /** The batch output: one row per tested model, in the order they were run. */
 @Composable
 private fun BatchResultList(results: List<ModelFingerprintResult>) {
-    val done = results.count { it.status == ModelDetectionStatus.DONE }
+    val settled = settledModelCount(results)
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text("检测结果", style = MaterialTheme.typography.titleMedium)
         Text(
-            "已出结果 $done/${results.size} 个模型",
+            "已出结果 $settled/${results.size} 个模型",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
