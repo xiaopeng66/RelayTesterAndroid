@@ -979,6 +979,72 @@ class FingerprintViewModelTest {
     }
 
     @Test
+    fun `an entry check asked for during the startup read is replayed once it lands`() {
+        // The screen asks on every panel entry, but never twice; if it is dropped while
+        // the panel is still loading, the first visit silently loses it — and on a fresh
+        // install that check is what puts the download button on the empty card.
+        val store = MutableSupplierStore(listOf(testSupplier(models = listOf("m-one"))))
+        val gate = CompletableDeferred<Unit>()
+        store.gate = gate
+        val fetcher = FakeBankFetcher().apply { publish(fixtureBankBytes()) }
+        val subject = apiViewModel(
+            api = FakeCompletionApi(goldenCase().answers),
+            store = store,
+            skipRestore = false,
+            ioDispatcher = mainDispatcher,
+            bankFiles = MemoryBankFileSystem(installed = null),
+            bankFetcher = fetcher,
+        )
+        assertTrue("启动读取还挂在门上，面板应在加载态", subject.uiState.value.isLoading)
+
+        // The panel becomes visible and asks for its entry check while the read is running.
+        subject.refreshBankOnEntry()
+        assertEquals("在飞的启动读取还没落地，检查只能先记住", emptyList<String>(), fetcher.urls)
+
+        gate.complete(Unit)
+        runBlocking { subject.awaitIdle() }
+
+        assertEquals("读取落地后必须补上这次检查，且只补一次", listOf(FakeBankFetcher.MANIFEST_URL), fetcher.urls)
+        assertNotNull("未安装时必须把下载入口摆出来", subject.uiState.value.availableBankUpdate)
+    }
+
+    @Test
+    fun `a second run is refused while the first is still dispatching`() {
+        // The guard cannot read `isRunning` alone: it is published only after the
+        // credentials are in, so a double tap lands inside that window and starts two rounds.
+        val api = FakeCompletionApi(goldenCase().answers)
+        val subject = readyApiViewModel(api)
+
+        subject.runApiDetection()
+        subject.runApiDetection()
+        runBlocking { subject.awaitIdle() }
+
+        assertEquals("双击只允许一轮（三条题目各一次）", 3, api.calls.get())
+    }
+
+    @Test
+    fun `a run is refused while a detection-package job is in flight`() {
+        val api = FakeCompletionApi(goldenCase().answers)
+        val gate = CompletableDeferred<Unit>()
+        val fetcher = FakeBankFetcher().apply {
+            publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp)
+            this.gate = gate
+        }
+        val subject = readyApiViewModel(api, bankFetcher = fetcher)
+        runBlocking { subject.awaitIdle() }
+        // A check holds `bankUpdateJob`; a round started now would race the package swap
+        // the check may schedule, so it must be refused with a message rather than run.
+        subject.checkBankUpdate()
+
+        subject.runApiDetection()
+
+        assertEquals("检测包作业在飞时不得开跑", 0, api.calls.get())
+        assertNotNull("必须告诉用户为什么没跑", subject.uiState.value.message)
+        gate.complete(Unit)
+        runBlocking { subject.awaitIdle() }
+    }
+
+    @Test
     fun `a round on a device with no package reports the missing package`() {
         val api = FakeCompletionApi(goldenCase().answers)
         val bare = apiViewModel(

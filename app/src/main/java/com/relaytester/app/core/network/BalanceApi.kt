@@ -10,12 +10,7 @@ import com.relaytester.app.core.model.SupplierProfile
 import java.io.IOException
 import java.io.InterruptedIOException
 import java.util.concurrent.TimeUnit
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.suspendCancellableCoroutine
-import okhttp3.Call
-import okhttp3.Callback
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
@@ -117,6 +112,8 @@ class BalanceApi(
             }
         } catch (error: CancellationException) {
             throw error
+        } catch (error: RedirectRefusedException) {
+            BalanceQueryResult.Failure(error.message ?: "站点要求跳转到其他域名，出于密钥安全已拒绝")
         } catch (error: TemplateException) {
             BalanceQueryResult.Failure(error.message ?: "模板配置无效")
         } catch (error: InterruptedIOException) {
@@ -134,17 +131,18 @@ class BalanceApi(
         if (template.name.trim().isEmpty()) return "请填写模板名称"
         if (template.queryMode == BalanceQueryMode.SCRIPT) {
             val script = template.scriptCode.orEmpty()
-            val scriptError = scriptRuntime.validate(script)
+            // Static only. This runs while a supplier backup is imported — the script
+            // comes from a file the user did not write — so compiling it here would
+            // execute untrusted code with nothing but a token filter in the way. The
+            // placeholders are checked against the raw text instead, which catches the
+            // same typos without running anything; the script's structure is verified
+            // when a balance is actually queried.
+            val scriptError = scriptRuntime.validateSyntax(script)
             if (scriptError != null) return scriptError
-            val request = runCatching { scriptRuntime.compileRequest(script) }
-                .getOrElse { return "查询脚本无效，请检查 request 与 extractor" }
-            if (containsUnsupportedPlaceholder(request.urlTemplate) ||
-                request.headers.values.any(::containsUnsupportedPlaceholder) ||
-                request.bodyTemplate?.let(::containsUnsupportedPlaceholder) == true
-            ) {
+            if (containsUnsupportedPlaceholder(script)) {
                 return "模板只支持 {{baseUrl}}、{{apiKey}}、{{accessToken}}、{{userId}} 和 {{nowEpochMs}} 占位符"
             }
-            return validateHeaders(request.headers.map { BalanceTemplateHeader(it.key, it.value) })
+            return null
         }
         if (template.endpointTemplate.trim().isEmpty()) return "请填写请求地址"
         if (template.availablePath.trim().isEmpty()) return "请填写可用余额的 JSON 路径"
@@ -235,6 +233,8 @@ class BalanceApi(
             }
         } catch (error: CancellationException) {
             throw error
+        } catch (error: RedirectRefusedException) {
+            BalanceQueryResult.Failure(error.message ?: "站点要求跳转到其他域名，出于密钥安全已拒绝")
         } catch (error: BalanceScriptException) {
             BalanceQueryResult.Failure(error.message ?: "查询脚本无效")
         } catch (error: TemplateException) {
@@ -388,9 +388,14 @@ class BalanceApi(
     }.any { it.contains(placeholder) }
 
     private suspend fun execute(request: Request, timeoutSeconds: Int): Response {
-        val call = client.newCall(request)
-        call.timeout().timeout(timeoutSeconds.coerceIn(3, 120).toLong(), TimeUnit.SECONDS)
-        return call.await()
+        // Scale connect/read/write along with the call timeout, exactly as RelayApi does:
+        // setting only the call timeout leaves the 10s default read window in force, so a
+        // user who raised the timeout for a slow station still failed at 10 seconds.
+        // Redirects are followed by hand, not by OkHttp, so the API key/PAT cannot be
+        // re-sent to another host a 3xx points at.
+        val totalSeconds = timeoutSeconds.coerceIn(3, 120).toLong()
+        return client.forSameOriginRequests(totalSeconds, totalSeconds, totalSeconds, totalSeconds)
+            .executeSameOrigin(request)
     }
 
     private fun parseJson(body: String): Any? = runCatching {
@@ -466,19 +471,6 @@ class BalanceApi(
         }
         if (source.read(Buffer(), 1) != -1L) throw TemplateException("站点响应过大，已拒绝解析")
         return buffer.readUtf8()
-    }
-
-    private suspend fun Call.await(): Response = suspendCancellableCoroutine { continuation ->
-        continuation.invokeOnCancellation { cancel() }
-        enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                if (continuation.isActive) continuation.resumeWithException(e)
-            }
-
-            override fun onResponse(call: Call, response: Response) {
-                if (continuation.isActive) continuation.resume(response) else response.close()
-            }
-        })
     }
 
     private class TemplateException(message: String) : IllegalArgumentException(message)

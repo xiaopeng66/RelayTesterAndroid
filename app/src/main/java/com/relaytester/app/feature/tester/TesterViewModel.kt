@@ -558,6 +558,18 @@ class TesterViewModel(
     private var fetchAllModelsJob: Job? = null
     /** Closes the tiny pre-publication window for rapid double-clicks. */
     private val fetchAllModelsStartMutex = Mutex()
+    /**
+     * The same guard for the two heavy starts that publish their busy flag only after
+     * they have suspended at least once.
+     *
+     * `startTest` reads the draft and may fetch a model list before `isRunning` becomes
+     * true, and `queryAllBalances` persists the draft before `isQuerying` becomes true.
+     * A second tap inside either window starts a rival run: the two share one `testJob`
+     * handle (so cancelling only reaches the newer one) and the older one's completion
+     * writes `isRunning = false` over the newer one's state.
+     */
+    private val testRunStartMutex = Mutex()
+    private val balanceQueryStartMutex = Mutex()
     /** Serializes profile replacement and persistence when card refreshes finish together. */
     private val profileMutationMutex = Mutex()
     private val supplierActivationMutex = Mutex()
@@ -946,16 +958,20 @@ class TesterViewModel(
                         }
                     }.awaitAll().toMap()
                 }
-                // A null directory means the supplier could not be reached, so its
-                // sources are left unjudged rather than falsely reported missing.
+                // Only a non-empty directory is evidence about a model's presence. A
+                // supplier that answers correctly with an empty list — or one that could
+                // not be reached, or whose key is missing (both `null`) — says nothing
+                // about whether a source was delisted, so its sources stay unjudged.
+                // Judging them would report every model of that site as gone.
+                val judged = directories.filterValues { !it.isNullOrEmpty() }
                 val missing = entry.sources
                     .filter { source ->
-                        val directory = directories[source.supplierId] ?: return@filter false
+                        val directory = judged[source.supplierId] ?: return@filter false
                         source.modelId !in directory
                     }
                     .mapTo(mutableSetOf()) { it.missingKey() }
                 val unreachable = entry.sources
-                    .filter { it.supplierId !in directories.keys }
+                    .filter { judged[it.supplierId] == null }
                     .map { it.supplierId }
                     .distinct()
                 _uiState.update { state ->
@@ -1746,7 +1762,9 @@ class TesterViewModel(
 
     fun queryBalance() {
         if (balanceOperationBlocked()) return
-        viewModelScope.launch { queryBalanceInternal() }
+        if (!balanceQueryStartMutex.tryLock()) return
+        val job = viewModelScope.launch { queryBalanceInternal() }
+        releaseWhenSettled(balanceQueryStartMutex, job)
     }
 
     /** Queries exactly the requested supplier without switching the active draft. */
@@ -1760,7 +1778,8 @@ class TesterViewModel(
             (state.isQuerying && state.batchProgressTotal > 1)
         ) return
         if (profiles.none { it.id == id }) return
-        viewModelScope.launch {
+        if (!balanceQueryStartMutex.tryLock()) return
+        val job = viewModelScope.launch {
             val profile = if (id == activeSupplierId) {
                 if (persistDraft() == null || persistBalanceCredentials() == null) return@launch
                 profiles.firstOrNull { it.id == id }
@@ -1769,11 +1788,14 @@ class TesterViewModel(
             } ?: return@launch
             queryBalanceForSupplierInternal(profile)
         }
+        releaseWhenSettled(balanceQueryStartMutex, job)
     }
 
     fun queryAllBalances() {
         if (balanceOperationBlocked()) return
-        viewModelScope.launch { queryAllBalancesInternal() }
+        if (!balanceQueryStartMutex.tryLock()) return
+        val job = viewModelScope.launch { queryAllBalancesInternal() }
+        releaseWhenSettled(balanceQueryStartMutex, job)
     }
 
     fun saveCurrentSupplier(onSaved: () -> Unit = {}) {
@@ -2261,7 +2283,8 @@ class TesterViewModel(
 
     fun startTest() {
         if (runningOrInitializing()) return
-        viewModelScope.launch {
+        if (!testRunStartMutex.tryLock()) return
+        val job = viewModelScope.launch {
             var request = prepareRequest() ?: return@launch
             if (request.profile.models.isEmpty()) {
                 val supplierId = request.profile.id
@@ -2325,11 +2348,13 @@ class TesterViewModel(
             }
             startRun(request, targets, replaceAll = true)
         }
+        releaseWhenSettled(testRunStartMutex, job)
     }
 
     fun retryFailed() {
         if (runningOrInitializing()) return
-        viewModelScope.launch {
+        if (!testRunStartMutex.tryLock()) return
+        val job = viewModelScope.launch {
             val request = prepareRequest() ?: return@launch
             val targets = _uiState.value.results
                 .filter { it.status == TestStatus.FAILED && it.model in _uiState.value.selectedModels }
@@ -2340,11 +2365,13 @@ class TesterViewModel(
             }
             startRun(request, targets, replaceAll = false)
         }
+        releaseWhenSettled(testRunStartMutex, job)
     }
 
     fun retestAll() {
         if (runningOrInitializing()) return
-        viewModelScope.launch {
+        if (!testRunStartMutex.tryLock()) return
+        val job = viewModelScope.launch {
             val request = prepareRequest() ?: return@launch
             val targets = _uiState.value.results
                 .map { it.model }
@@ -2355,6 +2382,7 @@ class TesterViewModel(
             }
             startRun(request, targets, replaceAll = true)
         }
+        releaseWhenSettled(testRunStartMutex, job)
     }
 
     fun cancelRun() {
@@ -2362,15 +2390,41 @@ class TesterViewModel(
         testJob = null
         fetchAllModelsJob?.cancel()
         fetchAllModelsJob = null
+        // Rows that never got a verdict would otherwise keep rendering "进行中" (a
+        // PENDING result) on a stopped run, with no summary to explain it: the row
+        // has to say the run was cancelled instead.
+        val settled = _uiState.value.results.map { result ->
+            if (result.status == TestStatus.PENDING) {
+                result.copy(
+                    status = TestStatus.FAILED,
+                    error = TestError(ErrorKind.OTHER, "已取消"),
+                )
+            } else {
+                result
+            }
+        }
         _uiState.update {
             it.copy(
                 isRunning = false,
                 isFetchingModels = false,
                 fetchingSupplierIds = emptySet(),
+                results = settled,
                 message = "测试已取消",
                 isMessageError = false,
             )
         }
+    }
+
+    /**
+     * Releases [mutex] once [job] settles.
+     *
+     * A `job.invokeOnCompletion` release (rather than a `finally` inside the coroutine)
+     * keeps the start guards readable: the lock is dropped whichever way the body exits,
+     * including an early return or an exception. It is the same shape the batch
+     * model-fetch start already uses.
+     */
+    private fun releaseWhenSettled(mutex: Mutex, job: Job) {
+        job.invokeOnCompletion { if (mutex.isLocked) mutex.unlock() }
     }
 
     fun updateFilter(filter: ResultFilter) {
@@ -2701,6 +2755,10 @@ class TesterViewModel(
 
         try {
             val succeeded = coroutineScope {
+                // One request per supplier, but only a bounded number at once: with a
+                // long supplier list the unbounded fan-out opened a socket per site and
+                // queued them all on the same small IO pool.
+                val semaphore = Semaphore(MAX_UNIFIED_TEST_CONCURRENCY)
                 targets.map { profile ->
                     async {
                         _balanceUiState.update {
@@ -2728,8 +2786,8 @@ class TesterViewModel(
                             return@async false
                         }
                         val request = (preparation as BalanceRequestPreparation.Ready).request
-                        when (
-                            val result = withContext(Dispatchers.IO) {
+                        val result = semaphore.withPermit {
+                            withContext(Dispatchers.IO) {
                                 balanceApi.query(
                                     profile = request.profile,
                                     apiKey = request.apiKey,
@@ -2738,7 +2796,8 @@ class TesterViewModel(
                                     template = request.template,
                                 )
                             }
-                        ) {
+                        }
+                        when (result) {
                             is BalanceQueryResult.Success -> {
                                 _balanceUiState.update {
                                     it.copy(
@@ -3467,6 +3526,10 @@ class TesterViewModel(
         targets: List<String>,
         replaceAll: Boolean,
     ) {
+        // Belt and braces behind the caller's start mutex: no path may end up with a
+        // second batch sharing the single `testJob` handle, because cancelling it would
+        // then only reach the newer run while the older one keeps spending requests.
+        if (testJob?.isActive == true) return
         val pending = targets.associateWith(ModelTestResult::pending)
         val initialResults = _uiState.value.let { state ->
             val results = if (replaceAll) {
@@ -3517,7 +3580,23 @@ class TesterViewModel(
         }
         // OkHttp and its supporting classes are intentionally initialized after
         // the user starts a run, never while the Activity is creating its first frame.
-        val runner = withContext(Dispatchers.Default) { batchTestRunner }
+        // The acquisition is the one step that can still fail (a class-initialisation
+        // error); it must not leave `isRunning` stuck on a run that never started.
+        val runner = try {
+            withContext(Dispatchers.Default) { batchTestRunner }
+        } catch (error: CancellationException) {
+            _uiState.update { it.copy(isRunning = false) }
+            throw error
+        } catch (error: Throwable) {
+            _uiState.update {
+                it.copy(
+                    isRunning = false,
+                    message = error.message ?: "测试启动失败",
+                    isMessageError = true,
+                )
+            }
+            return
+        }
         testJob = viewModelScope.launch {
             try {
                 val summary = runner.run(
