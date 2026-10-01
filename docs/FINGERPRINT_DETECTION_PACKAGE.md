@@ -1,0 +1,206 @@
+# 指纹检测：算法对齐上游，检测包改为可下载的数据包
+
+状态：已实施（单测 167/167 绿、隔离变异 4/4 红证、v2 检测包已发布、设备 E2E 走通包生命周期 6 条路径与一次真实打分、上游跟随已交给 GitHub Actions 定时任务）
+日期：2026-10-01
+相关：`docs/FINGERPRINT_ACCURACY_OPTIMIZATION_SPEC.md`（准确率评估，本轮裁定覆盖了它的"明确不做"）
+
+---
+
+## 1. 这次改了什么，为什么
+
+三件事，分别对应用户的三条要求：
+
+| 要求 | 做法 | 结果 |
+|---|---|---|
+| 检测原理跟上游保持一致 | 完整移植上游 `shared-detector-v1`：kNN 参考距离与 verifier 全部实现，权重、tau 校准、三条回答的聚合方式逐条照抄 | 黄金向量最差偏差 2.5e-5（排名）/ 3.9e-5（核验） |
+| 软件本体小一点 | 399,470 字节的参考库不再打进 APK，改为首次使用时下载 | APK 2,904,555 字节，比已发布的 1.4.0（3,201,744）**小 297,189 字节（−9.3%）** |
+| 检测包做成可下载的数据包，方便更新 | 格式升到 `LMFPA002`/清单 `formatVersion: 2`，发布在 `bank` 预发布；新增一条命令完成"拉上游 → 构建 → 比对 → 发布" | 一个 3.3 MB 的包，更新不动 APK |
+
+**先前实现的差异**：旧版本只做了 `0.5·z(LDA) + 0.5·z(质心)`，去掉了 kNN 与 verifier，并把参考库打进安装包。现在两者都补齐了。
+
+**不要把它读成"更准了"**：见 §7 的诚实边界——完整公式与旧简化公式的差异落在噪声带内，这次改动的价值是"与上游可逐位对照 + 更新不必发版 + APK 变小"。
+
+---
+
+## 2. 检测包（格式 v2）
+
+- 构建器：`tools/build_fingerprint_asset.py`（读上游 `data/shared_detector.json` + `data/unified_bank.json`）。
+- 魔数 `LMFPA002`，清单 `formatVersion: 2`（旧版 `LMFPA001`/格式 1 的清单会被新 App 明确拒绝）。
+- 内容：LDA 头、质心特征库（Hellinger 355 维 + 序数块 74 维、干扰子空间、13 个环境的质心）、每模型 kNN 参考矩阵、verifier（预处理、投影基、逐候选高斯、`new_joint`、自己的参考矩阵、6→1 逻辑头）、温度 `tau`。
+- 编码：稠密标量 int32 定点（1e-6）；两个参考张量（kNN 1948×429、verifier 1272×429）按行 16 位量化 + 每行一个 float32 尺度。
+- 当前发布：53 个模型，**3,476,998 字节**，`sha256 4bdd1d3bb449…`，构建于 `2026-09-30T03:01:12.803902+00:00`，上游 `data/shared_detector.json` 修订 `74540e8f147c`。
+- 8 位是可选档（`--ref-bits 8`，约 2.1 MB）：实测会重排约 0.05% 的近邻候选对（38/75,790），在面板的 top-8 列表里看得见，所以默认 16 位。
+
+### 端侧解析与校验
+
+`core/fingerprint/FingerprintBank.kt` 按上述顺序解析，并做一致性校验（两个头块 355/74 维、每模型数组长度、429 维 LDA 与 verifier 基、`basis` 行宽等于 `mu` 长度、`active/mean/scale/weights` 等长、`active` 索引 < 6、模型 id 互不相同）。任何不一致、截断或多一个字节都会被拒绝（`FingerprintBankStore.parse` 把一切异常当成"不是检测包"）。
+
+---
+
+## 3. 生命周期：从"内置"到"下载一次，之后离线"
+
+三种状态（`BankSource`）：
+
+| 状态 | 何时 | 面板表现 |
+|---|---|---|
+| `NOT_PROVISIONED` | 全新安装、或用户删掉了检测包 | 未安装提示 + 「下载检测包」按钮；**进入面板时自动查一次清单**（面板唯一一次自发联网） |
+| `INSTALLED` | 已下载并安装 | 显示构建时间、模型数、来源；「检查更新」手动触发 |
+| `INSTALLED_UNREADABLE` | 已安装但读不出来 / 解析不了 | 明确文案（"无法读取"/"无法解析"，请重新下载）+ 「删除已安装的检测包」 |
+
+- 安装：先完整解析校验，再落盘；写入走"暂存 → 轮转 `.bak` → 原子 move"。解析不了的文件永远不会成为当前包，旧包继续用。
+- 回滚：解析主文件失败时自动尝试 `.bak`，成功则面板照常用并提示"已回退到上一份"。
+- 上限：8 MB（16 位全量 3.3 MB，留一倍余量给上游扩表）。
+- 检测本身**完全离线**：题目、打分、候选排序、置信度都在端侧算；联网只发生在"检查清单"和"下载包"两个动作。
+- 没有推送通知：检测包更新是"打开面板时告知"，不是后台轮询，也没有系统通知。旧版 App 的清单请求会被格式版本挡住（"格式版本 2 不受支持"），它继续用自己内置的那一份，不受影响。
+
+### 打分口径
+
+- 三条有效回答 → 完整路径：`ranking = 0.5·z(mean(LDA投影)) + 0.25·z(median(−kNN距离)) + 0.25·z(mean(质心基线))`；verifier 另算 6 特征 → 逻辑头得到 `verification_score`，只决定 `verification_top` 与"排名/核验是否一致"，**不重排候选**；置信度是 `softmax(tau·ranking)`。
+- 1–2 条有效回答 → 部分路径（`shared-ranker-partial-v1` 等价语义）：只出候选排序，明确不给检验分数与置信度，面板文案写清"补齐三条才有置信度"。
+- 有效回答门槛沿用上游：`max(80, ceil(expected_count × 0.55))`。
+- **有意偏离上游的一处**：上游用四个哈希把 `tau` 绑到它拟合时的制品上；我们的包就是那个绑定的产物，所以这一层退化成"包能解析且 `tau` 在 [0.001, 1000] 内"。已在 `SharedScoring.kt` 的文件头注明。
+
+---
+
+## 4. 上游对齐是怎么被证明的
+
+`app/src/test/java/com/relaytester/app/FingerprintGoldenTest.kt`（16 个用例）+ `app/src/test/resources/fingerprint-golden.json`：
+
+- 黄金向量由**上游自己的** `shared/shared-detector.ts`（`analyzeSharedOutputs`）跑出来的 8 组用例（6 个模型的真实回答 + 一条部分样本用例），不是第二份实现；生成器会拒绝"包的构建时间与检测器不一致"的组合（那会让上游静默退回旧排序器）。
+- 断言：候选顺序、首位候选、家族、逐模型排名分/检验分/置信度（容差 1e-4）、评分路径、置信度状态、verifier 第一候选、截断包被拒。
+- 实测最差偏差（量化的代价）：排名 2.5e-5、检验 3.9e-5、置信度 1.2e-5；8 组用例的完整顺序 8/8 一致，120 个候选对 0 反序。
+- 隔离变异：把 verifier 的预处理改回"复用 ranker 的 `full_params`"（这正是本轮修掉的真缺陷）→ `FingerprintGoldenTest` **变红**。这不是造出来的例子，是开发过程中真实发生过的红→绿。
+
+### 夹具与黄金向量是"钉住"的
+
+`app/src/test/resources/lm-fingerprint/lite-bank-small.bin`（6 模型，421,112 字节）+ 对应的黄金向量对应某个**固定的上游修订**，故意不随上游漂移：测试向量必须是不变的，否则"上游变了"和"我们改坏了"分不开。要重新钉一份修订时的步骤：
+
+```bash
+python tools/build_fingerprint_asset.py <上游 data 目录> build/lm-fingerprint/lite-bank-small.bin \
+    --models 6 --ref-bits 16 --emit-detector-json /tmp/detector.json --emit-bank-json /tmp/bank.json
+bun run tools/make_fingerprint_golden.ts <上游 checkout> /tmp/detector.json /tmp/bank.json \
+    <上游 data/unified_reference.jsonl> app/src/test/resources/fingerprint-golden.json
+```
+
+（夹具只在测试里，不进 APK。）
+
+---
+
+## 5. 更新一个检测包（运维）
+
+**平时不用管：上游一变，GitHub Actions 自己重建并发布。** 工作流
+`.github/workflows/update-detection-package.yml` 每天 03:17 UTC 跑一次，也可以在
+Actions 页面点 "Run workflow" 手动跑（可选 `force` 用来验证发布通道）。它做的事：
+
+1. `git ls-remote` 取上游 `Ikaleio/lm-detector` 的 HEAD（不用 API、不限流）；
+2. clone 本仓库（默认分支）→ 下载上游那一个修订的 `data/*.json`（44 MB）；
+3. `python tools/update_fingerprint_package.py --revision <上游 HEAD>`：重建 → 与线上清单比 `sha256` → **一致就打印"无需发布"**；
+4. 发布时把两个资产**下载回来逐字节比对**，对不上就让 job 失败。
+
+同一条命令本机也能跑：
+
+```bash
+python tools/update_fingerprint_package.py            # 检查上游 → 按需重建 → 与线上比对 → 变了才发布
+python tools/update_fingerprint_package.py --dry-run  # 全流程但不发布
+python tools/update_fingerprint_package.py --revision <sha>   # 跳过 API，直接用这个上游修订
+python tools/update_fingerprint_package.py --refresh  # 忽略缓存，重新下载上游数据（44 MB）
+python tools/update_fingerprint_package.py --data-dir /path/to/lm-detector/data   # 用本地上游副本
+python tools/publish_bank.py --check                  # 只校验线上资产与本地是否逐字节一致
+```
+
+- **幂等来自构建的确定性**：包头的 `builtAt` 取自上游数据里的字段，不是时钟；同一份上游数据重建出的字节完全相同（实测重建得到的 `sha256` 与线上发布的一模一样）。所以"上游没动"的日子，这一步只是重算一遍再比一下。
+- 判定依据是上游那个修订（CI 里就是上游 HEAD）。**上游因为无关文件挪动 HEAD 时也会重建一次**，重建结果与线上一致，同样"无需发布"——代价是一次 44 MB 下载，不会误发。
+- 产物：`build/lm-fingerprint/lite-bank.bin` + 从文件头反读出来的 `latest.json`（构建时间、模型数、参考摘要、大小、SHA-256、`minAppVersionCode`），两者不可能互相漂移。
+- 发布后会把两个资产**下载回来逐字节比对**；刚替换的资产可能被 CDN 缓存一瞬，所以回读带 cache-buster 并重试 5 次（这是实测踩到的假失败：内容其实已经正确）。
+- 失败模式：GitHub API 限流 → 提示写 token（CI 里不走 API，所以只影响本机）；`raw.githubusercontent.com` 不可达 → 设置 `HTTPS_PROXY` 或用 `--data-dir`（CI 跑在 GitHub 自己的网络上，实测正常）。
+- Token：本机是 `GITHUB_TOKEN` 或 `E:/AI/Zcode/tmp/.ghtoken` 第一行；**CI 用的是本次运行自己的临时 `GITHUB_TOKEN`，仓库里没有配任何 secret**。
+
+### 5.1 这套自动化的安全边界
+
+| 问题 | 实际情况 |
+|---|---|
+| 别人装了 App，能不能碰我的 GitHub？ | 不能。APK 里**没有任何凭据**，它只会对公开的 `releases/download/bank/latest.json` 做匿名 GET；应用代码里全仓只有这一个 GitHub URL（`BankUpdate.kt`）。装 App 的人最多产生下载流量。 |
+| CI 用的是什么凭据？ | 运行自带的 `GITHUB_TOKEN`：本仓库作用域、跑完即失效，写权限只声明了发布资产需要的 `contents: write`（仓库默认权限本身是只读的）。**没有 PAT、没有仓库 secret**，所以没有可被偷的长期凭据。 |
+| 谁能触发这个工作流？ | 只有 `schedule` 和 `workflow_dispatch` 两种触发，**没有 `push`/`pull_request`**，所以通过 fork 或 PR 送进来的代码永远不会在这个 job 里跑；`workflow_dispatch` 也只有写权限的人能点。 |
+| 第三方 action 会不会被投毒？ | 用不到第三方 action：整个工作流只有 `git`、`python3` 和 runner 自带工具（因此也**没有可被移动 tag 劫持的依赖**）。 |
+| 仓库要不要保持公开？ | 要。App 不带凭据 ⇒ 资产必须匿名可读。把仓库转私有会让更新功能整体失效（这是设计前提，不是疏漏）。 |
+| 上游数据本身有毒怎么办？ | 上游是第三方仓库，这是唯一的供应链面。缓解：构建脚本是我们自己的、只把数值打包；App 侧安装前先解析校验（格式/边界/大小），解析不过就拒绝安装并保留原包。**没做到的**：CI 里没有跑 Kotlin 黄金向量（缺 Android 工具链），所以"数值正确性"这一层仍靠本机 `:app:testOptimizedUnitTest` 把关。 |
+| 定时任务会不会自己停？ | 会。公开仓库 60 天没有仓库活动时，GitHub 会自动停掉定时工作流并给仓库所有者发邮件。停了不影响任何人使用（线上包保持现状），Actions 页面点一下 Enable 再用 "Run workflow" 跑一次即可。 |
+
+---
+
+## 6. 体积账（实测）
+
+| 项 | 字节 |
+|---|---|
+| 已发布的 1.4.0 APK | 3,201,744 |
+| 本次构建的 optimized APK | **2,904,555**（−297,189，−9.3%） |
+| 其中：移出 APK 的参考库（旧文件） | 399,470（旧 APK 内 deflate 后约 313 KB） |
+| 其中：新增算法代码与文案（净） | 约 +16 KB |
+| 下载的检测包（16 位） | 3,476,998 |
+| 测试夹具（不进 APK） | 421,112 + 46,321 |
+
+---
+
+## 7. 诚实边界
+
+1. **不宣称准确率提升。** 准确率评估（`FINGERPRINT_ACCURACY_OPTIMIZATION_SPEC.md` §1.2）：无泄漏口径下完整公式逐模型 48/53、逐回答 372/491，旧简化公式 47/53、386/491——两个方向的差都在 ±5 点的噪声带内。这一轮是"对齐上游 + 可更新 + 更小"，不是"更准"。
+2. **kNN 的体积换来的不是精度**：16 位参考张量让包从 0.4 MB 涨到 3.3 MB，收益是可逐位对照上游；8 位能让包回到 2.1 MB，代价是 0.05% 的近邻候选对被重排。
+3. **余量：0.05% 是量化尺度上的近似说法**。1e-4 的断言容差是"实测最差 3.9e-5"的 2.5 倍；包再被裁一次（模型数变化）需要重新测量。
+4. **"库外模型判定"没有做**。verifier 的分数与 `new_joint` 路径已经进包并算出检验分数，但面板不输出"这个回答不像库内任何模型"。前提缺失：本地没有库外模型的回答样本，假接受率无法测量（同上文 §6.2）。
+5. **旧版 App 无法使用新包**：格式版本门是硬的（"更新清单的格式版本 2 不受支持"）。旧版继续用它内置的 0.4 MB 参考库，不需要新包。
+6. **设备 E2E 的覆盖与缺口**：已在模拟器上走通"未安装空态与自动查清单 → 真实下载安装（落地文件 sha256 与线上一致）→ 已是最新 → 坏包回退 → 无备份时判不可读 → 删除回未安装"，并用手动粘贴跑通一次**真实打分**（见 §9）。**没做**的：多模型批量检测的设备走查、设备上走"更新检测包"（覆盖安装）这一条、飞行模式下的离线文案、真机（非模拟器）。
+7. **CI 只守通道，不守数值**：工作流能保证"上游变了就重建、变了才发、发完回读一致"，但它**不跑 Kotlin 黄金向量**（runner 上没有 Android 工具链）。也就是说"发出去的包数值是否正确"仍靠本机 `:app:testOptimizedUnitTest` + 夹具黄金向量把关；CI 抓不到"能解析但数值错"的包。App 侧还有一道兜底：装之前先解析校验，解析不过就拒绝安装并保留原包。
+8. **定时任务会自己停**：公开仓库 60 天无仓库活动，GitHub 会停掉 `schedule`（并发邮件）。这不是故障，线上包保持现状、App 照常工作；Actions 页面 Enable + "Run workflow" 即可恢复。见 §5.1。
+
+---
+
+## 8. 门禁状态
+
+| 项 | 结果 |
+|---|---|
+| `:app:testOptimizedUnitTest` | 167/167 绿（用例数与源码 `@Test` 计数一致） |
+| 隔离变异 | 4/4 红证（verifier 预处理错位、缺包不再提前拒单、读失败逃逸 probe、删除后不再重查清单） |
+| 黄金向量 | 16/16 绿（含 8 组上游用例、量化偏差 ≤3.9e-5） |
+| 发布校验 | `publish_bank.py --check` 通过（两个资产回读逐字节一致） |
+| 构建确定性 | 同上游数据重建 → `sha256` 与线上发布一致（"无需发布"路径成立） |
+| 更新脚本 | 本地/网络两条路径 + 幂等路径 + `--revision` 路径均实测 |
+| 设备 E2E | 见 §9：包生命周期 6 条路径 + 一次真实打分（与独立 Python 复算逐项一致） |
+| CI 工作流 | 见 §5：定时 + 手动，`contents: write`，无第三方 action，无仓库 secret |
+
+---
+
+## 9. 设备实证（模拟器 emulator-5554，debug 变体）
+
+### 9.1 走通的路径与原文
+
+| 场景 | 面板实测文案 |
+|---|---|
+| 未安装（自动查过清单） | `检测包 未安装` / `尚未安装检测包，检测功能暂不可用。` / `可更新到：构建于 2026-09-30T03:01:12.803902+00:00 · 53 个模型 · 3.3 MB` |
+| 下载安装成功 | `检测包 已安装` / `构建于 2026-09-30T03:01:12.803902+00:00 · 53 个模型 · 3.3 MB` / 提示 `检测包已安装：构建于 …，53 个模型` |
+| 再点检查更新 | `检测包已是最新`（清单 sha 与已装文件一致，不再给"更新"按钮） |
+| 主文件损坏、有 `.bak` | `已安装的检测包不可用，已回退到上一份` |
+| 主文件与 `.bak` 都不可读 | `已安装但无法读取` / `当前检测包无法读取，检测功能暂不可用。`（不再显示"构建于 未知 · 0 个模型"） |
+| 删除 | 回到 `未安装` 与空态文案 |
+
+下载落地的文件用 `run-as … sha256sum` 与拉回宿主后的 `sha256sum` 双向核对，均等于线上发布的 `4bdd1d3bb449d21f5afd0d4e7645264f9c090172200a06800230af1d1225cbf8`（3,476,998 B）。
+
+### 9.2 一次真实打分（手动粘贴 → 候选榜）
+
+把黄金用例 1 的三段回答（218 / 223 / 239 个整数，来自上游 TS 生成的 `fingerprint-golden.json`）粘进手动模式的三个输入框：
+
+- 面板显示 `已收到 3/3 条有效回答`，第三题预览 `已识别 239 个整数，可用于检测` —— 落地包给的合格线是 `ceil(326 × 0.55) = 180`，三段都过线。
+- 点"分析粘贴的回答"后：`最接近的候选 gpt-5.4`、`家族 GPT`、`置信 98%`；候选排序 1–8 为
+  `gpt-5.4 / gpt-6-sol / gpt-6-luna / grok-4.6 / gpt-6-astra / qwen3.8-27b / gpt-5.6-terra / gpt-6.1-sol`，第 2 名起全是 0%。
+- 把设备上那个文件原样拉回宿主，用独立的 Python 实现（`tmp/fp_v2/read_package.py`）对同一组回答复算：winner `gpt-5.4`（ranking 2.601781、概率 0.989519 → 界面 98%），前 8 名顺序与上面逐个相同，候选概率和 = 1.0。
+
+这条链把"文本框 → 解析 → 从设备私有目录读包 → 上游算法打分 → 界面渲染"整段串起来了；**注意这里和夹具黄金用例的数值不同**（夹具是 6 个模型的小包，候选集合变了，z 分数与 softmax 分母随之变），能对得上的是**第一名身份**（都是 gpt-5.4）与**排序结构**。
+
+### 9.3 环境坑（下次少走弯路）
+
+- **GitHub release 资产的 CDN 在模拟器里直连不通**：同一时刻小的 JSON 请求正常，`release-assets` 的 TLS 握手 45 s 超时。宿主上用 `ProxyHandler({})` 复现同一现象 ⇒ 是网络环境，不是应用缺陷。给模拟器挂宿主 Clash（`10.0.2.2:7897`，allow-lan 已开）后下载正常。
+- **模拟器全局代理要重启才生效**：`settings put global http_proxy…` 写完当次不生效，`am broadcast android.intent.action.PROXY_CHANGE` 是 root-only（Permission Denial）。必须 `adb reboot`。验证时别只看应用日志——失败原因只在界面 snackbar 上（OkHttp 走 `onFailure` 包装），截图才看得到 `Failed to connect to /127.0.0.1:7897`。
+- **`adb push` 的设备路径在 Git Bash 里会被改写**：`adb push x /data/local/tmp/y` 报成功但文件不在。写 `//data/local/tmp/y`。
+- **`run-as` 不能直接 `cp`**：应用 uid 进不去 `/data/local/tmp`；用设备侧管道 `cat src | run-as <pkg> sh -c "cat > target"`。
+- **Compose 手输长文本**：输入框在被键盘遮住时不会出现在 uiautomator 树里（未组合），得先 `input keyevent 4` 收起键盘（IME 会吃掉这次返回，面板不受影响）再滚动；`input text` 按 ~260 字符分段注入，整段 800 字符会被静默截断。
+- **别用路径认产物**：`tmp/fp_v2/lite-bank.bin` 与线上发布的包**同名不同内容**（`30a86314…` vs `4bdd1d3b…`），拿它复算会得到另一套候选顺序。对账一律先比 sha256。

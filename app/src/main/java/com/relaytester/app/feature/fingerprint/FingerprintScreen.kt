@@ -133,7 +133,7 @@ fun FingerprintScreen(
                 onRetryChallenge = viewModel::retryChallenge,
                 onCheckBankUpdate = viewModel::checkBankUpdate,
                 onInstallBankUpdate = viewModel::installBankUpdate,
-                onRestoreBuiltInBank = viewModel::restoreBuiltInBank,
+                onRemovePackage = viewModel::removeInstalledPackage,
                 contentPadding = innerPadding,
             )
         }
@@ -157,7 +157,7 @@ private fun FingerprintContent(
     onRetryChallenge: (Int) -> Unit,
     onCheckBankUpdate: () -> Unit,
     onInstallBankUpdate: () -> Unit,
-    onRestoreBuiltInBank: () -> Unit,
+    onRemovePackage: () -> Unit,
     contentPadding: androidx.compose.foundation.layout.PaddingValues,
 ) {
     LazyColumn(
@@ -285,26 +285,27 @@ private fun FingerprintContent(
                 state = state,
                 onCheckBankUpdate = onCheckBankUpdate,
                 onInstallBankUpdate = onInstallBankUpdate,
-                onRestoreBuiltInBank = onRestoreBuiltInBank,
+                onRemovePackage = onRemovePackage,
             )
         }
     }
 }
 
 /**
- * Which reference bank the panel is scoring with, and how to move it forward.
+ * Which detection package the panel is scoring with, and how to move it forward.
  *
- * The check is a button rather than a background poll: detection stays offline unless
- * the user asks for an update, which is the only network call this panel makes on its
- * own account. The card says so, because a bank that quietly talked to the network
- * would make that promise a lie.
+ * The package is downloaded rather than shipped in the APK, so this card is also the
+ * panel's provisioner: with nothing installed it explains what is missing and offers
+ * the download. After that the check is a button rather than a background poll — the
+ * one exception is noted on the card itself, because a panel that quietly talked to the
+ * network would make its "检测不联网" promise a lie.
  */
 @Composable
 private fun ReferenceBankCard(
     state: FingerprintUiState,
     onCheckBankUpdate: () -> Unit,
     onInstallBankUpdate: () -> Unit,
-    onRestoreBuiltInBank: () -> Unit,
+    onRemovePackage: () -> Unit,
 ) {
     val busy = state.isCheckingBankUpdate || state.isInstallingBank || state.isRunning
     OutlinedCard {
@@ -318,7 +319,7 @@ private fun ReferenceBankCard(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    "参考库",
+                    "检测包",
                     style = MaterialTheme.typography.bodyMedium,
                     fontWeight = FontWeight.Medium,
                 )
@@ -328,14 +329,18 @@ private fun ReferenceBankCard(
                     color = when (state.bankSource) {
                         BankSource.INSTALLED -> MaterialTheme.colorScheme.primary
                         BankSource.INSTALLED_UNREADABLE -> MaterialTheme.colorScheme.error
-                        BankSource.BUILT_IN -> MaterialTheme.colorScheme.onSurfaceVariant
+                        BankSource.NOT_PROVISIONED -> MaterialTheme.colorScheme.onSurfaceVariant
                     },
                 )
             }
 
             Text(
-                "构建于 ${state.referenceBuiltAt.ifBlank { "未知" }} · " +
-                    "${state.modelCount} 个模型标签 · ${formatBankSize(state.bankSizeBytes)}",
+                bankStateLine(
+                    source = state.bankSource,
+                    builtAt = state.referenceBuiltAt,
+                    modelCount = state.modelCount,
+                    sizeBytes = state.bankSizeBytes,
+                ),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -348,9 +353,17 @@ private fun ReferenceBankCard(
                 )
             }
 
-            if (state.bankSource == BankSource.INSTALLED_UNREADABLE) {
+            if (state.bankSource == BankSource.NOT_PROVISIONED) {
                 Text(
-                    "已安装的参考库无法解析，当前使用内置参考库；点下面的按钮可以清掉它。",
+                    "检测需要先下载一次检测包；装好之后检测本身完全离线，不联网。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            state.bankProblem?.let { problem ->
+                Text(
+                    problem,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
                 )
@@ -388,22 +401,31 @@ private fun ReferenceBankCard(
                             )
                             Spacer(Modifier.width(8.dp))
                         }
-                        Text("更新参考库", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            if (state.bankSource == BankSource.NOT_PROVISIONED) {
+                                "下载检测包"
+                            } else {
+                                "更新检测包"
+                            },
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
                     }
                 }
             }
 
-            if (state.bankSource != BankSource.BUILT_IN) {
+            if (state.bankSource != BankSource.NOT_PROVISIONED) {
                 TextButton(
-                    onClick = onRestoreBuiltInBank,
+                    onClick = onRemovePackage,
                     enabled = !busy,
                     modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
-                ) { Text("恢复内置参考库") }
+                ) { Text("删除已安装的检测包") }
             }
 
             Text(
-                "检测本身不联网；点「检查更新」只会取一次更新清单，" +
-                    "点「更新参考库」才会下载库文件。参考数据由 lm-detector (MIT) 提供。",
+                "检测本身不联网：点「检查更新」只会取一次更新清单，点「下载/更新检测包」才会下载文件。" +
+                    "没有检测包时（第一次进入面板，或刚把它删掉）会自动查一次清单，其余检查都要手动触发。" +
+                    "参考数据由 lm-detector (MIT) 提供。",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -460,7 +482,7 @@ private fun IntentNote() {
             )
             Text(
                 "让模型凭第一反应写出约 300 个 1–355 的整数。每个模型写出的“随机数”分布相对稳定，" +
-                    "把结果与参考库比对就能看出后端最接近哪个模型。",
+                    "把结果与检测包比对就能看出后端最接近哪个模型。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -956,15 +978,35 @@ private fun DetectionResultCard(analysis: com.relaytester.app.core.fingerprint.F
                 }
                 top?.probability?.let { probability ->
                     Column {
-                        Text("库内置信", style = MaterialTheme.typography.labelSmall)
+                        Text("置信", style = MaterialTheme.typography.labelSmall)
                         Text("${(probability * 100).toInt()}%", style = MaterialTheme.typography.titleSmall)
                     }
                 }
             }
+            if (analysis.candidates.firstOrNull()?.probability == null) {
+                Text(
+                    if (analysis.usableAnswers < 3) {
+                        "只有 ${analysis.usableAnswers}/3 条有效回答：先给出候选排序，" +
+                            "补齐三条有效回答后才有检验分数与置信度。"
+                    } else {
+                        "这份检测包没有可用的置信度标定，本结果只按候选排序给出。"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (analysis.verifierAgrees == false) {
+                Text(
+                    "排名与核验给出的第一候选不一致：候选顺序仍由排名分数决定，请谨慎对待。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
             HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
             Text(
-                "这是参考库内的封闭集合排序：不在库中的模型同样会得到一个最接近的候选，" +
-                    "分数不是身份证明。同家族相邻版本的区分尤其需要谨慎。",
+                "这是检测包内的封闭集合排序：不在库中的模型同样会得到一个最接近的候选，" +
+                    "分数不是身份证明。同家族相邻版本的区分尤其需要谨慎。置信度是检测包标定的，" +
+                    "不是「这就是该模型」的概率。",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

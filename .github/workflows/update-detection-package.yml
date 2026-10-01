@@ -1,0 +1,104 @@
+# Keeps the `bank` pre-release in step with upstream lm-detector.
+#
+# The app downloads its detection package from that release (background:
+# docs/FINGERPRINT_DETECTION_PACKAGE.md). This job rebuilds the package from upstream's
+# data and publishes it only when the built bytes differ from what is already published,
+# so a run against an unchanged upstream ends in "无需发布" and changes nothing.
+#
+# Security shape, deliberately minimal:
+#   * triggers are `schedule` and `workflow_dispatch` only — no `push` and no
+#     `pull_request*`, so nothing a contributor or a fork sends can run here;
+#   * the only write power asked for is `contents: write`, which is what uploading a
+#     release asset needs. It comes from the run's own short-lived GITHUB_TOKEN, scoped to
+#     this repository and gone when the job ends: no PAT, no repository secret, nothing
+#     long-lived that could leak or be replayed;
+#   * no third-party actions are used at all — the steps below are plain git and python
+#     from the runner image, so there is no action whose moved tag could be hijacked;
+#   * the app itself carries no credential: it only GETs public release assets from this
+#     repository, so installing the app cannot reach anything here. That also means the
+#     repository and its release assets have to stay public for the updater to work.
+#
+# Operational notes:
+#   * GitHub runs scheduled workflows from the default branch only, so this file (and the
+#     tools it calls) have to be on `main` — a run on any other branch never fires;
+#   * GitHub switches a public repository's schedule off after 60 days without repository
+#     activity, and emails the owner when it does. Publishing needs no workaround for
+#     that: nothing breaks in the meantime (the published package simply stays as it is),
+#     and re-enabling is one click in the Actions tab, after which "Run workflow" retries
+#     on demand. A run dropped under load is likewise harmless — the next one sees the
+#     same state;
+#   * forks: the job would publish into the fork's own release, which no app reads, so it
+#     is harmless there. No repository guard is used, because a rename would then stop the
+#     schedule silently.
+
+name: Update detection package
+
+on:
+  schedule:
+    # Daily. Not on the hour: GitHub delays or drops runs scheduled at peak load.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 与线上逐字节一致也重新上传（用来验证发布通道真的能跑）
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+# Two runs replacing the same two assets at once would race.
+concurrency:
+  group: update-detection-package
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Read upstream revision
+        id: upstream
+        # `git ls-remote` instead of the commits API: no token to spend on a third-party
+        # repository, and no anonymous rate limit to hit.
+        run: |
+          set -euo pipefail
+          sha="$(git ls-remote https://github.com/Ikaleio/lm-detector.git HEAD | cut -f1)"
+          test -n "$sha"
+          echo "upstream HEAD is $sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Check out this repository
+        # A plain clone rather than actions/checkout: the tools are all this job needs, and
+        # this keeps the workflow free of third-party actions to trust.
+        run: git clone --depth 1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" work
+
+      - name: Check the publishing tools import
+        working-directory: work
+        # Cheap and first: a broken tools/ push should fail in a second, not after the
+        # 44 MB upstream download.
+        run: |
+          python3 -m py_compile \
+            tools/build_fingerprint_asset.py \
+            tools/publish_bank.py \
+            tools/update_fingerprint_package.py
+
+      - name: Rebuild and publish if upstream moved
+        working-directory: work
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+          FORCE: ${{ inputs.force }}
+        # The build is deterministic (its builtAt comes from upstream's data, not from the
+        # clock), so an unchanged upstream rebuilds to the published digest and the script
+        # reports "无需发布". Publishing also reads both assets back and compares them
+        # byte for byte, so a truncated upload fails the job instead of going unnoticed.
+        run: |
+          set -euo pipefail
+          args=(
+            --revision "$UPSTREAM_SHA"
+            --cache-dir "$RUNNER_TEMP/upstream"
+            --out "$RUNNER_TEMP/lite-bank.bin"
+          )
+          if [ "$FORCE" = "true" ]; then args+=(--force); fi
+          python3 tools/update_fingerprint_package.py "${args[@]}"

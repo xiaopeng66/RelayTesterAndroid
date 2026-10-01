@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
-"""Publish the reference bank for the app's in-app updater.
+"""Publish the fingerprint detection package for the app's in-app updater.
 
 Uploads two assets to the `bank` pre-release of the app repository:
 
-    lite-bank.bin   the packed bank, byte-identical to what ships in the APK
+    lite-bank.bin   the packed detection package, built by build_fingerprint_asset.py
     latest.json     the manifest the app polls from its "检查更新" button
+
+The package is no longer bundled in the APK: the app downloads it once and keeps it,
+which is what keeps the app itself small and the package updatable on its own.
 
 The manifest is derived from the asset itself — build stamp, model count, reference
 digest, size and SHA-256 are all read back out of the binary — so the two can never
 disagree. Both files are downloaded again afterwards and compared byte for byte.
 
 Usage:
-    python tools/publish_bank.py                 # publish the packaged asset
+    python tools/publish_bank.py                 # publish build/lm-fingerprint/lite-bank.bin
     python tools/publish_bank.py --dry-run       # print the manifest, upload nothing
     python tools/publish_bank.py --check         # verify what is published matches
-    python tools/publish_bank.py --bank <path>   # publish a different asset
+    python tools/publish_bank.py --bank <path>   # publish a different package
 
 Token: GITHUB_TOKEN, or the first line of E:/AI/Zcode/tmp/.ghtoken.
 """
@@ -26,25 +29,27 @@ import os
 import re
 import struct
 import sys
+import time
 import urllib.error
 import urllib.request
 
 REPO = "xiaopeng66/RelayTesterAndroid"
 TAG = "bank"
-RELEASE_NAME = "参考库（应用内更新源）"
+RELEASE_NAME = "检测包（应用内更新源）"
 API = "https://api.github.com"
 PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_BANK = os.path.join(PROJECT, "app/src/main/assets/lm-fingerprint/lite-bank.bin")
+DEFAULT_BANK = os.path.join(PROJECT, "build/lm-fingerprint/lite-bank.bin")
 GRADLE = os.path.join(PROJECT, "app/build.gradle.kts")
 TOKEN_FILES = ["E:/AI/Zcode/tmp/.ghtoken"]
-MAGIC = b"LMFPA001"
-FORMAT_VERSION = 1
+MAGIC = b"LMFPA002"
+FORMAT_VERSION = 2
 
-RELEASE_BODY = """参考库的应用内更新源，供「指纹检测」面板的「检查更新」按钮读取。
+RELEASE_BODY = """指纹检测包的发布源，供「指纹检测」面板的「检查更新」按钮读取。
 
 - `latest.json`：更新清单（格式版本、构建时间、模型数量、大小与 SHA-256、下载地址）。
-- `lite-bank.bin`：与安装包内完全一致的参考库文件。
+- `lite-bank.bin`：检测包本体（由上游 lm-detector 的数据构建，见仓库 `tools/`）。
 
+检测包不打进安装包，应用首次需要时自行下载并保存在设备上，之后检测完全离线。
 这里只发布数据文件，不发布 APK；应用版本请看 [Releases]({release_url})。
 """
 
@@ -182,26 +187,42 @@ def replace_asset(token, release, name, payload, content_type):
     return json.loads(body)
 
 
-def download(url):
+def download(url, cache_bust=False):
+    if cache_bust:
+        separator = "&" if "?" in url else "?"
+        url = f"{url}{separator}cb={int(time.time() * 1000)}"
     request_object = urllib.request.Request(url)
     with urllib.request.urlopen(request_object, timeout=180) as response:
         return response.read()
 
 
-def verify(release, bank_bytes, manifest_bytes):
-    """Download both assets back and compare them with what we meant to publish."""
+def verify(release, bank_bytes, manifest_bytes, attempts=5, wait_seconds=4.0):
+    """Download both assets back and compare them with what we meant to publish.
+
+    A just-replaced asset can still be served from a CDN cache for a moment, so the
+    read-back is retried with a cache-busting query before it is called a mismatch: a
+    false "不一致" here would look exactly like a corrupted upload.
+    """
     assets = {asset["name"]: asset for asset in release["assets"]}
     for name in ("lite-bank.bin", "latest.json"):
         if name not in assets:
             raise SystemExit(f"发布后找不到资产 {name}")
-    fetched_bank = download(assets["lite-bank.bin"]["browser_download_url"])
-    fetched_manifest = download(assets["latest.json"]["browser_download_url"])
-    if fetched_bank != bank_bytes:
-        raise SystemExit("回读的 lite-bank.bin 与本地文件不一致")
-    if fetched_manifest != manifest_bytes:
-        raise SystemExit("回读的 latest.json 与本地文件不一致")
-    print("verified: 两个资产回读均与本地逐字节一致")
-    return json.loads(fetched_manifest)
+    bank_url = assets["lite-bank.bin"]["browser_download_url"]
+    manifest_url = assets["latest.json"]["browser_download_url"]
+    seen = None
+    for attempt in range(attempts):
+        fetched_bank = download(bank_url, cache_bust=True)
+        fetched_manifest = download(manifest_url, cache_bust=True)
+        if fetched_bank == bank_bytes and fetched_manifest == manifest_bytes:
+            print("verified: 两个资产回读均与本地逐字节一致")
+            return json.loads(fetched_manifest)
+        seen = (len(fetched_bank), len(fetched_manifest))
+        if attempt + 1 < attempts:
+            time.sleep(wait_seconds)
+    raise SystemExit(
+        f"回读校验失败（重试 {attempts} 次）：本地 {len(bank_bytes)}/{len(manifest_bytes)} 字节，"
+        f"线上 {seen[0]}/{seen[1]} 字节",
+    )
 
 
 def main():

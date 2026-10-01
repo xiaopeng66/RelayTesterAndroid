@@ -40,8 +40,8 @@ data class BankManifest(
 
 /** Reads the published manifest; every failure is a [BankUpdateException]. */
 object BankManifestParser {
-    /** Bumped when the packed bank changes shape; an app that predates it must not install it. */
-    const val SUPPORTED_FORMAT = 1
+    /** Bumped when the packed package changes shape; an app that predates it must not install it. */
+    const val SUPPORTED_FORMAT = 2
 
     fun parse(text: String): BankManifest {
         val root = try {
@@ -131,20 +131,26 @@ class BankUpdateClient(
     private val manifestUrl: String = BankUpdateDefaults.MANIFEST_URL,
     private val maxManifestBytes: Int = MAX_MANIFEST_BYTES,
 ) {
-    suspend fun check(local: BankIdentity, appVersionCode: Long): BankUpdateCheck {
+    /**
+     * Compares what is published with the package in use.
+     *
+     * [localSha256] is null when nothing is installed — the panel is unprovisioned, so
+     * whatever is published is by definition an install rather than an update.
+     */
+    suspend fun check(localSha256: String?, appVersionCode: Long): BankUpdateCheck {
         val bytes = fetcher.fetch(manifestUrl, maxManifestBytes)
         val manifest = BankManifestParser.parse(String(bytes, Charsets.UTF_8))
         return when {
-            // Identity comes first: a bank we already have is nothing to do, whatever the
-            // manifest asks of the app.
-            manifest.sha256 == local.sha256 -> BankUpdateCheck.UpToDate
+            // Identity comes first: a package we already have is nothing to do, whatever
+            // the manifest asks of the app.
+            localSha256 != null && manifest.sha256 == localSha256 -> BankUpdateCheck.UpToDate
             manifest.minAppVersionCode > appVersionCode -> BankUpdateCheck.NeedsNewerApp(manifest)
             else -> BankUpdateCheck.Available(manifest)
         }
     }
 
     /**
-     * Fetches the bank [manifest] advertises.
+     * Fetches the package [manifest] advertises.
      *
      * The size and the digest are checked here, so bytes that do not match what the
      * manifest promised never reach the store.
@@ -155,10 +161,10 @@ class BankUpdateClient(
     ): ByteArray {
         val bytes = fetcher.fetch(manifest.url, maxBytes)
         if (bytes.size.toLong() != manifest.sizeBytes) {
-            throw BankUpdateException("下载的参考库大小与清单不符（${bytes.size} ≠ ${manifest.sizeBytes}）")
+            throw BankUpdateException("下载的检测包大小与清单不符（${bytes.size} ≠ ${manifest.sizeBytes}）")
         }
         if (!sha256Hex(bytes).equals(manifest.sha256, ignoreCase = true)) {
-            throw BankUpdateException("下载的参考库校验失败（SHA-256 不匹配）")
+            throw BankUpdateException("下载的检测包校验失败（SHA-256 不匹配）")
         }
         return bytes
     }
