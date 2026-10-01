@@ -192,16 +192,26 @@ def notify_tracking_issue(token, built_manifest, revision, previous):
     error here is printed and swallowed.
     """
     try:
-        requires_newer_app = previous is None or built_manifest["minAppVersionCode"] > previous.get(
-            "minAppVersionCode", 0,
-        )
-        app_line = (
-            f"⚠️ 本次包要求 App 版本代码 ≥ {built_manifest['minAppVersionCode']}："
-            "更旧的 App 需要先更新应用，才能安装这份检测包。"
-            if requires_newer_app
-            else f"App 无需更新（要求 ≥ {built_manifest['minAppVersionCode']}）："
-            "打开「指纹检测」面板即可看到「可更新到…」并直接安装。"
-        )
+        required = built_manifest["minAppVersionCode"]
+        if previous is None:
+            # First publish: there is no earlier package to compare against, so state
+            # the requirement without claiming anything about who needs to update.
+            app_line = f"这是首次发布，包要求 App 版本代码 ≥ {required}。"
+        else:
+            previous_required = previous.get("minAppVersionCode", 0)
+            if required > previous_required:
+                # The comparison is against the previous *package*, the only thing this
+                # run can see: the app and the package ship on separate channels, so the
+                # run cannot know which app versions are in the field.
+                app_line = (
+                    f"⚠️ 最低 App 版本代码提高到 {required}（上一版包要求 {previous_required}）："
+                    "低于该值的 App 需要先更新应用，才能安装这份检测包。"
+                )
+            else:
+                app_line = (
+                    f"要求 App 版本代码 ≥ {required}（与上一版包相同）："
+                    "打开「指纹检测」面板即可看到「可更新到…」并直接安装。"
+                )
         body = (
             f"@{OWNER} 检测包已自动发布。\n\n"
             f"- 上游修订：{UPSTREAM}/tree/{revision}\n"
