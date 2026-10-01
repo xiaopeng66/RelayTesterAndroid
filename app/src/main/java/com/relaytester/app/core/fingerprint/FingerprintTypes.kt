@@ -132,12 +132,18 @@ internal class BankReader(private val bytes: ByteArray) {
         val models = u32()
         // Each model costs at least its row count and one scale, so the count is bounded.
         requireCapacity(models, 8)
+        // Every model's payload is `rows * columns * width`, so a columns count that does
+        // not fit in what is left describes data that is not there — and would make the
+        // product below overflow into a smaller width that still passes the capacity check.
+        requireCapacity(columns, 1)
         val width = if (bits == 16) 2 else 1
         return List(models) {
             val rows = u32()
             requireCapacity(rows, 4)
             val scales = float32(rows)
-            val data = bytes(rows * columns * width)
+            val payload = rows.toLong() * columns.toLong() * width
+            require(payload <= Int.MAX_VALUE) { "指纹检测包参考张量过大" }
+            val data = bytes(payload.toInt())
             QuantizedReferences(columns, rows, bits, scales, data)
         }
     }

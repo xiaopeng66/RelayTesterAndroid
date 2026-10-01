@@ -119,6 +119,47 @@ class FingerprintBankStoreTest {
 
         assertEquals(BankSource.INSTALLED_UNREADABLE, loaded.source)
         assertNull(loaded.loaded)
+        assertTrue("必须说明超出上限", loaded.problem!!.contains("大小上限"))
+    }
+
+    @Test
+    fun `an oversize installed package is refused before its bytes are read`() {
+        // The cap exists to bound memory, so a package over it must not be materialised
+        // first: the whole point is to never hold an attacker-sized buffer.
+        val oversize = ByteArray(FingerprintBankStore.MAX_INSTALLED_BYTES.toInt() + 1)
+        val files = MemoryBankFileSystem(installed = oversize)
+
+        files.store().load()
+
+        assertEquals("超限文件不得被读入内存", 0, files.installedReads)
+    }
+
+    @Test
+    fun `a missing installed file still adopts the rollback copy`() {
+        // An install whose final rename failed leaves the new bytes staged and the old
+        // package as the only rollback: the panel must use it instead of claiming there
+        // is nothing and demanding a fresh download.
+        val files = MemoryBankFileSystem(installed = null, backup = fixtureBankBytes())
+
+        val loaded = files.store().load()
+
+        assertEquals(BankSource.INSTALLED, loaded.source)
+        assertTrue(loaded.usedBackup)
+        assertNotNull(loaded.loaded)
+        assertEquals(shippedBankBuiltAt(), loaded.loaded!!.identity.builtAt)
+        assertTrue("必须说明已经回退", loaded.problem!!.contains("回退"))
+    }
+
+    @Test
+    fun `removing still succeeds when only the backup delete fails`() {
+        // The rollback copy is disposable: a backup that cannot be removed must not make
+        // the panel report the removal as failed and leave it looking provisioned.
+        val files = MemoryBankFileSystem(deleteBackupFails = true)
+
+        assertEquals(BankDiscardResult.Removed, files.store().discardInstalled())
+
+        assertNull(files.installed)
+        assertEquals(BankSource.NOT_PROVISIONED, files.store().load().source)
     }
 
     @Test

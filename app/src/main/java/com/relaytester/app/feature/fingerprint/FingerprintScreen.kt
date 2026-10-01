@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Close
@@ -55,6 +56,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -218,7 +220,19 @@ private fun FingerprintContent(
                             enabled = !state.isRunning,
                         )
                         Row(
-                            modifier = Modifier.fillMaxWidth(),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                // The row is the control: a bare Switch announces only
+                                // "switch, off" with no idea what it toggles, because its
+                                // label lives in a sibling node. Making the row the
+                                // toggleable merges the title, the explanation and the
+                                // switch state into one accessible control.
+                                .toggleable(
+                                    value = state.useParallel,
+                                    enabled = !state.isRunning,
+                                    role = Role.Switch,
+                                    onValueChange = onParallelChange,
+                                ),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
@@ -231,7 +245,9 @@ private fun FingerprintContent(
                             }
                             Switch(
                                 checked = state.useParallel,
-                                onCheckedChange = onParallelChange,
+                                // Null: the row above handles the gesture, so the switch
+                                // is a state indicator rather than a second target.
+                                onCheckedChange = null,
                                 enabled = !state.isRunning,
                             )
                         }

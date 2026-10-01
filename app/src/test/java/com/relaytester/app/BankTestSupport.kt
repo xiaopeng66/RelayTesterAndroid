@@ -8,6 +8,7 @@ import com.relaytester.app.core.fingerprint.FingerprintBank
 import com.relaytester.app.core.fingerprint.FingerprintBankStore
 import com.relaytester.app.core.fingerprint.sha256Hex
 import java.io.IOException
+import kotlinx.coroutines.CompletableDeferred
 import org.json.JSONObject
 
 /**
@@ -149,10 +150,17 @@ internal class MemoryBankFileSystem(
     var writeFails: Boolean = false,
     /** Deleting throws, standing in for a file that cannot be removed. */
     var deleteFails: Boolean = false,
+    /** Only the rollback copy refuses to delete; the installed package still goes. */
+    var deleteBackupFails: Boolean = false,
 ) : BankFileSystem {
+    /** How many times the installed file's bytes were actually read. */
+    var installedReads = 0
+        private set
+
     override fun installedLength(): Long? = installed?.size?.toLong()
 
     override fun readInstalled(): ByteArray? {
+        installedReads++
         if (installed != null && readFails) throw IOException("读取已安装检测包失败")
         return installed
     }
@@ -172,7 +180,7 @@ internal class MemoryBankFileSystem(
     }
 
     override fun deleteBackup() {
-        if (deleteFails) throw IOException("删除检测包备份失败")
+        if (deleteFails || deleteBackupFails) throw IOException("删除检测包备份失败")
         backup = null
     }
 
@@ -215,8 +223,12 @@ internal class FakeBankFetcher(
 ) : BankFetcher {
     val urls = mutableListOf<String>()
 
+    /** Parks every fetch until the test releases it, so a job can be held in flight. */
+    var gate: CompletableDeferred<Unit>? = null
+
     override suspend fun fetch(url: String, maxBytes: Int): ByteArray {
         urls += url
+        gate?.await()
         failure?.let { throw it }
         return if (url.endsWith(".json")) manifestBody.toByteArray(Charsets.UTF_8) else bankBytes
     }

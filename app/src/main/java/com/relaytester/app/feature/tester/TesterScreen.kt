@@ -620,8 +620,10 @@ private fun SupplierSelector(
                     OutlinedCard(
                         modifier = Modifier
                             .width(cardWidth)
-                            // Fixed height so both columns of the grid stay level.
-                            .height(58.dp)
+                            // A floor, not a fixed height: the grid already levels both
+                            // columns of a row, and at a large font scale the name plus
+                            // the protocol line need more than 58dp or they clip.
+                            .heightIn(min = 58.dp)
                             .clip(cardShape)
                             .combinedClickable(
                                 enabled = enabled,
@@ -642,9 +644,11 @@ private fun SupplierSelector(
                         shape = cardShape,
                         colors = CardDefaults.outlinedCardColors(containerColor = containerColor),
                     ) {
+                        // Width-only: a full-size box would clamp the column back to the
+                        // card's minimum height and clip the second line at 2x fonts.
                         Box(
                             modifier = Modifier
-                                .fillMaxSize(),
+                                .fillMaxWidth(),
                         ) {
                             if (supplier.isTestingDisabled) {
                                 // A pull-only marker that draws over the corner instead of
@@ -663,7 +667,7 @@ private fun SupplierSelector(
                             }
                             Column(
                                 modifier = Modifier
-                                    .fillMaxSize()
+                                    .fillMaxWidth()
                                     // Pull-only cards reserve room for the corner marker.
                                     .padding(start = if (supplier.isTestingDisabled) 14.dp else 10.dp)
                                     // Clears the edit control stacked over the corner.
@@ -1257,7 +1261,6 @@ private fun TestSettingsCard(
                                                     enabled = enabled,
                                                     modifier = Modifier
                                                         .align(Alignment.CenterEnd)
-                                                        .size(36.dp)
                                                         .semantics {
                                                             contentDescription = "删除快捷筛选词 $term"
                                                         },
@@ -1858,7 +1861,6 @@ private fun ResultItem(
                     if (onCopyName != null) {
                         IconButton(
                             onClick = { onCopyName(result.model) },
-                            modifier = Modifier.size(36.dp),
                         ) {
                             Icon(
                                 Icons.Outlined.ContentCopy,
@@ -1871,7 +1873,6 @@ private fun ResultItem(
                         IconButton(
                             onClick = { onFingerprint(result.model) },
                             enabled = enabled,
-                            modifier = Modifier.size(36.dp),
                         ) {
                             Icon(
                                 Icons.Outlined.Fingerprint,
@@ -3000,7 +3001,6 @@ private fun ModelCatalogEntryCard(
                             { onRunSource(source) }
                         },
                         enabled = editingEnabled && (sourceMissing || sourceTestable),
-                        modifier = Modifier.size(36.dp),
                     ) {
                         if (sourceMissing) {
                             Icon(

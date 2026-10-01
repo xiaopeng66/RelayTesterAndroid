@@ -26,8 +26,17 @@ internal class BalanceQueryScript {
         val planName: String?,
     )
 
-    fun validate(source: String?): String? = runCatching {
-        compileRequest(source.orEmpty())
+    /**
+     * Static validation only: never runs [source].
+     *
+     * Compiling a script means executing it, and validation happens on the import path,
+     * where the code comes from a file the user did not write. A hanging or hostile
+     * script there would burn a thread before the user ever chose the template. The
+     * real compile happens when a balance is queried; a structurally broken script is
+     * reported then, from [compileRequest].
+     */
+    fun validateSyntax(source: String?): String? = runCatching {
+        validateSource(source.orEmpty())
         null
     }.getOrElse { error ->
         (error as? BalanceScriptException)?.message ?: "查询脚本无效，请检查语法与返回结构"
@@ -158,6 +167,7 @@ internal class BalanceQueryScript {
         if (source.isBlank()) throw BalanceScriptException("请填写查询脚本")
         if (source.length > MAX_SCRIPT_CHARS) throw BalanceScriptException("查询脚本超过 16 KB 限制")
         val blocked = FORBIDDEN_TOKENS.find(source)?.value
+            ?: FORBIDDEN_GLOBALS.find(source)?.value
         if (blocked != null) {
             throw BalanceScriptException("查询脚本不能使用 $blocked；仅支持请求描述与响应映射")
         }
@@ -182,6 +192,22 @@ internal class BalanceQueryScript {
         const val MAX_FAILURE_MESSAGE_CHARS = 256
         val FORBIDDEN_TOKENS = Regex(
             """(?i)\b(?:while|for|do|eval|function\s*\*|new\s+|class|import|require|fetch|xmlhttprequest|websocket|worker|promise|settimeout|setinterval|async|await|yield|constructor|__proto__|prototype|repeat|padstart|padend|fill)\b""",
+        )
+
+        /**
+         * Case-sensitive, so it blocks the `Function` global without also blocking the
+         * lower-case `function` an extractor may legitimately be written with.
+         *
+         * The case-insensitive list above cannot express this: matching `Function`
+         * there would reject `extractor: function (json) { ... }`, and leaving it out
+         * leaves the textbook bypass — `Function("wh" + "ile(1){}")()` — open, since no
+         * loop keyword ever appears in the source text. This narrows that hole (and the
+         * `globalThis` handle to it); the honest limit is that no token filter can
+         * close JS code generation completely, which is why scripts are validated
+         * statically and only ever executed on an explicit user action.
+         */
+        val FORBIDDEN_GLOBALS = Regex(
+            """\b(?:Function|globalThis|WebAssembly|importScripts|debugger)\b""",
         )
     }
 }

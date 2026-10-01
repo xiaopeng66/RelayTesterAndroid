@@ -261,6 +261,16 @@ class FingerprintViewModel(
     /** Supplier/model pair requested before the store finished loading. */
     private var pendingPrefill: Pair<String?, String>? = null
 
+    /**
+     * Set when the panel asked for its entry check while a startup read was still running.
+     *
+     * [startBankCheck] drops a check while anything else is in flight, and the screen
+     * only asks once per panel entry, so without this the first visit to the panel could
+     * lose the check entirely — including the first-run case where that check is what
+     * puts the download button on an empty card. Replayed as soon as the read lands.
+     */
+    private var entryCheckPending = false
+
     init {
         if (skipRestore) {
             _uiState.update { it.copy(isLoading = false) }
@@ -270,6 +280,7 @@ class FingerprintViewModel(
                 val result = withContext(ioDispatcher) { bankStore.load() }
                 loadedBank = result.loaded
                 _uiState.update { it.withBank(result) }
+                replayPendingEntryCheck()
             }
         } else {
             loadJob = viewModelScope.launch { load() }
@@ -309,6 +320,7 @@ class FingerprintViewModel(
             }
             pendingPrefill = null
             refreshProgress()
+            replayPendingEntryCheck()
         }.onFailure { error ->
             _uiState.update {
                 it.copy(isLoading = false, loadError = error.message ?: "检测包加载失败")
@@ -537,7 +549,12 @@ class FingerprintViewModel(
     }
 
     fun runApiDetection() {
-        if (_uiState.value.isRunning) return
+        // The job handle, not the flag: `isRunning` is only published once the credentials
+        // are in, and the second tap of a double tap lands inside that window. Without
+        // this both launches survive, both spend upstream requests, and `cancelRun` can
+        // only reach the newer one.
+        if (_uiState.value.isRunning || runJob?.isActive == true) return
+        if (refuseWhileBankJobRuns()) return
         val state = _uiState.value
         val supplierId = state.selectedSupplierId
         val models = state.selectedModels
@@ -772,6 +789,8 @@ class FingerprintViewModel(
 
     /** Scores the manual answers; the same validity rule applies as for API answers. */
     fun runManualAnalysis() {
+        if (runJob?.isActive == true) return
+        if (refuseWhileBankJobRuns()) return
         val state = _uiState.value
         val answers = state.progress.map { it.answer }
         val counts = state.progress.map { it.challenge.expectedCount }
@@ -967,11 +986,25 @@ class FingerprintViewModel(
      * a phone with no network does not get an error snackbar on every visit for a check
      * the user did not ask for. Detection itself stays offline either way.
      */
-    fun refreshBankOnEntry() = startBankCheck(silent = true)
+    fun refreshBankOnEntry() {
+        entryCheckPending = true
+        startBankCheck(silent = true)
+    }
 
     private fun startBankCheck(silent: Boolean) {
         if (bankUpdateBusy()) return
+        entryCheckPending = false
         bankUpdateJob = viewModelScope.launch { checkBankUpdateNow(silent) }
+    }
+
+    /**
+     * Runs an entry check that arrived before the panel was ready.
+     *
+     * Called wherever the startup read finishes; a no-op when no entry check is owed or
+     * when something else claimed the bank slot in the meantime.
+     */
+    private fun replayPendingEntryCheck() {
+        if (entryCheckPending) startBankCheck(silent = true)
     }
 
     /**
@@ -1103,6 +1136,21 @@ class FingerprintViewModel(
             // After the flag is cleared: the check refuses to start while one is set.
             if (removed) checkBankUpdateNow(silent = true)
         }
+    }
+
+    /**
+     * True when a package job is in flight, so a round must not start.
+     *
+     * A round resolves the package once per model through [bankOrReport]; if an install
+     * swapped the package underneath it, the rows of one batch would carry rankings and
+     * reference stamps from two different packages. The reverse direction is already
+     * covered — [bankUpdateBusy] refuses to start an install during a round — so
+     * refusing here closes the pair.
+     */
+    private fun refuseWhileBankJobRuns(): Boolean {
+        if (bankUpdateJob?.isActive != true) return false
+        showMessage("检测包正在更新，请稍候再试", isError = true)
+        return true
     }
 
     /**

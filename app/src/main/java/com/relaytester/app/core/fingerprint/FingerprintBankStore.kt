@@ -293,9 +293,16 @@ class FingerprintBankStore(
         if (present) {
             try {
                 files.deleteInstalled()
-                files.deleteBackup()
             } catch (error: IOException) {
                 return BankDiscardResult.Failed
+            }
+            // Best effort, and after the delete that matters: a leftover rollback copy is
+            // not what the user asked to remove, and reporting a failure here would leave
+            // the panel claiming the package is still installed after it is gone.
+            try {
+                files.deleteBackup()
+            } catch (error: IOException) {
+                // ignored on purpose
             }
         }
         cached = null
@@ -322,6 +329,11 @@ class FingerprintBankStore(
             null
         }
         if (length == null) {
+            // No installed file, but the rollback copy may still hold the package: an
+            // install whose final rename failed leaves exactly this shape. Reporting
+            // "nothing installed" would demand a fresh download for a package that is
+            // sitting on disk, which is what the class promises not to do.
+            if (adoptBackup("上次安装未完成，已回退到上一份")) return
             source = BankSource.NOT_PROVISIONED
             return
         }
@@ -329,32 +341,44 @@ class FingerprintBankStore(
         // A read that fails is a file that cannot be used, not a crash: the panel has to
         // keep working and say so.
         var unreadable = false
-        val primary = try {
-            files.readInstalled()
-        } catch (error: IOException) {
+        // The ceiling is checked before reading, not after: it exists to bound memory, and
+        // materialising an oversized file first would defeat the point. Writes are capped,
+        // so this needs a file dropped into private storage by a restore or by hand.
+        val oversized = length > maxInstalledBytes
+        val primary = if (oversized) {
             unreadable = true
             null
+        } else {
+            try {
+                files.readInstalled()
+            } catch (error: IOException) {
+                unreadable = true
+                null
+            }
         }
         if (installFrom(primary, backup = false)) return
 
+        if (adoptBackup("已安装的检测包不可用，已回退到上一份")) return
+        source = BankSource.INSTALLED_UNREADABLE
+        problem = when {
+            oversized -> "已安装的检测包超出大小上限，请重新下载"
+            unreadable -> "已安装的检测包无法读取，请重新下载"
+            else -> "已安装的检测包无法解析，请重新下载"
+        }
+    }
+
+    /** Adopts the rollback copy, reporting [reason]; false when there is no usable one. */
+    private fun adoptBackup(reason: String): Boolean {
         val fallback = try {
             files.readBackup()
         } catch (error: IOException) {
-            unreadable = true
             null
         }
-        if (installFrom(fallback, backup = true)) {
-            usedBackup = true
-            problem = "已安装的检测包不可用，已回退到上一份"
-            source = BankSource.INSTALLED
-            return
-        }
-        source = BankSource.INSTALLED_UNREADABLE
-        problem = if (unreadable) {
-            "已安装的检测包无法读取，请重新下载"
-        } else {
-            "已安装的检测包无法解析，请重新下载"
-        }
+        if (!installFrom(fallback, backup = true)) return false
+        usedBackup = true
+        problem = reason
+        source = BankSource.INSTALLED
+        return true
     }
 
     /** Parses [bytes] and adopts them when they form a usable package. */

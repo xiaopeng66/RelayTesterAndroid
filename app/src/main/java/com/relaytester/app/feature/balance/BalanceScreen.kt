@@ -518,17 +518,20 @@ private fun BalanceSupplierCard(
     ) {
         Box(
             modifier = Modifier
-                .height(BALANCE_SUPPLIER_CARD_HEIGHT),
+                .heightIn(min = BALANCE_SUPPLIER_CARD_HEIGHT),
         ) {
             Column(
                 modifier = Modifier
-                    .height(BALANCE_SUPPLIER_CARD_HEIGHT)
+                    // A floor rather than a fixed height, and no weighted spacers: a
+                    // weight inside an unbounded column collapses, and at 2x fonts the
+                    // four lines need more than 112dp — a fixed height clipped them.
+                    .heightIn(min = BALANCE_SUPPLIER_CARD_HEIGHT)
                     .padding(start = 14.dp, top = 7.dp, end = 14.dp, bottom = 7.dp),
             ) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(28.dp)
+                        .heightIn(min = 28.dp)
                         .padding(end = 44.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
@@ -546,7 +549,7 @@ private fun BalanceSupplierCard(
                     Spacer(Modifier.height(8.dp))
                     Text(
                         "可用",
-                        modifier = Modifier.height(16.dp),
+                        modifier = Modifier.heightIn(min = 16.dp),
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
@@ -555,7 +558,7 @@ private fun BalanceSupplierCard(
                     Spacer(Modifier.height(1.dp))
                     Text(
                         text = snapshot?.formatValue(snapshot.availableRaw) ?: "—",
-                        modifier = Modifier.height(21.dp),
+                        modifier = Modifier.heightIn(min = 21.dp),
                         style = MaterialTheme.typography.titleSmall,
                         color = MaterialTheme.colorScheme.tertiary,
                         maxLines = 1,
@@ -563,7 +566,7 @@ private fun BalanceSupplierCard(
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
-                Spacer(Modifier.weight(1f))
+                Spacer(Modifier.height(6.dp))
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -585,8 +588,6 @@ private fun BalanceSupplierCard(
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
-
-                Spacer(Modifier.weight(1f))
             }
             Box(
                 modifier = Modifier

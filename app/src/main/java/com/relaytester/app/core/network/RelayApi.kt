@@ -10,20 +10,13 @@ import com.relaytester.app.core.model.TestStatus
 import com.relaytester.app.core.model.TokenUsage
 import java.io.IOException
 import java.io.InterruptedIOException
-import java.util.concurrent.TimeUnit
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
-import okhttp3.Call
-import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.Response
 import okhttp3.ResponseBody
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okio.Buffer
@@ -369,19 +362,12 @@ open class RelayApi(
 
     private suspend fun execute(request: Request, timeoutSeconds: Int): HttpPayload =
         withContext(Dispatchers.IO) {
-            // Build a per-request client so connect/read/write timeouts scale with
-            // the user's configured timeout. Slow relays that need longer than the
-            // OkHttp default (10s) connect/read window must not fail early, and the
-            // call timeout keeps a hard upper bound on the whole request.
+            // Build a per-request client so connect/read/write timeouts scale with the
+            // user's configured timeout. Slow relays that need longer than the OkHttp
+            // default (10s) connect/read window must not fail early.
             val totalSeconds = (timeoutSeconds + CLIENT_GRACE_SECONDS).toLong()
-            val call = client.newBuilder()
-                .connectTimeout(totalSeconds, TimeUnit.SECONDS)
-                .readTimeout(totalSeconds, TimeUnit.SECONDS)
-                .writeTimeout(totalSeconds, TimeUnit.SECONDS)
-                .callTimeout(totalSeconds, TimeUnit.SECONDS)
-                .build()
-                .newCall(request)
-            call.awaitResponse().use { response ->
+            val ready = client.forSameOriginRequests(totalSeconds, totalSeconds, totalSeconds, totalSeconds)
+            ready.executeSameOrigin(request).use { response ->
                 HttpPayload(
                     status = response.code,
                     body = response.body?.readLimitedUtf8() ?: "",
@@ -407,6 +393,10 @@ open class RelayApi(
 
     private fun errorForThrowable(error: Throwable): TestError = when (error) {
         is InterruptedIOException -> TestError(ErrorKind.TIMEOUT, "请求超时")
+        // Before the generic IOException: the refusal carries the reason a redirect was
+        // not followed, and collapsing it to "网络连接失败" would hide an attack shape.
+        is RedirectRefusedException ->
+            TestError(ErrorKind.OTHER, error.message?.take(MAX_ERROR_CHARS) ?: "上游重定向被拒绝")
         is IOException -> TestError(ErrorKind.NETWORK, "网络连接失败")
         else -> TestError(ErrorKind.OTHER, error.message?.take(MAX_ERROR_CHARS) ?: "请求失败")
     }
@@ -451,23 +441,6 @@ open class RelayApi(
     )
 
     private fun normalizedBaseUrl(raw: String): String? = RelayBaseUrl.normalize(raw)
-
-    private suspend fun Call.awaitResponse(): Response = suspendCancellableCoroutine { continuation ->
-        continuation.invokeOnCancellation { cancel() }
-        enqueue(object : Callback {
-            override fun onFailure(call: Call, error: IOException) {
-                if (continuation.isActive) continuation.resumeWithException(error)
-            }
-
-            override fun onResponse(call: Call, response: Response) {
-                if (continuation.isActive) {
-                    continuation.resume(response)
-                } else {
-                    response.close()
-                }
-            }
-        })
-    }
 
     private fun ResponseBody.readLimitedUtf8(): String {
         source().use { source ->

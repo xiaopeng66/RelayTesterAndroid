@@ -122,8 +122,10 @@ class FingerprintBank private constructor(
         const val VALIDITY_RATIO = 0.55
 
         private const val MAGIC = "LMFPA002"
-        private const val FEATURE_DIMENSION = NumberFeatures.DIMENSION + 74
 
+        /** Width of the ordered-block half of the feature vector upstream's detector emits. */
+        private const val ORDERED_DIMENSION = 74
+        private const val FEATURE_DIMENSION = NumberFeatures.DIMENSION + ORDERED_DIMENSION
         /**
          * Parses packed package bytes.
          *
@@ -275,8 +277,14 @@ class FingerprintBank private constructor(
             require(weights.headParams[0].mean.size == NumberFeatures.DIMENSION) {
                 "指纹检测包的 Hellinger 维度不是 ${NumberFeatures.DIMENSION}"
             }
-            require(weights.fullParams[1].mean.size == 74) {
-                "指纹检测包的有序分块维度不是 74"
+            require(weights.headParams[1].mean.size == ORDERED_DIMENSION) {
+                "指纹检测包的头部有序分块维度不是 $ORDERED_DIMENSION"
+            }
+            require(weights.fullParams[0].mean.size == NumberFeatures.DIMENSION) {
+                "指纹检测包的完整 Hellinger 维度不是 ${NumberFeatures.DIMENSION}"
+            }
+            require(weights.fullParams[1].mean.size == ORDERED_DIMENSION) {
+                "指纹检测包的有序分块维度不是 $ORDERED_DIMENSION"
             }
             require(weights.ldaWeights.size == modelCount && weights.ldaBias.size == modelCount) {
                 "指纹检测包的 LDA 权重与模型数量不一致"
@@ -284,21 +292,29 @@ class FingerprintBank private constructor(
             require(weights.ldaWeights.all { it.size == FEATURE_DIMENSION }) {
                 "指纹检测包的 LDA 权重维度不是 $FEATURE_DIMENSION"
             }
-            require(weights.hellinger.centroids.size == modelCount) {
-                "指纹检测包的 Hellinger 质心与模型数量不一致"
-            }
-            require(weights.ordered.centroids.size == modelCount) {
-                "指纹检测包的有序分块质心与模型数量不一致"
-            }
+            // The two feature banks are indexed by the transformed blocks at scoring time
+            // (355 Hellinger / 74 ordered). A bank whose own width disagrees installs
+            // fine and then either throws mid-round or silently drops coordinates.
+            requireFeatureBank(weights.hellinger, NumberFeatures.DIMENSION, modelCount, "Hellinger")
+            requireFeatureBank(weights.ordered, ORDERED_DIMENSION, modelCount, "有序分块")
             require(weights.environments.all { it.size == modelCount }) {
                 "指纹检测包的环境模板与模型数量不一致"
             }
             require(weights.references.size == modelCount) {
                 "指纹检测包的 kNN 参考与模型数量不一致"
             }
+            require(weights.references.all { it.columns == FEATURE_DIMENSION }) {
+                "指纹检测包的 kNN 参考维度不是 $FEATURE_DIMENSION"
+            }
             val verifier = weights.verifier
             require(verifier.preprocessing.size == 2) {
                 "指纹检测包的核验器标准化块数量不正确"
+            }
+            // The verifier re-standardises the raw blocks itself, so its two blocks have to
+            // match the same two widths the ranker uses.
+            require(verifier.preprocessing[0].mean.size == NumberFeatures.DIMENSION &&
+                verifier.preprocessing[1].mean.size == ORDERED_DIMENSION) {
+                "指纹检测包的核验器标准化维度不正确"
             }
             require(verifier.basis.size == FEATURE_DIMENSION && verifier.origin.size == FEATURE_DIMENSION) {
                 "指纹检测包的核验器投影维度不是 $FEATURE_DIMENSION"
@@ -349,6 +365,34 @@ class FingerprintBank private constructor(
             val rows = reader.u32()
             val columns = reader.u32()
             return Gaussian(reader.matrix(rows, columns), reader.float64())
+        }
+
+        /**
+         * A feature bank whose own width disagrees with the vector it is applied to is
+         * the one inconsistency a single packed package can still carry: the reader sizes
+         * `mean`/`scale`/`centroids` from the file, so a package assembled for another
+         * feature width installs cleanly and then throws (or silently drops coordinates)
+         * at scoring time. Every array in a bank shares one width, so checking `mean` is
+         * enough to pin the rest.
+         */
+        private fun requireFeatureBank(
+            bank: FeatureBank,
+            dimension: Int,
+            modelCount: Int,
+            what: String,
+        ) {
+            require(bank.mean.size == dimension && bank.scale.size == dimension) {
+                "指纹检测包的$what 标准化维度不是 $dimension"
+            }
+            require(bank.centroids.size == modelCount) {
+                "指纹检测包的$what 质心与模型数量不一致"
+            }
+            require(bank.centroids.all { it.size == dimension }) {
+                "指纹检测包的$what 质心维度不是 $dimension"
+            }
+            require(bank.nuisanceBasis.all { it.size == dimension }) {
+                "指纹检测包的$what 干扰基维度不是 $dimension"
+            }
         }
 
         /** The number of features upstream's verifier logistic head consumes. */
