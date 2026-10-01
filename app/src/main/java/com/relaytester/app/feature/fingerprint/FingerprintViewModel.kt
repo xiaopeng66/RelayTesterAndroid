@@ -127,6 +127,15 @@ data class FingerprintUiState(
     val isInstallingBank: Boolean = false,
     /** Set when a check found a different published bank. */
     val availableBankUpdate: BankManifest? = null,
+    /**
+     * Set when the published bank demands an app newer than this one.
+     *
+     * The update offer stays hidden in that case — an unparseable package must not be
+     * installable — but the panel still has to say why nothing is offered. This is the
+     * "update the app first" hint, and it is set by the silent entry check too, not
+     * only by the manual button.
+     */
+    val bankRequiringNewerApp: BankManifest? = null,
     val suppliers: List<SupplierOption> = emptyList(),
     val selectedSupplierId: String? = null,
     /** Filters the supplier's model list; it is no longer a free-text model name. */
@@ -1036,7 +1045,9 @@ class FingerprintViewModel(
     private fun applyCheckResult(check: BankUpdateCheck, silent: Boolean) {
         when (check) {
             is BankUpdateCheck.Available -> {
-                _uiState.update { it.copy(availableBankUpdate = check.manifest) }
+                _uiState.update {
+                    it.copy(availableBankUpdate = check.manifest, bankRequiringNewerApp = null)
+                }
                 if (!silent) {
                     showMessage(
                         "发现新的检测包：构建于 ${check.manifest.builtAt}，" +
@@ -1047,12 +1058,16 @@ class FingerprintViewModel(
             }
 
             BankUpdateCheck.UpToDate -> {
-                _uiState.update { it.copy(availableBankUpdate = null) }
+                _uiState.update {
+                    it.copy(availableBankUpdate = null, bankRequiringNewerApp = null)
+                }
                 if (!silent) showMessage("检测包已是最新", isError = false)
             }
 
             is BankUpdateCheck.NeedsNewerApp -> {
-                _uiState.update { it.copy(availableBankUpdate = null) }
+                _uiState.update {
+                    it.copy(availableBankUpdate = null, bankRequiringNewerApp = check.manifest)
+                }
                 if (!silent) {
                     showMessage("发布的检测包需要更新的 App 版本，请先更新应用", isError = true)
                 }

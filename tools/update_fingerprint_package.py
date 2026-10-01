@@ -11,8 +11,10 @@ One command does the whole round trip:
 
 Step 5 is where the app picks the new package up: the panel's "检查更新" button reads
 that manifest, and a device with no package checks it once by itself on first entry.
-Nothing is pushed to the device, so "tell me when there is a new package" is answered
-by opening the panel, not by a notification.
+Nothing is pushed to the device, so on the phone "tell me when there is a new package"
+is answered by opening the panel. The operator hears about a real publish through the
+"检测包自动更新记录" issue this script comments on — an ordinary GitHub notification,
+not a push channel.
 
 Usage:
     python tools/update_fingerprint_package.py                 # check, rebuild, publish if changed
@@ -173,6 +175,77 @@ def describe(manifest):
     )
 
 
+#: All real publishes land on one open issue; the owner watches their own repository,
+#: and every comment @mentions them, so GitHub's ordinary notification plumbing
+#: delivers the news without a webhook, bot account or extra secret.
+TRACKING_ISSUE_TITLE = "检测包自动更新记录"
+OWNER = publish_bank.REPO.split("/")[0]
+
+
+def notify_tracking_issue(token, built_manifest, revision, previous):
+    """Best-effort record of a real publish on the tracking issue.
+
+    The daily run is otherwise silent: devices learn about a new package from the
+    manifest, but the person operating this repository hears nothing. This posts the
+    publish (or appends to the thread if the issue already exists). A notification
+    problem must never fail a publish that already succeeded and verified, so any
+    error here is printed and swallowed.
+    """
+    try:
+        requires_newer_app = previous is None or built_manifest["minAppVersionCode"] > previous.get(
+            "minAppVersionCode", 0,
+        )
+        app_line = (
+            f"⚠️ 本次包要求 App 版本代码 ≥ {built_manifest['minAppVersionCode']}："
+            "更旧的 App 需要先更新应用，才能安装这份检测包。"
+            if requires_newer_app
+            else f"App 无需更新（要求 ≥ {built_manifest['minAppVersionCode']}）："
+            "打开「指纹检测」面板即可看到「可更新到…」并直接安装。"
+        )
+        body = (
+            f"@{OWNER} 检测包已自动发布。\n\n"
+            f"- 上游修订：{UPSTREAM}/tree/{revision}\n"
+            f"- 内容：{built_manifest['modelCount']} 个模型 / "
+            f"{built_manifest['sizeBytes'] / 1024 / 1024:.2f} MB / "
+            f"构建于 {built_manifest['builtAt']} / `{built_manifest['sha256'][:12]}`\n"
+            f"- {app_line}\n\n"
+            "每次真实发布由 GitHub Actions 在本帖追加一条记录；"
+            "手机端每次进入指纹面板都会静默查一次清单，更新提示出现在面板里。"
+        )
+        status, payload = publish_bank.request(
+            token, "GET",
+            f"{publish_bank.API}/repos/{publish_bank.REPO}/issues?state=open&per_page=100",
+        )
+        if status != 200:
+            raise RuntimeError(f"读取 issue 列表失败：HTTP {status} {payload[:200]!r}")
+        number = next(
+            (
+                issue["number"] for issue in json.loads(payload)
+                if "pull_request" not in issue and issue["title"] == TRACKING_ISSUE_TITLE
+            ),
+            None,
+        )
+        if number is None:
+            status, payload = publish_bank.request(
+                token, "POST", f"{publish_bank.API}/repos/{publish_bank.REPO}/issues",
+                {"title": TRACKING_ISSUE_TITLE, "body": body},
+            )
+            if status not in (200, 201):
+                raise RuntimeError(f"创建跟踪 issue 失败：HTTP {status} {payload[:200]!r}")
+            print(f"tracking issue created: #{json.loads(payload)['number']}")
+        else:
+            status, payload = publish_bank.request(
+                token, "POST",
+                f"{publish_bank.API}/repos/{publish_bank.REPO}/issues/{number}/comments",
+                {"body": body},
+            )
+            if status not in (200, 201):
+                raise RuntimeError(f"评论跟踪 issue 失败：HTTP {status} {payload[:200]!r}")
+            print(f"tracking issue updated: #{number}")
+    except Exception as error:  # noqa: BLE001 - notification must not fail the publish
+        print(f"通知未发出（发布不受影响）：{error}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="上游变了就重新构建并发布检测包")
     parser.add_argument("--data-dir", help="上游 data/ 目录（给了就不联网下载上游）")
@@ -247,6 +320,7 @@ def main():
     release = publish_bank.release_by_tag(token)
     publish_bank.verify(release, built, manifest_bytes)
 
+    notify_tracking_issue(token, built_manifest, revision, current)
     print(
         "\n已发布。应用侧取用方式：面板「检查更新」→「下载/更新检测包」；"
         "未安装检测包的设备在首次进入面板时自动查一次清单。",
