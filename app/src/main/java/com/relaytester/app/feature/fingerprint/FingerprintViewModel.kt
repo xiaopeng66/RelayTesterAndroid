@@ -18,6 +18,7 @@ import com.relaytester.app.core.security.KeystoreSecretStore
 import com.relaytester.app.core.security.SecretStore
 import com.relaytester.app.core.storage.SupplierStore
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
@@ -92,6 +93,8 @@ class FingerprintViewModel(
     private val relayApiFactory: () -> RelayApi,
     private val bankFactory: () -> FingerprintBank,
     private val skipRestore: Boolean = false,
+    /** Overridden by tests so a round can be observed without racing real threads. */
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) : ViewModel() {
     private val relayApi: RelayApi by lazy { relayApiFactory() }
     private val bank: FingerprintBank by lazy { bankFactory() }
@@ -100,6 +103,16 @@ class FingerprintViewModel(
     val uiState = _uiState
 
     private var runJob: Job? = null
+
+    /**
+     * Suspends until an in-flight detection round settles.
+     *
+     * Tests drive a round through a dispatcher they control and need a
+     * deterministic join; polling the UI state would be racy.
+     */
+    internal suspend fun awaitIdle() {
+        runJob?.join()
+    }
 
     /**
      * Cached alongside UI state so synchronous callbacks (chip taps) never need to
@@ -119,7 +132,7 @@ class FingerprintViewModel(
     }
 
     private suspend fun load() {
-        val loaded = withContext(Dispatchers.IO) {
+        val loaded = withContext(ioDispatcher) {
             runCatching {
                 val bank = bank
                 val state = supplierStore.read()
@@ -293,7 +306,7 @@ class FingerprintViewModel(
         }
 
         runJob = viewModelScope.launch {
-            val prepared = withContext(Dispatchers.IO) {
+            val prepared = withContext(ioDispatcher) {
                 val supplier = suppliers().firstOrNull { it.id == supplierId }
                 if (supplier == null) {
                     null
@@ -325,7 +338,9 @@ class FingerprintViewModel(
             }
 
             val results = try {
-                if (state.useParallel) {
+                // Read the switch at dispatch time: the round starts inside a coroutine
+                // after credential loading, so the captured state can be stale.
+                if (_uiState.value.useParallel) {
                     coroutineScope {
                         challenges.indices.map { index ->
                             async { requestChallenge(index, supplier, apiKey, model, challenges[index]) }
@@ -443,6 +458,10 @@ class FingerprintViewModel(
                     val verdict = verdicts.getOrNull(index)
                     when {
                         verdict == null -> entry
+                        // A failed API request also leaves the answer blank, but it
+                        // carries an error worth keeping: clearing it would hide the
+                        // reason and take the per-question retry button with it.
+                        entry.answer.isBlank() && entry.error != null -> entry
                         entry.answer.isBlank() -> entry.copy(
                             state = ChallengeState.PENDING,
                             parsedNumbers = 0,
@@ -509,7 +528,7 @@ class FingerprintViewModel(
     }
 
     private suspend fun suppliers(): List<com.relaytester.app.core.model.SupplierProfile> =
-        withContext(Dispatchers.IO) { supplierStore.read().suppliers }.also { knownSuppliers = it }
+        withContext(ioDispatcher) { supplierStore.read().suppliers }.also { knownSuppliers = it }
 
     private fun showMessage(message: String, isError: Boolean) {
         _uiState.update { it.copy(message = message, isMessageError = isError) }
