@@ -21,6 +21,7 @@ import java.io.File
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
@@ -90,6 +91,10 @@ class FingerprintViewModelTest {
     private fun apiViewModel(
         api: RelayApi,
         store: SupplierStore = SingleSupplierStore(testSupplier()),
+        /** False runs the real startup read, for the tests that watch it complete. */
+        skipRestore: Boolean = true,
+        /** The main test dispatcher keeps a startup read deterministic; IO would not. */
+        ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     ): FingerprintViewModel = FingerprintViewModel(
         supplierStore = store,
         secretStore = object : SecretStore {
@@ -99,7 +104,8 @@ class FingerprintViewModelTest {
         },
         relayApiFactory = { api },
         bankFactory = { bank() },
-        skipRestore = true,
+        skipRestore = skipRestore,
+        ioDispatcher = ioDispatcher,
     )
 
     /** A round ready to dispatch: supplier chosen, models ticked, challenges seeded. */
@@ -118,8 +124,27 @@ class FingerprintViewModelTest {
         updateParallel(parallel)
     }
 
-    /** Waits for the batch list to leave its interim states, or fails on a stall. */
-    private fun awaitBatchSettled(subject: FingerprintViewModel) {
+    /**
+     * A ready round whose supplier came from a real startup read.
+     *
+     * The store tests need a view model that is actually holding state, so they cannot
+     * use `skipRestore`; the test dispatcher keeps that read on this thread.
+     */
+    private fun readyApiViewModelFor(
+        store: SupplierStore,
+        api: RelayApi,
+        models: List<String> = listOf("test-model"),
+    ): FingerprintViewModel = apiViewModel(
+        api = api,
+        store = store,
+        skipRestore = false,
+        ioDispatcher = mainDispatcher,
+    ).apply {
+        models.forEach { toggleModelSelection(it) }
+        selectMode(DetectionMode.API)
+    }
+
+    /** Waits for the batch list to leave its interim states, or fails on a stall. */    private fun awaitBatchSettled(subject: FingerprintViewModel) {
         runBlocking {
             withTimeout(BATCH_SETTLE_TIMEOUT_MS) {
                 while (subject.uiState.value.batchResults.any {
@@ -601,6 +626,165 @@ class FingerprintViewModelTest {
         assertEquals(listOf("other-model"), state.models)
         assertEquals("换了供应商，旧目录的勾选必须让位", emptyList<String>(), state.selectedModels)
     }
+
+    @Test
+    fun `a failed startup read recovers when the panel is re-entered`() {
+        // Without this the panel would sit on its error screen forever: refreshCatalogue
+        // was the only thing that re-read the store, and it left loadError untouched.
+        val store = MutableSupplierStore(listOf(testSupplier(models = listOf("m-one"))))
+        store.failReads = true
+        val subject = apiViewModel(
+            api = FakeCompletionApi(goldenCase().answers),
+            store = store,
+            skipRestore = false,
+            ioDispatcher = mainDispatcher,
+        )
+        runBlocking { subject.awaitIdle() }
+        assertNotNull("启动读取失败必须报出来", subject.uiState.value.loadError)
+
+        store.failReads = false
+        subject.refreshCatalogue()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertNull("重进面板必须能摘掉错误页", state.loadError)
+        assertFalse(state.isLoading)
+        assertEquals(listOf("m-one"), state.models)
+    }
+
+    @Test
+    fun `a refresh that fails leaves a working picker alone`() {
+        // The other half of the same rule: a background refresh must never blank a panel
+        // that is working, or a transient read error costs the user the whole screen.
+        val store = MutableSupplierStore(listOf(testSupplier(models = listOf("m-one"))))
+        val subject = apiViewModel(
+            api = FakeCompletionApi(goldenCase().answers),
+            store = store,
+            skipRestore = false,
+            ioDispatcher = mainDispatcher,
+        )
+        runBlocking { subject.awaitIdle() }
+        assertNull(subject.uiState.value.loadError)
+
+        store.failReads = true
+        subject.refreshCatalogue()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertNull("刷新失败不得把可用面板变成错误页", state.loadError)
+        assertEquals(listOf("m-one"), state.models)
+    }
+
+    @Test
+    fun `a refresh does not race the startup read`() {
+        val store = MutableSupplierStore(listOf(testSupplier(models = listOf("m-one"))))
+        val gate = CompletableDeferred<Unit>()
+        store.gate = gate
+        val subject = apiViewModel(
+            api = FakeCompletionApi(goldenCase().answers),
+            store = store,
+            skipRestore = false,
+            ioDispatcher = mainDispatcher,
+        )
+        assertTrue("启动读取还挂在门上，面板应在加载态", subject.uiState.value.isLoading)
+
+        subject.refreshCatalogue()
+
+        assertEquals("在飞的读取还没落地，刷新不得抢着再读一次", 1, store.reads.get())
+        gate.complete(Unit)
+        runBlocking { subject.awaitIdle() }
+        assertFalse(subject.uiState.value.isLoading)
+        assertEquals(listOf("m-one"), subject.uiState.value.models)
+    }
+
+    @Test
+    fun `a prefill clears a filter that would hide the model`() {
+        val subject = apiViewModel(FakeCompletionApi(goldenCase().answers)).apply {
+            selectSupplier("sup-1")
+        }
+        subject.updateModelFilter("zzz")
+
+        // The tester tab prefills without a supplier id when no supplier is active.
+        subject.prefill(null, "typed-by-hand")
+
+        val state = subject.uiState.value
+        assertEquals(listOf("typed-by-hand"), state.selectedModels)
+        assertEquals("筛选框不能继续挡着刚预填的模型", "", state.modelFilter)
+    }
+
+    @Test
+    fun `a prefill that arrives during the startup read still clears the filter`() {
+        val store = MutableSupplierStore(listOf(testSupplier(models = listOf("m-one"))))
+        val gate = CompletableDeferred<Unit>()
+        store.gate = gate
+        val subject = apiViewModel(
+            api = FakeCompletionApi(goldenCase().answers),
+            store = store,
+            skipRestore = false,
+            ioDispatcher = mainDispatcher,
+        )
+        subject.updateModelFilter("zzz")
+        // The store has not answered yet, so the request is parked instead of dropped.
+        subject.prefill("sup-1", "m-two")
+
+        gate.complete(Unit)
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertEquals(listOf("m-two"), state.selectedModels)
+        assertEquals("预填落地时也要摘掉筛选", "", state.modelFilter)
+    }
+
+    @Test
+    fun `a throwing request fails only its own model and the batch keeps going`() {
+        // An unexpected throw from one challenge used to escape as a sibling
+        // cancellation: the panel stopped silently and the rows stayed on "正在检测…"
+        // for good. It has to stay that challenge's failure, with the reason on screen.
+        val subject = readyApiViewModel(
+            ThrowingCompletionApi(IllegalStateException("参考库不可读")),
+            models = listOf("m-one", "m-two"),
+        )
+
+        subject.runApiDetection()
+        // Joins the round itself: polling batchResults would return before the rows
+        // exist, because they are only created once the credential load has finished.
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertFalse("异常后不能停在运行中", state.isRunning)
+        assertNull(state.activeModel)
+        assertEquals(
+            "两行都要有结论，第二行证明批次没有被打断",
+            listOf(ModelDetectionStatus.FAILED, ModelDetectionStatus.FAILED),
+            state.batchResults.map { it.status },
+        )
+        assertEquals("参考库不可读", state.batchResults.first().error)
+        // The reason also lands on the challenge cards, which is where the user looks
+        // for a per-question explanation, and no snackbar repeats it.
+        assertTrue(state.progress.all { it.state == ChallengeState.REJECTED })
+        assertEquals("参考库不可读", state.progress.first().error)
+    }
+
+    @Test
+    fun `an unexpected failure before the first request releases the panel`() {
+        // The other reachable throw: the store read that resolves the supplier. It sits
+        // before the loop, so only the last-resort net can keep it from escaping the
+        // view model scope and taking the app down.
+        val store = MutableSupplierStore(listOf(testSupplier()))
+        val subject = readyApiViewModelFor(store, FakeCompletionApi(goldenCase().answers))
+        runBlocking { subject.awaitIdle() }
+        // refreshCatalogue is what re-reads the store here; make that read fail.
+        store.failReads = true
+
+        subject.runApiDetection()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertFalse("异常后不能停在运行中", state.isRunning)
+        assertNull(state.activeModel)
+        assertTrue("必须把原因告诉用户", state.isMessageError)
+        assertEquals("配置读取失败", state.message)
+    }
 }
 
 private class EmptyStore : SupplierStore(null) {
@@ -620,7 +804,21 @@ private class SingleSupplierStore(
 private class MutableSupplierStore(
     var suppliers: List<SupplierProfile>,
 ) : SupplierStore(null) {
-    override suspend fun read() = SupplierStoreState(suppliers, suppliers.firstOrNull()?.id)
+    /** Makes every read fail, the way an unreadable DataStore file would. */
+    var failReads = false
+
+    /** Parks a read inside the store until the test releases it. */
+    var gate: CompletableDeferred<Unit>? = null
+
+    val reads = AtomicInteger(0)
+
+    override suspend fun read(): SupplierStoreState {
+        reads.incrementAndGet()
+        gate?.await()
+        if (failReads) error("配置读取失败")
+        return SupplierStoreState(suppliers, suppliers.firstOrNull()?.id)
+    }
+
     override suspend fun save(state: SupplierStoreState) = Unit
 }
 
@@ -721,6 +919,21 @@ private class GatedCompletionApi(
         }
         return ApiResult.Success(answers[0])
     }
+}
+
+/**
+ * Fails the way a corrupt asset or a scoring bug would: by throwing instead of
+ * returning a failure, which is the case the batch loop has to contain.
+ */
+private class ThrowingCompletionApi(private val boom: Throwable) : RelayApi() {
+    override suspend fun completeText(
+        profile: SupplierProfile,
+        apiKey: String,
+        model: String,
+        prompt: String,
+        maxTokens: Int,
+        timeoutSeconds: Int,
+    ): ApiResult<String> = throw boom
 }
 
 /** Generous ceiling: only a genuinely stuck batch may hit it. */

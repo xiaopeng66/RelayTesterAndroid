@@ -2,8 +2,8 @@
 
 Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询工具，面向经常使用中转站 / API 代理服务的用户。它不依赖外部服务器，直接从手机向用户配置的 API 站点发起请求，支持模型可用性验证、批量测试、余额查询、模型指纹检测与配置迁移。
 
-- 当前版本：1.4.2
-- 下载地址：[GitHub Release v1.4.2](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.4.2)
+- 当前版本：1.4.0
+- 下载地址：[GitHub Release v1.4.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.4.0)
 - APK 大小：约 3.05 MB
 - 支持系统：Android 8.0 及以上
 
@@ -113,15 +113,15 @@ Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询�
 
 ## 发行版本
 
-- [v1.4.2 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.4.2)
-- [v1.4.2 发行说明](RELEASE_NOTES_1.4.2.md)
-- APK：`RelayTester-v1.4.2-android.apk`
-- SHA-256：`d1039311d4c13c67957b143d863a87e4b5ae424957ccc3ada7903e853a65b6c5`
+- [v1.4.0 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.4.0)
+- [v1.4.0 发行说明](RELEASE_NOTES_1.4.0.md)
+- APK：`RelayTester-v1.4.0-android.apk`
+- SHA-256：`7675b19c266880c08a2f9e959939a9b9914387b21f14cfa2958f3a9865c7e49a`
 
 历史版本：
 
-- [v1.4.1 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.4.1) · [发行说明](RELEASE_NOTES_1.4.1.md)
-- [v1.4.0 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.4.0) · [发行说明](RELEASE_NOTES_1.4.0.md)
 - [v1.3.0 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.3.0) · [发行说明](RELEASE_NOTES_1.3.0.md)
+- [v1.2.0 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.2.0) · [发行说明](RELEASE_NOTES_1.2.0.md)
+- [v1.1.0 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.1.0) · [发行说明](RELEASE_NOTES_1.1.0.md)
 
 若有新功能需求或问题反馈，请提交 Issue，或直接在本仓库中继续开发。
