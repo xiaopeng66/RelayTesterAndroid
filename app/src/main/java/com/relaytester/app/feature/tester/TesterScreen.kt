@@ -35,6 +35,7 @@ import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.DropdownMenu
@@ -1812,6 +1813,7 @@ private fun ResultFilters(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ResultItem(
     result: ModelTestResult,
@@ -1865,8 +1867,9 @@ private fun ResultItem(
                 modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
+                // 第 1 行：状态点、模型名（占满剩余宽度，长名字因此少被截断）、状态胶囊。
                 Row(
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Box(
@@ -1882,14 +1885,88 @@ private fun ResultItem(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
+                    ResultStatusChip(result.status, isFetchedOnly)
+                }
+                // 第 2 行：指标/成因胶囊在左，操作图标在右。旧版把两个图标塞在名称行，
+                // 名称可用宽度被吃掉约 96dp；FlowRow 让大字号下胶囊换行而不是被裁掉。
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    FlowRow(
+                        modifier = Modifier.weight(1f),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        when (result.status) {
+                            TestStatus.SUCCESS -> {
+                                // 一个指标一种颜色，全 app 同一套：延迟青、token 蓝、
+                                // 结论绿/红；胶囊底色是同色 12%，不靠颜色也能读文字。
+                                result.latencyMs?.let {
+                                    ResultMetricChip(it.toString() + " ms", MaterialTheme.colorScheme.tertiary)
+                                }
+                                result.finishReason?.let { reason ->
+                                    val label = finishReasonLabel(reason)
+                                    val color = when (label) {
+                                        "正常" -> Color(0xFF15803D)
+                                        "长度截断" -> MaterialTheme.colorScheme.error
+                                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                    }
+                                    ResultMetricChip(label, color)
+                                }
+                                val tokenTotal = result.usage?.resolvedTotal?.takeIf { it > 0 }
+                                tokenTotal?.let {
+                                    ResultMetricChip(it.toString() + " tok", MaterialTheme.colorScheme.primary)
+                                }
+                                if (result.latencyMs == null && result.finishReason == null && tokenTotal == null) {
+                                    ResultMetricChip("请求成功", Color(0xFF15803D))
+                                }
+                            }
+
+                            TestStatus.FAILED -> {
+                                result.httpStatus?.let {
+                                    ResultMetricChip("HTTP $it", MaterialTheme.colorScheme.error)
+                                }
+                                ResultMetricChip(
+                                    result.error?.kind?.label ?: "请求失败",
+                                    MaterialTheme.colorScheme.error,
+                                )
+                            }
+
+                            TestStatus.PENDING -> {
+                                // 状态词由名称行的胶囊承载；这里补一句进度说明，从未跑过的行
+                                // 换成更具体的提示。一句话都不放会让第二行只剩右侧图标。
+                                Text(
+                                    if (isFetchedOnly) "开始测试后显示延迟与用量" else "等待测试…",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    softWrap = false,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                    }
                     if (onCopyName != null) {
-                        IconButton(
-                            onClick = { onCopyName(result.model) },
-                        ) {
+                        IconButton(onClick = { onCopyName(result.model) }) {
                             Icon(
                                 Icons.Outlined.ContentCopy,
                                 contentDescription = "复制模型名 ${result.model}",
                                 modifier = Modifier.size(16.dp),
+                            )
+                        }
+                    }
+                    if (canExpandFailure) {
+                        TextButton(
+                            onClick = { expanded = !expanded },
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                            modifier = Modifier.height(40.dp),
+                        ) {
+                            Text(
+                                if (expanded) "收起" else "详情",
+                                style = MaterialTheme.typography.labelMedium,
+                                maxLines = 1,
+                                softWrap = false,
                             )
                         }
                     }
@@ -1906,141 +1983,15 @@ private fun ResultItem(
                         }
                     }
                 }
-                when (result.status) {
-                    TestStatus.SUCCESS -> {
-                        // One color per metric family, shared with the summary strip and
-                        // the balance screen: latency teal, tokens blue, verdict green or
-                        // red. Neutral separators keep the values readable as one line.
-                        val metrics = buildList {
-                            result.latencyMs?.let {
-                                add(it.toString() + " ms" to MaterialTheme.colorScheme.tertiary)
-                            }
-                            result.finishReason?.let { reason ->
-                                val label = finishReasonLabel(reason)
-                                val color = when (label) {
-                                    "正常" -> Color(0xFF15803D)
-                                    "长度截断" -> MaterialTheme.colorScheme.error
-                                    else -> MaterialTheme.colorScheme.onSurfaceVariant
-                                }
-                                add(label to color)
-                            }
-                            result.usage?.resolvedTotal?.takeIf { it > 0 }?.let {
-                                add(it.toString() + " tok" to MaterialTheme.colorScheme.primary)
-                            }
-                        }
-                        Text(
-                            text = buildAnnotatedString {
-                                if (metrics.isEmpty()) {
-                                    pushStyle(SpanStyle(color = Color(0xFF15803D)))
-                                    append("请求成功")
-                                    pop()
-                                } else {
-                                    metrics.forEachIndexed { index, (value, color) ->
-                                        if (index > 0) {
-                                            pushStyle(SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant))
-                                            append("  ·  ")
-                                            pop()
-                                        }
-                                        pushStyle(SpanStyle(color = color))
-                                        append(value)
-                                        pop()
-                                    }
-                                }
-                            },
-                            modifier = Modifier.padding(start = 12.dp),
-                            style = MaterialTheme.typography.bodySmall,
-                            maxLines = 1,
-                            softWrap = false,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-
-                    TestStatus.FAILED -> {
-                        Text(
-                            listOfNotNull(failureSummary(result), failureDetail).joinToString(" · "),
-                            modifier = Modifier.padding(start = 12.dp),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.error,
-                            maxLines = if (expanded) Int.MAX_VALUE else 1,
-                            softWrap = expanded,
-                            overflow = if (expanded) TextOverflow.Clip else TextOverflow.Ellipsis,
-                        )
-                    }
-
-                    TestStatus.PENDING -> {
-                        Text(
-                            if (isFetchedOnly) "已获取，尚未开始测试" else "等待测试…",
-                            modifier = Modifier.padding(start = 12.dp),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            softWrap = false,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                }
-            }
-            if (isFetchedOnly) {
-                Box(
-                    modifier = Modifier
-                        .width(60.dp)
-                        .height(56.dp),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    TextButton(
-                        onClick = {},
-                        enabled = false,
-                        contentPadding = PaddingValues(horizontal = 4.dp),
-                        modifier = Modifier.width(56.dp).height(40.dp),
-                    ) {
-                        Text(
-                            "待测",
-                            style = MaterialTheme.typography.labelMedium,
-                            maxLines = 1,
-                            softWrap = false,
-                        )
-                    }
-                }
-            } else if (result.status == TestStatus.FAILED) {
-                Column(
-                    modifier = Modifier.width(60.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    Box(
-                        modifier = Modifier.height(36.dp),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        StatusLabel(result.status)
-                    }
-                    Box(
-                        modifier = Modifier.height(16.dp),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        if (canExpandFailure) {
-                            TextButton(
-                                onClick = { expanded = !expanded },
-                                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
-                                modifier = Modifier.width(56.dp).height(28.dp),
-                            ) {
-                                Text(
-                                    if (expanded) "收起" else "详情",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    maxLines = 1,
-                                    softWrap = false,
-                                )
-                            }
-                        }
-                    }
-                }
-            } else {
-                Box(
-                    modifier = Modifier
-                        .width(60.dp)
-                        .height(56.dp),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    StatusLabel(result.status)
+                if (result.status == TestStatus.FAILED && failureDetail != null) {
+                    Text(
+                        failureDetail,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        maxLines = if (expanded) Int.MAX_VALUE else 1,
+                        softWrap = expanded,
+                        overflow = if (expanded) TextOverflow.Clip else TextOverflow.Ellipsis,
+                    )
                 }
             }
         }
@@ -2253,23 +2204,59 @@ private fun SummaryMetric(
     }
 }
 
+/** 指标胶囊：圆角配方 + 同色 12% 底色，等宽数字让各行的 ms / tok 对齐。 */
 @Composable
-private fun StatusLabel(status: TestStatus, isFetchedOnly: Boolean = false) {
+private fun ResultMetricChip(text: String, color: Color) {
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(color.copy(alpha = 0.12f))
+            .padding(horizontal = 6.dp, vertical = 3.dp),
+    ) {
+        Text(
+            text,
+            style = MaterialTheme.typography.labelSmall,
+            color = color,
+            maxLines = 1,
+            softWrap = false,
+        )
+    }
+}
+
+/** 状态胶囊：全圆角，把「可用 / 失败 / 待测 / 等待中」放在名称行右端。 */
+@Composable
+private fun ResultStatusChip(status: TestStatus, isFetchedOnly: Boolean = false) {
     val label = when (status) {
         TestStatus.SUCCESS -> "可用"
         TestStatus.FAILED -> "失败"
         // PENDING covers both "queued behind other models" and "this row's request is in
-        // flight", so "进行中" here contradicted the body text ("等待测试…") on the same
-        // row. The row itself is what says it is running; the badge only says it is not
-        // finished yet.
+        // flight", so "进行中" here contradicted the body text on the same row. The row
+        // itself is what says it is running; the badge only says it is not finished yet.
         TestStatus.PENDING -> if (isFetchedOnly) "待测" else "等待中"
     }
     val color = when (status) {
         TestStatus.SUCCESS -> Color(0xFF15803D)
         TestStatus.FAILED -> MaterialTheme.colorScheme.error
-        TestStatus.PENDING -> MaterialTheme.colorScheme.tertiary
+        TestStatus.PENDING -> if (isFetchedOnly) {
+            MaterialTheme.colorScheme.onSurfaceVariant
+        } else {
+            MaterialTheme.colorScheme.tertiary
+        }
     }
-    Text(label, style = MaterialTheme.typography.labelMedium, color = color)
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(percent = 50))
+            .background(color.copy(alpha = 0.12f))
+            .padding(horizontal = 8.dp, vertical = 3.dp),
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelSmall,
+            color = color,
+            maxLines = 1,
+            softWrap = false,
+        )
+    }
 }
 
 private fun failureSummary(result: ModelTestResult): String {
