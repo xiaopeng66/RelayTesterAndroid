@@ -26,6 +26,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -94,6 +95,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
@@ -110,6 +112,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.window.Dialog
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -1640,6 +1643,9 @@ private fun LazyListScope.resultSection(
                 modifier = Modifier.weight(1f),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Ellipsis,
             )
             TextButton(
                 onClick = { onSelectAll(visibleModels) },
@@ -1774,7 +1780,11 @@ private fun ResultFilters(
     onQueryChange: (String) -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        // 大字号下三枚筛选 Chip 与排序按钮挤在一行里会各自折行（2× 时「按延迟」被拆成
+        // 两行并顶破卡片）。超过阈值就让排序按钮整块落到第二行、右对齐，按钮文字本身
+        // 在任何字号下都不换行。
+        val stackSortButton = LocalDensity.current.fontScale >= 1.5f
+        val filterChips: @Composable () -> Unit = {
             FilterChip(
                 selected = state.filter == ResultFilter.ALL,
                 onClick = { onFilterChange(ResultFilter.ALL) },
@@ -1790,7 +1800,8 @@ private fun ResultFilters(
                 onClick = { onFilterChange(ResultFilter.FAILED) },
                 label = { Text("失败") },
             )
-            Spacer(Modifier.weight(1f))
+        }
+        val sortButton: @Composable () -> Unit = {
             OutlinedButton(
                 onClick = {
                     onSortChange(
@@ -1798,7 +1809,24 @@ private fun ResultFilters(
                     )
                 },
             ) {
-                Text(if (state.sort == ResultSort.LATENCY) "按延迟" else "按名称")
+                Text(
+                    if (state.sort == ResultSort.LATENCY) "按延迟" else "按名称",
+                    maxLines = 1,
+                    softWrap = false,
+                )
+            }
+        }
+        if (stackSortButton) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { filterChips() }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+            ) { sortButton() }
+        } else {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                filterChips()
+                Spacer(Modifier.weight(1f))
+                sortButton()
             }
         }
         AppTextField(
@@ -1813,7 +1841,6 @@ private fun ResultFilters(
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ResultItem(
     result: ModelTestResult,
@@ -1840,159 +1867,172 @@ private fun ResultItem(
         }
     val canExpandFailure = !isFetchedOnly && result.status == TestStatus.FAILED && failureDetail != null
     OutlinedCard {
-        Row(
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(min = 64.dp)
                 .padding(horizontal = 6.dp, vertical = 6.dp),
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
-            verticalAlignment = Alignment.CenterVertically,
+            verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            if (selectable) {
-                Box(
-                    modifier = Modifier.width(40.dp).height(56.dp),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Checkbox(
-                        checked = selected,
-                        onCheckedChange = { onToggle() },
-                        enabled = enabled,
-                        modifier = Modifier
-                            .size(46.dp)
-                            .graphicsLayer(scaleX = 0.7f, scaleY = 0.7f),
-                    )
-                }
-            }
-            Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
+            // 第 1 行：勾选框 · 状态点 · 模型名（占满剩余宽度）· 状态胶囊。勾选框放在行内
+            // 而不是另起一列：它因此与名称、胶囊永远在同一条中线上，也不会像旧版那样按
+            // 整张卡片的高度居中、被失败行下面那行详情文本推下去。
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 32.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                // 第 1 行：状态点、模型名（占满剩余宽度，长名字因此少被截断）、状态胶囊。
+                if (selectable) {
+                    Box(
+                        modifier = Modifier.size(32.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Checkbox(
+                            checked = selected,
+                            onCheckedChange = { onToggle() },
+                            enabled = enabled,
+                            modifier = Modifier
+                                .size(46.dp)
+                                .graphicsLayer(scaleX = 0.7f, scaleY = 0.7f),
+                        )
+                    }
+                }
+                Box(
+                    modifier = Modifier
+                        .size(8.dp)
+                        .clip(MaterialTheme.shapes.extraSmall)
+                        .background(statusColor),
+                )
+                Text(
+                    result.model,
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.titleSmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                ResultStatusChip(result.status, isFetchedOnly)
+            }
+            // 第 2 行：指标胶囊（永远单行）在左，固定宽度的动作轨在右。旧版这里是 FlowRow
+            // 与图标混排：空间不够就换行，后面那个图标还会把复制按钮顶得左右乱跳。
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
                 Row(
+                    modifier = Modifier
+                        .weight(1f)
+                        // 与第 1 行的状态点左对齐（勾选框 32dp + 间距 6dp）；没有勾选框时
+                        // 不需要缩进，胶囊就从卡片内边距开始。
+                        .padding(start = if (selectable) 38.dp else 0.dp),
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Box(
-                        modifier = Modifier
-                            .size(8.dp)
-                            .clip(MaterialTheme.shapes.extraSmall)
-                            .background(statusColor),
-                    )
-                    Text(
-                        result.model,
-                        modifier = Modifier.weight(1f),
-                        style = MaterialTheme.typography.titleSmall,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    ResultStatusChip(result.status, isFetchedOnly)
-                }
-                // 第 2 行：指标/成因胶囊在左，操作图标在右。旧版把两个图标塞在名称行，
-                // 名称可用宽度被吃掉约 96dp；FlowRow 让大字号下胶囊换行而不是被裁掉。
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    FlowRow(
-                        modifier = Modifier.weight(1f),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        when (result.status) {
-                            TestStatus.SUCCESS -> {
-                                // 一个指标一种颜色，全 app 同一套：延迟青、token 蓝、
-                                // 结论绿/红；胶囊底色是同色 12%，不靠颜色也能读文字。
-                                result.latencyMs?.let {
-                                    ResultMetricChip(it.toString() + " ms", MaterialTheme.colorScheme.tertiary)
-                                }
-                                result.finishReason?.let { reason ->
-                                    val label = finishReasonLabel(reason)
-                                    val color = when (label) {
-                                        "正常" -> Color(0xFF15803D)
-                                        "长度截断" -> MaterialTheme.colorScheme.error
-                                        else -> MaterialTheme.colorScheme.onSurfaceVariant
-                                    }
-                                    ResultMetricChip(label, color)
-                                }
-                                val tokenTotal = result.usage?.resolvedTotal?.takeIf { it > 0 }
-                                tokenTotal?.let {
-                                    ResultMetricChip(it.toString() + " tok", MaterialTheme.colorScheme.primary)
-                                }
-                                if (result.latencyMs == null && result.finishReason == null && tokenTotal == null) {
-                                    ResultMetricChip("请求成功", Color(0xFF15803D))
-                                }
+                    when (result.status) {
+                        TestStatus.SUCCESS -> {
+                            // 一个指标一种颜色，全 app 同一套：延迟青、token 蓝、
+                            // 结论绿/红；胶囊底色是同色 12%，不靠颜色也能读文字。
+                            result.latencyMs?.let {
+                                ResultMetricChip(it.toString() + " ms", MaterialTheme.colorScheme.tertiary)
                             }
-
-                            TestStatus.FAILED -> {
-                                result.httpStatus?.let {
-                                    ResultMetricChip("HTTP $it", MaterialTheme.colorScheme.error)
+                            result.finishReason?.let { reason ->
+                                val label = finishReasonLabel(reason)
+                                val color = when (label) {
+                                    "正常" -> Color(0xFF15803D)
+                                    "长度截断" -> MaterialTheme.colorScheme.error
+                                    else -> MaterialTheme.colorScheme.onSurfaceVariant
                                 }
-                                ResultMetricChip(
-                                    result.error?.kind?.label ?: "请求失败",
-                                    MaterialTheme.colorScheme.error,
-                                )
+                                // 唯一可压缩的一枚：宽度不够时它省略，延迟与 token 保持完整。
+                                ResultMetricChip(label, color, Modifier.weight(1f, fill = false))
                             }
-
-                            TestStatus.PENDING -> {
-                                // 状态词由名称行的胶囊承载；这里补一句进度说明，从未跑过的行
-                                // 换成更具体的提示。一句话都不放会让第二行只剩右侧图标。
-                                Text(
-                                    if (isFetchedOnly) "开始测试后显示延迟与用量" else "等待测试…",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    maxLines = 1,
-                                    softWrap = false,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
+                            val tokenTotal = result.usage?.resolvedTotal?.takeIf { it > 0 }
+                            tokenTotal?.let {
+                                ResultMetricChip(it.toString() + " tok", MaterialTheme.colorScheme.primary)
+                            }
+                            if (result.latencyMs == null && result.finishReason == null && tokenTotal == null) {
+                                ResultMetricChip("请求成功", Color(0xFF15803D))
                             }
                         }
-                    }
-                    if (onCopyName != null) {
-                        IconButton(onClick = { onCopyName(result.model) }) {
-                            Icon(
-                                Icons.Outlined.ContentCopy,
-                                contentDescription = "复制模型名 ${result.model}",
-                                modifier = Modifier.size(16.dp),
+                        TestStatus.FAILED -> {
+                            result.httpStatus?.let {
+                                ResultMetricChip("HTTP $it", MaterialTheme.colorScheme.error)
+                            }
+                            ResultMetricChip(
+                                result.error?.kind?.label ?: "请求失败",
+                                MaterialTheme.colorScheme.error,
+                                Modifier.weight(1f, fill = false),
                             )
                         }
-                    }
-                    if (canExpandFailure) {
-                        TextButton(
-                            onClick = { expanded = !expanded },
-                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
-                            modifier = Modifier.height(40.dp),
-                        ) {
+                        TestStatus.PENDING -> {
+                            // 状态词由名称行的胶囊承载；这里补一句进度说明，从未跑过的行
+                            // 换成更具体的提示。一句话都不放会让第二行只剩右侧图标。
                             Text(
-                                if (expanded) "收起" else "详情",
-                                style = MaterialTheme.typography.labelMedium,
+                                if (isFetchedOnly) "开始测试后显示延迟与用量" else "等待测试…",
+                                modifier = Modifier.weight(1f, fill = false),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1,
                                 softWrap = false,
-                            )
-                        }
-                    }
-                    if (onFingerprint != null && result.status == TestStatus.SUCCESS) {
-                        IconButton(
-                            onClick = { onFingerprint(result.model) },
-                            enabled = enabled,
-                        ) {
-                            Icon(
-                                Icons.Outlined.Fingerprint,
-                                contentDescription = "检测 ${result.model} 的模型指纹",
-                                modifier = Modifier.size(16.dp),
+                                overflow = TextOverflow.Ellipsis,
                             )
                         }
                     }
                 }
-                if (result.status == TestStatus.FAILED && failureDetail != null) {
-                    Text(
-                        failureDetail,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
-                        maxLines = if (expanded) Int.MAX_VALUE else 1,
-                        softWrap = expanded,
-                        overflow = if (expanded) TextOverflow.Clip else TextOverflow.Ellipsis,
-                    )
+                // 动作轨：两格各 48dp、顺序固定（复制 · 指纹/详情/空），所以复制按钮在成功、
+                // 失败、待测行里停在同一 x，不再随第二枚图标的有无左右跳。图标只把本体各
+                // 向内移 6dp 让它们靠拢，触控盒仍是 48dp。
+                if (onCopyName != null) {
+                    IconButton(
+                        onClick = { onCopyName(result.model) },
+                        modifier = Modifier.size(48.dp),
+                    ) {
+                        Icon(
+                            Icons.Outlined.ContentCopy,
+                            contentDescription = "复制模型名 ${result.model}",
+                            modifier = Modifier.size(16.dp).offset(x = 6.dp),
+                        )
+                    }
+                } else {
+                    Spacer(Modifier.size(48.dp))
                 }
+                when {
+                    canExpandFailure -> Box(
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clickable(enabled = enabled, role = Role.Button) { expanded = !expanded },
+                        contentAlignment = Alignment.CenterEnd,
+                    ) {
+                        Text(
+                            if (expanded) "收起" else "详情",
+                            style = MaterialTheme.typography.labelMedium,
+                            maxLines = 1,
+                            softWrap = false,
+                        )
+                    }
+                    onFingerprint != null && result.status == TestStatus.SUCCESS -> IconButton(
+                        onClick = { onFingerprint(result.model) },
+                        enabled = enabled,
+                        modifier = Modifier.size(48.dp),
+                    ) {
+                        Icon(
+                            Icons.Outlined.Fingerprint,
+                            contentDescription = "检测 ${result.model} 的模型指纹",
+                            modifier = Modifier.size(16.dp).offset(x = (-6).dp),
+                        )
+                    }
+                    else -> Spacer(Modifier.size(48.dp))
+                }
+            }
+            if (result.status == TestStatus.FAILED && failureDetail != null) {
+                Text(
+                    failureDetail,
+                    modifier = Modifier.padding(start = if (selectable) 38.dp else 0.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    maxLines = if (expanded) Int.MAX_VALUE else 1,
+                    softWrap = expanded,
+                    overflow = if (expanded) TextOverflow.Clip else TextOverflow.Ellipsis,
+                )
             }
         }
     }
@@ -2204,21 +2244,30 @@ private fun SummaryMetric(
     }
 }
 
-/** 指标胶囊：圆角配方 + 同色 12% 底色，等宽数字让各行的 ms / tok 对齐。 */
+/**
+ * 指标胶囊：圆角配方 + 同色 12% 底色，等宽数字让各行的 ms / tok 对齐。
+ *
+ * 高度取 18.sp 换算成的 dp（随字号缩放），而不是纵向 padding：CJK（「长度截断」）与
+ * 数字（「25 tok」）的行盒天生不一样高，几枚胶囊并排就会上下参差；固定高度 + 垂直
+ * 居中让它们逐像素等高，字号放大后也等高。
+ */
 @Composable
-private fun ResultMetricChip(text: String, color: Color) {
+private fun ResultMetricChip(text: String, color: Color, modifier: Modifier = Modifier) {
     Box(
-        modifier = Modifier
+        modifier = modifier
+            .height(with(LocalDensity.current) { 18.sp.toDp() })
             .clip(RoundedCornerShape(6.dp))
             .background(color.copy(alpha = 0.12f))
-            .padding(horizontal = 6.dp, vertical = 3.dp),
+            .padding(horizontal = 6.dp),
+        contentAlignment = Alignment.Center,
     ) {
         Text(
             text,
-            style = MaterialTheme.typography.labelSmall,
+            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
             color = color,
             maxLines = 1,
             softWrap = false,
+            overflow = TextOverflow.Ellipsis,
         )
     }
 }
@@ -2244,10 +2293,13 @@ private fun ResultStatusChip(status: TestStatus, isFetchedOnly: Boolean = false)
         }
     }
     Box(
+        // 与指标胶囊同高，名称行的高度因此不随状态词长短变化。
         modifier = Modifier
+            .height(with(LocalDensity.current) { 18.sp.toDp() })
             .clip(RoundedCornerShape(percent = 50))
             .background(color.copy(alpha = 0.12f))
-            .padding(horizontal = 8.dp, vertical = 3.dp),
+            .padding(horizontal = 8.dp),
+        contentAlignment = Alignment.Center,
     ) {
         Text(
             label,
@@ -2279,6 +2331,14 @@ private fun protocolShortLabel(protocol: RelayProtocol): String = when (protocol
 private fun finishReasonLabel(value: String): String = when (value) {
     "stop", "end_turn", "stop_sequence", "completed" -> "正常"
     "length", "max_tokens" -> "长度截断"
+    // 上游各家自造的收尾词：同一含义在不同中转站叫法不一，长短不齐的原文（如
+    // "incomplete"）会把胶囊撑成长条、把这一行挤到换行，常见几档统一成短标签。
+    "incomplete" -> "未完成"
+    "content_filter" -> "内容过滤"
+    "tool_calls", "tool_use", "function_call" -> "工具调用"
+    "refusal" -> "被拒绝"
+    "canceled", "cancelled" -> "已取消"
+    // 其余照旧展示原文；胶囊是这一行里唯一可压缩的一枚，超长时省略而不是换行。
     else -> value
 }
 
