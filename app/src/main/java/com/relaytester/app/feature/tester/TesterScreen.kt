@@ -1,7 +1,5 @@
 package com.relaytester.app.feature.tester
 
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -88,6 +86,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -129,7 +128,9 @@ import com.relaytester.app.core.model.matchesAnyModelFilterTerm
 import com.relaytester.app.core.model.mergeModelFilterTerms
 import com.relaytester.app.core.network.RelayBaseUrl
 import com.relaytester.app.ui.navigation.AppDestination
+import com.relaytester.app.ui.components.QuietIconButton
 import com.relaytester.app.ui.components.RelayAppHeader
+import com.relaytester.app.ui.components.copyToClipboard
 import java.io.OutputStreamWriter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -137,6 +138,31 @@ import kotlinx.coroutines.withContext
 
 /** Mirrors the quick prompts provided by the initial relay-tester web source. */
 private val TEST_PROMPT_PRESETS = listOf("ping", "Hi", "Say OK", "1+1=?", "回复ok")
+
+/**
+ * Keeps the model editor's in-progress source list across a configuration change.
+ *
+ * The editor's other fields are `rememberSaveable`; this one was plain `remember`, so a
+ * rotation reopened the editor with its title and name restored and its sources empty —
+ * and saving then replaced the entry's stored sources with the few that had been re-added.
+ * A source is two strings, so it is flattened rather than made `Parcelable`.
+ */
+private val modelSourcesSaver = listSaver<List<ModelSource>, String>(
+    save = { sources -> sources.map { "${it.supplierId}\u0000${it.modelId}" } },
+    restore = { flat ->
+        flat.mapNotNull { entry ->
+            val split = entry.indexOf('\u0000')
+            if (split <= 0) {
+                null
+            } else {
+                ModelSource(
+                    supplierId = entry.substring(0, split),
+                    modelId = entry.substring(split + 1),
+                )
+            }
+        }
+    },
+)
 
 private data class FilteredModelsState(
     val values: List<String>,
@@ -341,7 +367,7 @@ fun TesterScreen(
             AlertDialog(
                 onDismissRequest = { supplierToDeleteId = null },
                 title = { Text("删除供应商？") },
-                text = { Text("“${supplier.name}”及其模型、余额配置将被删除。此操作无法撤销。") },
+                text = { Text("删除「${supplier.name}」及其模型、余额配置，无法撤销。") },
                 confirmButton = {
                     TextButton(
                         onClick = {
@@ -546,7 +572,7 @@ private fun ModelFetchFailureCard(failures: List<ModelFetchFailure>) {
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             Text(
-                "批量拉取模型失败 ${failures.size} 个供应商",
+                "批量拉取失败：${failures.size} 个供应商",
                 style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
                 color = MaterialTheme.colorScheme.onErrorContainer,
             )
@@ -796,7 +822,7 @@ private fun SupplierSelector(
             }
         }
         Text(
-            "点击切换供应商，双击重新拉取模型；右上角图标编辑供应商配置。",
+            "点按切换供应商，双击重拉模型；右上角图标可编辑。",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -969,7 +995,7 @@ private fun SupplierConfigurationForm(
             // Cleartext is opt-in, so the warning only appears once the user has
             // actually typed the http:// prefix.
             Text(
-                "该地址使用明文 HTTP，API Key 与请求内容不加密传输，仅建议用于本机或内网自建站点。",
+                "明文 HTTP：密钥与内容不加密，仅限本机/内网。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error,
             )
@@ -1027,7 +1053,7 @@ private fun SupplierConfigurationForm(
             },
         )
         Text(
-            "密钥由 Android Keystore 加密保存。测试结果 JSON 不含密钥；加密配置备份会包含密钥。",
+            "密钥存于 Keystore；加密备份含密钥。",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -1085,7 +1111,7 @@ private fun PullOnlyModeRow(
                 enabled = enabled,
             )
             Text(
-                "禁止测试（仅拉取模型、不发测试请求；不想被探测的站点请勾选）",
+                "禁止测试：只拉模型，不发测试请求。",
                 style = MaterialTheme.typography.labelLarge,
                 modifier = Modifier.weight(1f),
                 maxLines = 1,
@@ -1362,7 +1388,7 @@ private fun TestSettingsCard(
                     enabled = enabled,
                 )
                 Text(
-                    "默认只重试网络、超时、429 和 5xx；认证、余额或模型不存在错误不会重复请求。",
+                    "只重试网络、超时、429 与 5xx。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -1587,7 +1613,7 @@ private fun LazyListScope.fetchedModelsSection(
                 ) { Text("取消全选") }
             }
             Text(
-                "开始测试后将在同一列表中显示延迟、用量和错误详情。",
+                "结果会显示在同一列表里。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -2023,7 +2049,7 @@ private fun ResultItem(
                 // 移 4dp 让它与末格靠拢，格子本身不变。末格只有**宽度**随标签放大，高度
                 // 恒为 RESULT_ACTION_SLOT，否则这一行会被末格撑高。
                 if (onCopyName != null) {
-                    IconButton(
+                    QuietIconButton(
                         onClick = { onCopyName(result.model) },
                         modifier = Modifier.size(RESULT_ACTION_SLOT),
                     ) {
@@ -2181,7 +2207,7 @@ private fun SecurityNote() {
             tint = MaterialTheme.colorScheme.tertiary,
         )
         Text(
-            "默认使用 HTTPS；地址以 http:// 开头时按明文请求。测试结果 JSON 不含密钥；加密配置备份会包含密钥。",
+            "HTTPS 优先；http:// 为明文。",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -2409,9 +2435,9 @@ private fun copyNames(context: Context, label: String, values: List<String>) {
         Toast.makeText(context, "没有可复制的" + label, Toast.LENGTH_SHORT).show()
         return
     }
-    val clipboard = context.getSystemService(ClipboardManager::class.java)
-    clipboard.setPrimaryClip(ClipData.newPlainText(label, values.joinToString("\n")))
-    Toast.makeText(context, "已复制 " + values.size + " 个" + label, Toast.LENGTH_SHORT).show()
+    // 单条读「已复制模型名」，多条读「已复制 3 个失败模型」——「1 个」在中文里是多余的。
+    val confirmation = if (values.size == 1) "已复制$label" else "已复制 ${values.size} 个$label"
+    copyToClipboard(context, values.joinToString("\n"), confirmation)
 }
 
 /**
@@ -2440,7 +2466,12 @@ private fun ModelCatalogDialog(
     var entryName by rememberSaveable { mutableStateOf("") }
     var selectedSupplierId by rememberSaveable { mutableStateOf(state.suppliers.firstOrNull()?.id) }
     var selectedModel by rememberSaveable { mutableStateOf("") }
-    var pendingSources by remember { mutableStateOf<List<ModelSource>>(emptyList()) }
+    // Saved like the rest of the editor: without this, a rotation restored the title and the
+    // name but emptied the source list, and the next 保存修改 replaced the entry's stored
+    // sources with whatever had been re-added — silently dropping the rest.
+    var pendingSources by rememberSaveable(stateSaver = modelSourcesSaver) {
+        mutableStateOf<List<ModelSource>>(emptyList())
+    }
     var catalogSearchKeyword by rememberSaveable { mutableStateOf("") }
     var editingSearchKeyword by rememberSaveable { mutableStateOf("") }
     var selectedSearchKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
@@ -2498,7 +2529,7 @@ private fun ModelCatalogDialog(
                         style = MaterialTheme.typography.headlineSmall,
                     )
                     Text(
-                        "为同一模型配置多个供应商来源，并单独检查各来源的连接状态。",
+                        "同一模型可配多个供应商来源，分别检查连接。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -2821,7 +2852,7 @@ private fun ModelCatalogDialog(
                     )
                     if (state.modelCatalog.isEmpty()) {
                         Text(
-                            "尚未配置跨供应商模型。先选择供应商并拉取模型列表，再添加来源。",
+                            "先拉取模型列表，再添加来源。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -2928,7 +2959,7 @@ private fun ModelCatalogDialog(
         AlertDialog(
             onDismissRequest = { sourceToDelete = null },
             title = { Text("移除供应商来源？") },
-            text = { Text("将移除“$supplierName · ${source.modelId}”，但不会影响已保存配置。") },
+            text = { Text("将移除「$supplierName · ${source.modelId}」；已保存配置不受影响。") },
             confirmButton = {
                 TextButton(
                     onClick = {
@@ -2952,7 +2983,7 @@ private fun ModelCatalogDialog(
             AlertDialog(
                 onDismissRequest = { entryToDeleteId = null },
                 title = { Text("删除已配置模型？") },
-                text = { Text("“${entry.name}”及其供应商来源将被删除。此操作无法撤销。") },
+                text = { Text("删除「${entry.name}」及其全部来源，无法撤销。") },
                 confirmButton = {
                     TextButton(
                         onClick = {

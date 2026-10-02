@@ -155,6 +155,13 @@ open class BalanceApi(
         if (template.successExpectedValue != null && template.successPath.isNullOrBlank()) {
             return "设置成功预期值时也要填写成功标记路径"
         }
+        // The other half of the same rule: a path without an expected value used to be
+        // accepted, and `matchesSuccessFlag` then skipped the check entirely — the marker
+        // the user configured silently did nothing. One of the two fields alone is a
+        // half-finished check, so it is refused rather than quietly ignored.
+        if (!template.successPath.isNullOrBlank() && template.successExpectedValue.isNullOrBlank()) {
+            return "填写成功标记路径后也要填写成功预期值"
+        }
         val templatedValues = buildList {
             add(template.endpointTemplate)
             addAll(template.headers.map { it.valueTemplate })
@@ -319,7 +326,7 @@ open class BalanceApi(
                 return "请求头值不能包含换行"
             }
             if (name.requiresCredentialPlaceholder() && !header.valueTemplate.containsCredentialPlaceholder()) {
-                return "认证请求头请使用 {{apiKey}} 或 {{accessToken}}，不要把密钥保存进模板"
+                return "认证头用 {{apiKey}} 或 {{accessToken}}，别把密钥写进模板"
             }
         }
         return null
@@ -369,9 +376,15 @@ open class BalanceApi(
         .findAll(value)
         .any { it.value !in SUPPORTED_PLACEHOLDERS }
 
+    /**
+     * Matching is on the name with `-`/`_` removed, so every hint is a whole credential
+     * word rather than a bare fragment: `X-Api-Key` is flagged through `apikey`, while
+     * bookkeeping headers such as `X-Idempotency-Key` are not asked for a placeholder
+     * they have no value for.
+     */
     private fun String.requiresCredentialPlaceholder(): Boolean {
-        val lower = lowercase()
-        return lower in SENSITIVE_HEADER_NAMES || SENSITIVE_HEADER_HINTS.any(lower::contains)
+        val squashed = lowercase().filter { it != '-' && it != '_' }
+        return lowercase() in SENSITIVE_HEADER_NAMES || SENSITIVE_HEADER_HINTS.any(squashed::contains)
     }
 
     private fun String.containsCredentialPlaceholder(): Boolean =
@@ -423,11 +436,6 @@ open class BalanceApi(
         ?.redactSecrets()
         ?.take(MAX_FAILURE_MESSAGE_CHARS)
         ?: "接口返回的成功标记与模板配置不一致"
-
-    private fun String.redactSecrets(): String = replace(
-        Regex("(?i)(bearer\\s+|x-api-key[=:]\\s*|api[_-]?key[=:]\\s*|access[_-]?token[=:]\\s*)[^\\s,}]+"),
-        "\$1***",
-    )
 
     /** Supports dot properties and zero-based array indices, such as data.items[0].quota. */
     private fun readPath(root: Any, rawPath: String): Any? {
@@ -498,7 +506,20 @@ open class BalanceApi(
             "x-auth-token",
             "cookie",
         )
-        val SENSITIVE_HEADER_HINTS = listOf("auth", "token", "secret", "key", "cookie", "password")
+        /** Credential words, matched against the header name with separators removed. */
+        val SENSITIVE_HEADER_HINTS = listOf(
+            "authorization",
+            "auth",
+            "token",
+            "secret",
+            "apikey",
+            "accesskey",
+            "privatekey",
+            "cookie",
+            "password",
+            "credential",
+            "bearer",
+        )
         val SUPPORTED_PLACEHOLDERS = setOf(
             "{{baseUrl}}",
             "{{apiKey}}",

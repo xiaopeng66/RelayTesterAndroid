@@ -78,9 +78,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.disabled
 import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.selected
@@ -269,7 +271,7 @@ private fun BalanceHome(
         AlertDialog(
             onDismissRequest = { templateToDelete = null },
             title = { Text("删除余额模板？") },
-            text = { Text("“${template.name}”将从所有供应商取消绑定。此操作无法撤销。") },
+            text = { Text("解除「${template.name}」与所有供应商的绑定，无法撤销。") },
             confirmButton = {
                 TextButton(
                     onClick = {
@@ -501,7 +503,17 @@ private fun BalanceSupplierCard(
             )
             .semantics {
                 this.selected = selected
-                contentDescription = "供应商 ${supplier.name}；双击查询余额"
+                // The card's own lines carry the name, the available balance and the status;
+                // a contentDescription here replaced all of them with a generic sentence, so
+                // the number a screen-reader user came for was the one thing not announced.
+                // A double tap is not an accessibility action either, so the refresh is
+                // published as one instead of relying on the gesture.
+                customActions = listOf(
+                    CustomAccessibilityAction("查询余额") {
+                        onDoubleClick()
+                        true
+                    },
+                )
             },
         colors = androidx.compose.material3.CardDefaults.outlinedCardColors(
             containerColor = if (selected) {
@@ -798,7 +810,7 @@ private fun BalanceCredentialsForm(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text(
-            "余额访问令牌可与模型测试 API Key 不同，并会加密保存在本机。",
+            "可与模型测试 API Key 不同，加密保存。",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -835,7 +847,7 @@ private fun BalanceCredentialsForm(
         )
         CredentialHelperText(
             text = errors.accessToken
-                ?: "仅用于余额接口，保存后受 Android Keystore 保护。",
+                ?: "仅用于余额接口，受 Keystore 保护。",
             isError = errors.accessToken != null,
         )
         OutlinedTextField(
@@ -899,7 +911,7 @@ private fun BalanceResultCard(
             }
             if (snapshot == null && errorMessage == null) {
                 Text(
-                    "确认中转站地址、查询凭据与模板后，可读取当前账户余额。",
+                    "确认地址、凭据与模板后即可读取余额。",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -1026,7 +1038,7 @@ private fun BalanceTemplateCard(
         ) {
             Text("余额查询模板", style = MaterialTheme.typography.titleMedium)
             Text(
-                "模板决定请求地址、认证请求头和响应字段映射；每个供应商可单独选择。",
+                "模板决定地址、认证头与字段映射；可按供应商选。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -1177,9 +1189,9 @@ private fun TemplateSecuritySummary() {
         // The guard is same-origin, not TLS-only: a supplier configured as cleartext HTTP
         // must still be able to query its own balance, so claiming "HTTPS only" here
         // would describe a rule the code deliberately does not enforce.
-        TemplateSafetyBullet("同源：只访问当前站点的同一来源（协议、域名、端口一致），不会把请求发往其他域名。")
-        TemplateSafetyBullet("凭据：API Key / PAT 仅在请求时注入，不写入模板或日志。")
-        TemplateSafetyBullet("脚本：只能描述同站请求与 JSON 映射，不能直接联网或访问设备能力。")
+        TemplateSafetyBullet("只访问当前站点同源地址（协议、域名、端口一致）。")
+        TemplateSafetyBullet("凭据仅请求时注入，不写模板与日志。")
+        TemplateSafetyBullet("只描述同站请求与 JSON 映射，不联网、不碰设备。")
     }
 }
 
@@ -1266,9 +1278,9 @@ private fun BalanceTemplateEditor(
                 OutlinedCard(modifier = Modifier.fillMaxWidth()) {
                     Text(
                         if (draft.queryMode == BalanceQueryMode.FORM) {
-                            "参数配置适合固定接口与 JSON 路径；复杂的可选字段可在“高级响应映射”中展开。"
+                            "固定接口用参数配置；可选字段见“高级响应映射”。"
                         } else {
-                            "查询脚本采用 request + extractor 结构；网络请求仍由本机校验后执行。"
+                            "脚本为 request + extractor；请求由本机校验后发出。"
                         },
                         modifier = Modifier.padding(16.dp),
                         style = MaterialTheme.typography.bodyMedium,
@@ -1339,7 +1351,7 @@ private fun BalanceTemplateEditor(
                         value = draft.endpointTemplate,
                         onValueChange = { onUpdate(BalanceTemplateField.ENDPOINT, it) },
                         errorMessage = errors.endpoint,
-                        helperText = "以 / 开头时从站点根路径解析；也可用 {{baseUrl}}。",
+                        helperText = "以 / 开头按站点根解析；可用 {{baseUrl}}。",
                     )
                     TemplateTextField(
                         label = "请求头（每行 名称: 值）",
@@ -1356,7 +1368,7 @@ private fun BalanceTemplateEditor(
                             value = draft.requestBodyTemplate,
                             onValueChange = { onUpdate(BalanceTemplateField.BODY, it) },
                             errorMessage = errors.body,
-                        helperText = "可使用 {{apiKey}}、{{accessToken}}、{{userId}} 或 {{nowEpochMs}}。",
+                        helperText = "可用 {{apiKey}}/{{accessToken}}/{{userId}}/{{nowEpochMs}}。",
                             singleLine = false,
                             maxLines = 8,
                         )
@@ -1383,7 +1395,7 @@ private fun BalanceTemplateEditor(
                         value = draft.scaleDivisor,
                         onValueChange = { onUpdate(BalanceTemplateField.SCALE_DIVISOR, it) },
                         errorMessage = errors.divisor,
-                        helperText = "显示值 = API 原始值 ÷ 此除数；new-api 默认是 500000。",
+                        helperText = "显示值 = 原始值 ÷ 除数（new-api 默认 500000）。",
                         keyboardType = KeyboardType.Decimal,
                     )
                     OutlinedButton(
@@ -1413,7 +1425,7 @@ private fun BalanceTemplateEditor(
                             label = { Text("总额度 = 可用额度 + 已用额度") },
                         )
                         Text(
-                            "适用于 new-api：响应只包含 quota 与 used_quota 时自动计算总额度。",
+                            "new-api：仅有 quota/used_quota 时自动算总额。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -1421,7 +1433,7 @@ private fun BalanceTemplateEditor(
                             label = "币种 JSON 路径（可选）",
                             value = draft.currencyPath,
                             onValueChange = { onUpdate(BalanceTemplateField.CURRENCY_PATH, it) },
-                            helperText = "接口有返回币种字符串时填写，例如 data.currency。",
+                            helperText = "有币种字段时填，如 data.currency。",
                         )
                         TemplateTextField(
                             label = "套餐名称 JSON 路径（可选）",
@@ -1434,14 +1446,14 @@ private fun BalanceTemplateEditor(
                             value = draft.successPath,
                             onValueChange = { onUpdate(BalanceTemplateField.SUCCESS_PATH, it) },
                             errorMessage = errors.success,
-                            helperText = "例如 success；留空则仅按 HTTP 2xx 判断。",
+                            helperText = "如 success；留空只按 HTTP 2xx。",
                         )
                         TemplateTextField(
                             label = "成功标记预期值（可选）",
                             value = draft.successExpectedValue,
                             onValueChange = { onUpdate(BalanceTemplateField.SUCCESS_EXPECTED_VALUE, it) },
                             errorMessage = errors.success,
-                            helperText = "例如 true。填写此项时必须同时填写成功标记路径。",
+                            helperText = "如 true；需与成功标记路径同时填写。",
                         )
                     }
                 }
@@ -1454,7 +1466,7 @@ private fun BalanceTemplateEditor(
                             value = draft.scriptCode,
                             onValueChange = { onUpdate(BalanceTemplateField.SCRIPT_CODE, it) },
                             errorMessage = errors.script,
-                            helperText = "返回 { request, extractor }；extractor 返回 remaining、used、total、unit、planName。",
+                            helperText = "返回 { request, extractor }；字段 remaining/used/total/unit/planName。",
                             singleLine = false,
                             maxLines = 18,
                         )
@@ -1475,12 +1487,12 @@ private fun BalanceTemplateEditor(
                         ) {
                             Text("脚本返回约定", style = MaterialTheme.typography.titleSmall)
                             Text(
-                                "request: url、method（GET/POST）、headers、body（可选）；extractor(response) 可返回 isValid: false 与 invalidMessage。",
+                                "request: url、method、headers、body；extractor 可返回 isValid/invalidMessage。",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                             Text(
-                                "余额数值由 extractor 直接返回显示值；可用占位符仅在请求发送前替换。",
+                                "extractor 返回显示值；占位符发送前替换。",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -1496,7 +1508,7 @@ private fun BalanceTemplateEditor(
                     ) {
                         Text("可用占位符", style = MaterialTheme.typography.titleSmall)
                         Text(
-                            "地址 · 模型 API Key · 余额令牌 · 用户 ID · 毫秒时间戳",
+                            "地址、API Key、余额令牌、用户 ID、时间戳",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )

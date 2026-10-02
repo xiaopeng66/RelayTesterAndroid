@@ -172,6 +172,60 @@ class TesterPanelRegressionTest {
         assertFalse(subject.balanceUiState.value.isQuerying)
     }
 
+    // ---- Re-running part of a list ---------------------------------------
+
+    @Test
+    fun `retesting the ticked rows keeps the rows left unticked`() {
+        // 重测已选 re-runs the ticked rows; it must not rebuild the list from them alone.
+        // It used to, which dropped every unticked verdict from the panel and from the
+        // exported JSON — the button says "retest the selected", not "discard the rest".
+        val api = SlowApi(listOf("model-a", "model-b"), holdMs = 10)
+        val subject = viewModel(api)
+        seedRunnableState(subject)
+        setResultsForTest(
+            subject,
+            listOf(
+                ModelTestResult("model-a", TestStatus.SUCCESS, latencyMs = 5),
+                ModelTestResult("model-b", TestStatus.SUCCESS, latencyMs = 7),
+            ),
+        )
+
+        subject.retestAll()
+        runBlocking { delay(400) }
+
+        val results = subject.uiState.value.results
+        assertTrue(
+            "未勾选的行必须留在结果里",
+            results.any { it.model == "model-b" },
+        )
+        // ...and it is neither re-run nor counted: only the ticked model is requested.
+        assertEquals("只重测勾选的行", 1, api.calls.get())
+    }
+
+    // ---- Judging a batch fetch -------------------------------------------
+
+    @Test
+    fun `a site answering the batch with an empty directory is reported`() {
+        // The single-supplier path already treats `200 []` as an error message. The batch
+        // counted it as a clean success and then overwrote the per-site reason with
+        // "已拉取 N 个供应商的模型", so the failure card stayed empty and the summary
+        // claimed a batch that returned nothing had gone fine.
+        val subject = viewModel(ModelsApi(emptyList()))
+        seedRunnableState(subject)
+
+        subject.fetchAllSupplierModels()
+        runBlocking { delay(400) }
+
+        val state = subject.uiState.value
+        assertEquals("空目录必须出现在失败清单里", 1, state.modelFetchFailures.size)
+        assertEquals("站点未返回模型列表", state.modelFetchFailures.first().reason)
+        assertTrue(
+            "摘要必须说明原因",
+            state.message?.contains("站点未返回模型列表") == true,
+        )
+        assertTrue("摘要必须标为错误", state.isMessageError)
+    }
+
     // ---- Harness ---------------------------------------------------------
 
     private fun viewModel(

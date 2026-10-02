@@ -92,7 +92,7 @@ object ConfigurationBackupCodec {
     fun encrypt(backup: ConfigurationBackup, password: CharArray): ByteArray {
         return try {
             if (password.size < MIN_PASSWORD_LENGTH) {
-                throw ConfigurationBackupException("备份密码至少需要 $MIN_PASSWORD_LENGTH 个字符")
+                throw ConfigurationBackupException("密码至少 $MIN_PASSWORD_LENGTH 个字符")
             }
             val salt = ByteArray(SALT_LENGTH).also(SecureRandom()::nextBytes)
             val iv = ByteArray(IV_LENGTH).also(SecureRandom()::nextBytes)
@@ -148,7 +148,7 @@ object ConfigurationBackupCodec {
                 throw ConfigurationBackupException("备份文件大小无效")
             }
             if (password.size < MIN_PASSWORD_LENGTH) {
-                throw ConfigurationBackupException("请输入至少 $MIN_PASSWORD_LENGTH 个字符的备份密码")
+                throw ConfigurationBackupException("密码至少 $MIN_PASSWORD_LENGTH 个字符")
             }
             val envelope = JSONObject(raw.toString(Charsets.UTF_8))
             if (envelope.optString("format") != FORMAT ||

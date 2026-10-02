@@ -48,7 +48,7 @@ class FingerprintBank private constructor(
         val usable = answerTexts.filterIndexed { index, _ -> diagnostics[index].accepted }
             .map(NumberFeatures::parseNumbers)
         require(usable.isNotEmpty()) {
-            "没有可用回答：请粘贴完整数字序列；拒答或严重截断的回答不会计入"
+            "没有可用回答：拒答或严重截断的回答不计入"
         }
 
         val complete = usable.size == 3 && answerTexts.size == 3
@@ -300,6 +300,9 @@ class FingerprintBank private constructor(
             require(weights.environments.all { it.size == modelCount }) {
                 "指纹检测包的环境模板与模型数量不一致"
             }
+            require(weights.environments.all { environment -> environment.all { it.size == ORDERED_DIMENSION } }) {
+                "指纹检测包的环境模板维度不是 $ORDERED_DIMENSION"
+            }
             require(weights.references.size == modelCount) {
                 "指纹检测包的 kNN 参考与模型数量不一致"
             }
@@ -324,6 +327,9 @@ class FingerprintBank private constructor(
             }
             require(verifier.candidates.size == modelCount && verifier.references.size == modelCount) {
                 "指纹检测包的核验器与模型数量不一致"
+            }
+            require(verifier.references.all { it.columns == FEATURE_DIMENSION }) {
+                "指纹检测包的核验器参考维度不是 $FEATURE_DIMENSION"
             }
             require(verifier.activeFeatures.size == verifier.mean.size &&
                 verifier.mean.size == verifier.scale.size &&

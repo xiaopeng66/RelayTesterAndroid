@@ -24,9 +24,12 @@ import java.io.File
 import java.io.IOException
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
@@ -53,6 +56,7 @@ import org.junit.Test
  * list, so every keystroke was reverted on recomposition and manual detection
  * was unreachable. Nothing crashed, and the algorithm tests stayed green.
  */
+@OptIn(ExperimentalCoroutinesApi::class)
 class FingerprintViewModelTest {
     private val mainDispatcher = UnconfinedTestDispatcher()
 
@@ -164,7 +168,8 @@ class FingerprintViewModelTest {
         selectMode(DetectionMode.API)
     }
 
-    /** Waits for the batch list to leave its interim states, or fails on a stall. */    private fun awaitBatchSettled(subject: FingerprintViewModel) {
+    /** Waits for the batch list to leave its interim states, or fails on a stall. */
+    private fun awaitBatchSettled(subject: FingerprintViewModel) {
         runBlocking {
             withTimeout(BATCH_SETTLE_TIMEOUT_MS) {
                 while (subject.uiState.value.batchResults.any {
@@ -373,13 +378,156 @@ class FingerprintViewModelTest {
         assertNull("三条回答都没能用于检测", state.analysis)
         assertTrue(state.isMessageError)
 
+        // 重试本题 = 只重问这一题，不再把整轮推倒：请求数只 +1，题目本身不换（换题会让
+        // 同一轮里其它模型对这道题的回答失去可比性），并且立刻按新回答重新评分。
+        val callsBeforeRetry = api.calls.get()
         val before = state.progress[0].challenge.id
         subject.retryChallenge(0)
-        assertNotEquals(
-            "失败后仍必须能重试该题",
-            before,
-            subject.uiState.value.progress[0].challenge.id,
+        runBlocking { subject.awaitIdle() }
+
+        assertEquals("失败后重试只重问这一题", callsBeforeRetry + 1, api.calls.get())
+        assertEquals("重试的是同一道题", before, subject.uiState.value.progress[0].challenge.id)
+        assertEquals("重试后仍要给出这轮的结论", 1, subject.uiState.value.batchResults.size)
+    }
+
+    @Test
+    fun `retrying one question scores the interrupted round instead of restarting it`() {
+        val api = FakeCompletionApi(
+            answers = goldenCase().answers,
+            failure = TestError(ErrorKind.UPSTREAM, "上游返回 HTTP 502"),
         )
+        val subject = readyApiViewModel(api)
+        subject.runApiDetection()
+        runBlocking { subject.awaitIdle() }
+        assertEquals(ModelDetectionStatus.FAILED, subject.uiState.value.batchResults.single().status)
+
+        // 上游恢复：从这一张卡片重试，这一轮必须接着跑完，而不是三题从头再来。
+        api.failure = null
+        subject.retryChallenge(0)
+        runBlocking { subject.awaitIdle() }
+
+        assertEquals("只补发这一题", 4, api.calls.get())
+        val row = subject.uiState.value.batchResults.single()
+        assertEquals(ModelDetectionStatus.DONE, row.status)
+        assertNotNull("重试后这一行必须有候选", row.candidateName)
+        assertNotNull("单模型重试要把候选榜放回面板", subject.uiState.value.analysis)
+    }
+
+    @Test
+    fun `a single-question retry only touches the slot it was asked for`() {
+        val api = FakeCompletionApi(goldenCase().answers)
+        val subject = readyApiViewModel(api, models = listOf("m-one", "m-two"))
+        subject.runApiDetection()
+        runBlocking { subject.awaitIdle() }
+        assertEquals(6, api.calls.get())
+        val idsBefore = subject.uiState.value.progress.map { it.challenge.id }
+
+        subject.retryChallenge(1)
+        runBlocking { subject.awaitIdle() }
+
+        assertEquals("两个模型各补发这一题，其它两题不许重发", 8, api.calls.get())
+        assertEquals("题目集合不动", idsBefore, subject.uiState.value.progress.map { it.challenge.id })
+        assertTrue(
+            "每行的结论都要按新回答刷新",
+            subject.uiState.value.batchResults.all { it.status == ModelDetectionStatus.DONE },
+        )
+    }
+
+    @Test
+    fun `cancelling after two answers keeps them for a three-answer retry score`() {
+        val golden = goldenCase()
+        val api = GatedCompletionApi(golden.answers, gatedPosition = 2)
+        val subject = readyApiViewModelFor(SingleSupplierStore(testSupplier()), api).apply {
+            updateParallel(false)
+        }
+        subject.runApiDetection()
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.started.await() } }
+        val before = subject.uiState.value.progress
+        assertEquals(listOf(ChallengeState.RECEIVED, ChallengeState.RECEIVED, ChallengeState.REQUESTING), before.map { it.state })
+
+        subject.cancelRun()
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { subject.awaitIdle() } }
+        val cancelled = subject.uiState.value
+        assertEquals(before.take(2), cancelled.progress.take(2))
+        assertEquals(ChallengeState.PENDING, cancelled.progress[2].state)
+        assertEquals(setOf(2), cancelled.retryableQuestionIndices)
+
+        subject.retryChallenge(2)
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { subject.awaitIdle() } }
+
+        val state = subject.uiState.value
+        assertEquals("只补发中断的第三题", 4, api.models.size)
+        assertEquals(before.map { it.challenge.id }, state.progress.map { it.challenge.id })
+        assertEquals(before.take(2), state.progress.take(2))
+        assertTrue(state.progress.all { it.state == ChallengeState.RECEIVED })
+        assertEquals(3, state.analysis?.usableAnswers)
+        assertEquals(3, state.batchResults.single().usableAnswers)
+        assertEquals(ModelDetectionStatus.DONE, state.batchResults.single().status)
+        assertEquals(emptySet<Int>(), state.retryableQuestionIndices)
+    }
+
+    @Test
+    fun `an early failed model exposes retryable questions after a healthy last model`() {
+        val failingModels = mutableSetOf("broken")
+        val api = FakeCompletionApi(goldenCase().answers, failingModels = failingModels)
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            api,
+            models = listOf("broken", "healthy"),
+        )
+        subject.runApiDetection()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertEquals(ModelDetectionStatus.FAILED, state.batchResults.first().status)
+        assertEquals(ModelDetectionStatus.DONE, state.batchResults.last().status)
+        assertTrue("最后一个模型的三题都健康，仍要能重试前一个模型", state.progress.all { it.state == ChallengeState.RECEIVED })
+        assertEquals(setOf(0, 1, 2), state.retryableQuestionIndices)
+
+        failingModels.clear()
+        subject.retryChallenge(0)
+        runBlocking { subject.awaitIdle() }
+
+        val retried = subject.uiState.value
+        assertEquals("显式重试仍为两个模型各补发一次", 8, api.calls.get())
+        assertEquals(1, retried.batchResults.first().usableAnswers)
+        assertEquals(3, retried.batchResults.last().usableAnswers)
+        assertEquals(setOf(1, 2), retried.retryableQuestionIndices)
+        subject.regenerateChallenges()
+        assertEquals("换题后旧轮次的重试入口必须清除", emptySet<Int>(), subject.uiState.value.retryableQuestionIndices)
+    }
+
+    @Test
+    fun `a batch row carries the candidate ranking the single-model card shows`() {
+        val golden = goldenCase()
+        val api = FakeCompletionApi(golden.answers)
+        val subject = readyApiViewModel(api, models = listOf("first", "second"))
+
+        subject.runApiDetection()
+        runBlocking { subject.awaitIdle() }
+
+        for (row in subject.uiState.value.batchResults) {
+            assertTrue(
+                "整份候选榜要跟着行一起留下（不是只留冠军），实际 ${row.candidates.size} 条",
+                row.candidates.size > 1,
+            )
+            assertEquals(golden.top1, row.candidates.first().displayName)
+        }
+    }
+
+    @Test
+    fun `retrying before any round still swaps the prompt`() {
+        // 没有可续的一轮（还没跑过、或题目已重新生成）时，这个按钮的老含义保持不变：
+        // 换一道不同长度的题。
+        val subject = viewModel()
+        subject.selectMode(DetectionMode.API)
+        val before = subject.uiState.value.progress[1].challenge.id
+
+        subject.retryChallenge(1)
+
+        val after = subject.uiState.value.progress[1]
+        assertNotEquals("没跑过时重试就是换题", before, after.challenge.id)
+        assertEquals(ChallengeState.PENDING, after.state)
     }
 
     @Test
@@ -756,6 +904,83 @@ class FingerprintViewModelTest {
     }
 
     @Test
+    fun `prefill is ignored while credentials are preparing`() {
+        val store = MutableSupplierStore(listOf(testSupplier(), otherSupplier()))
+        val api = FakeCompletionApi(goldenCase().answers)
+        val subject = readyApiViewModelFor(store, api, models = listOf("m-one", "m-two"))
+        val before = subject.uiState.value
+        val gate = CompletableDeferred<Unit>()
+        store.gate = gate
+        subject.runApiDetection()
+        assertFalse("凭据尚未读完，界面运行标记还未置位", subject.uiState.value.isRunning)
+        assertEquals(2, store.reads.get())
+        try {
+            subject.prefill(null, "replacement")
+            subject.prefill("sup-2", "other-model")
+            assertEquals("准备中的批次和题目必须保留", before, subject.uiState.value)
+        } finally {
+            gate.complete(Unit)
+            runBlocking { subject.awaitIdle() }
+        }
+        assertEquals(listOf("m-one", "m-two"), subject.uiState.value.batchResults.map { it.model })
+        assertEquals(6, api.calls.get())
+    }
+
+    @Test
+    fun `prefill is ignored while an active batch is requesting`() {
+        val api = GatedCompletionApi(goldenCase().answers)
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            api,
+            models = listOf("m-one", "m-two"),
+        ).apply { updateParallel(false) }
+        subject.runApiDetection()
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.started.await() } }
+        val before = subject.uiState.value
+        assertTrue(before.isRunning)
+        try {
+            subject.prefill(null, "replacement")
+            subject.prefill("sup-2", "other-model")
+            assertEquals("活动批次的选中模型、结果行和题目不得被预填覆盖", before, subject.uiState.value)
+        } finally {
+            subject.cancelRun()
+            runBlocking { subject.awaitIdle() }
+        }
+    }
+
+    @Test
+    fun `prefill and new runs wait until cancellation cleanup completes`() {
+        val cleanupGate = CompletableDeferred<Unit>()
+        val api = GatedCompletionApi(goldenCase().answers, cancellationGate = cleanupGate)
+        val subject = readyApiViewModelFor(SingleSupplierStore(testSupplier()), api).apply {
+            updateParallel(false)
+        }
+        subject.runApiDetection()
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.started.await() } }
+        subject.cancelRun()
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.cancellationStarted.await() } }
+        val cancelled = subject.uiState.value
+        assertFalse(cancelled.isRunning)
+        try {
+            subject.prefill(null, "replacement")
+            subject.prefill("sup-2", "other-model")
+            assertEquals("取消清理期间预填也必须拒绝", cancelled, subject.uiState.value)
+            subject.runApiDetection()
+            subject.retryChallenge(0)
+            assertEquals("取消尚未完成时不能再发任何请求", 1, api.models.size)
+            assertEquals(cancelled, subject.uiState.value)
+        } finally {
+            cleanupGate.complete(Unit)
+            runBlocking { subject.awaitIdle() }
+        }
+
+        subject.runApiDetection()
+        runBlocking { subject.awaitIdle() }
+        assertEquals("取消真正完成后新轮次才可开跑", 4, api.models.size)
+        assertEquals(ModelDetectionStatus.DONE, subject.uiState.value.batchResults.single().status)
+    }
+
+    @Test
     fun `a throwing request fails only its own model and the batch keeps going`() {
         // An unexpected throw from one challenge used to escape as a sibling
         // cancellation: the panel stopped silently and the rows stayed on "正在检测…"
@@ -1023,7 +1248,7 @@ class FingerprintViewModelTest {
     }
 
     @Test
-    fun `a run is refused while a detection-package job is in flight`() {
+    fun `a round starts even while the entry check is still in flight`() {
         val api = FakeCompletionApi(goldenCase().answers)
         val gate = CompletableDeferred<Unit>()
         val fetcher = FakeBankFetcher().apply {
@@ -1032,16 +1257,134 @@ class FingerprintViewModelTest {
         }
         val subject = readyApiViewModel(api, bankFetcher = fetcher)
         runBlocking { subject.awaitIdle() }
-        // A check holds `bankUpdateJob`; a round started now would race the package swap
-        // the check may schedule, so it must be refused with a message rather than run.
+        // 进面板的检查没人按过，只能占它自己的那个门：用户点下的检测必须照跑，
+        // 不能被一个用户没请求的 HTTP 请求挡在门外。
+        subject.refreshBankOnEntry()
+        assertTrue("静默检查必须真的在飞", subject.uiState.value.isCheckingBankInBackground)
+
+        subject.runApiDetection()
+        // 只等这一轮自己跑完：等 gates 上的静默检查会让「拒绝开跑」的变异把测试卡死，
+        // 而卡死既不是红也不是绿，等于没证明。
+        runBlocking {
+            withTimeout(BATCH_SETTLE_TIMEOUT_MS) {
+                while (
+                    subject.uiState.value.batchResults.isEmpty() ||
+                    subject.uiState.value.batchResults.any {
+                        it.status == ModelDetectionStatus.PENDING ||
+                            it.status == ModelDetectionStatus.RUNNING
+                    }
+                ) {
+                    delay(10)
+                }
+            }
+        }
+
+        assertEquals("静默检查不得挡住检测", 3, api.calls.get())
+        assertFalse("静默检查要让位", subject.uiState.value.isCheckingBankInBackground)
+        assertNull("没人按过的检查不该留话", subject.uiState.value.message)
+        gate.complete(Unit)
+        runBlocking { subject.awaitIdle() }
+    }
+
+    @Test
+    fun `a round is refused while the package install is in flight`() {
+        val api = FakeCompletionApi(goldenCase().answers)
+        val fetcher = FakeBankFetcher().apply { publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp) }
+        val subject = readyApiViewModel(api, bankFetcher = fetcher)
+        runBlocking { subject.awaitIdle() }
+
         subject.checkBankUpdate()
+        runBlocking { subject.awaitIdle() }
+        assertNotNull("先要有可下载的检测包", subject.uiState.value.availableBankUpdate)
+
+        // 换包才是真的危险：它把评分用的检测包换掉，一轮里的行就会带着两个不同检测包
+        // 的排名。所以安装期间必须拒绝开跑，并且说清楚原因。
+        val gate = CompletableDeferred<Unit>()
+        fetcher.gate = gate
+        subject.installBankUpdate()
+        assertTrue("安装必须真的在飞", subject.uiState.value.isInstallingBank)
 
         subject.runApiDetection()
 
-        assertEquals("检测包作业在飞时不得开跑", 0, api.calls.get())
+        assertEquals("换包期间不得开跑", 0, api.calls.get())
         assertNotNull("必须告诉用户为什么没跑", subject.uiState.value.message)
         gate.complete(Unit)
         runBlocking { subject.awaitIdle() }
+    }
+
+    @Test
+    fun `a check the user pressed takes over the entry check instead of queueing behind it`() {
+        val api = FakeCompletionApi(goldenCase().answers)
+        val gate = CompletableDeferred<Unit>()
+        val fetcher = FakeBankFetcher().apply { publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp) }
+        // mainDispatcher 作 IO：静默检查会在清单请求里确定性停住，取位一次算一次，
+        // 不然「谁发了几次请求」变成调度竞速，断言会闪。
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            api,
+            bankFetcher = fetcher,
+        )
+        runBlocking { subject.awaitIdle() }
+
+        fetcher.gate = gate
+        subject.refreshBankOnEntry()
+        assertTrue(subject.uiState.value.isCheckingBankInBackground)
+        assertEquals("静默检查先发出一次清单请求并停在门上", 1, fetcher.urls.size)
+
+        // 用户的请求优先：静默检查让位，按下的检查自己跑完并汇报结果，而不是排在一个
+        // 用户没请求的请求后面等它超时。这一步之后的断言不再 awaitIdle：让位的语义要是
+        // 退化成「排队」，awaitIdle 就会挂在那个永不放开的门上（测试卡死 = 没证明）。
+        fetcher.gate = null
+        subject.checkBankUpdate()
+
+        assertFalse("静默检查已让位", subject.uiState.value.isCheckingBankInBackground)
+        assertEquals(
+            "让位之后按下的检查才是第二次清单请求",
+            2,
+            fetcher.urls.count { it == FakeBankFetcher.MANIFEST_URL },
+        )
+        assertNotNull("用户按下的检查必须汇报结果", subject.uiState.value.message)
+        assertFalse(subject.uiState.value.isCheckingBankUpdate)
+        gate.complete(Unit)
+        runBlocking { subject.awaitIdle() }
+    }
+
+    @Test
+    fun `reentering during a silent bank check keeps one request for manual takeover`() {
+        val gate = CompletableDeferred<Unit>()
+        val fetcher = FakeBankFetcher().apply {
+            publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp)
+            this.gate = gate
+        }
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFetcher = fetcher,
+        )
+        subject.refreshBankOnEntry()
+        assertTrue(subject.uiState.value.isCheckingBankInBackground)
+        assertEquals(listOf(FakeBankFetcher.MANIFEST_URL), fetcher.urls)
+
+        try {
+            // A second entry must keep the first check reachable rather than launch
+            // another request and replace the job that manual takeover needs to cancel.
+            subject.refreshBankOnEntry()
+            assertEquals("重复进入只保留原来的静默清单请求", listOf(FakeBankFetcher.MANIFEST_URL), fetcher.urls)
+            assertTrue(subject.uiState.value.isCheckingBankInBackground)
+            assertFalse(subject.uiState.value.isCheckingBankUpdate)
+            assertNull(subject.uiState.value.message)
+
+            fetcher.gate = null
+            subject.checkBankUpdate()
+            assertEquals("手动接管才发出第二次请求", 2, fetcher.urls.size)
+            assertEquals(patchStamp, subject.uiState.value.availableBankUpdate?.builtAt)
+            assertNotNull(subject.uiState.value.message)
+            assertFalse(subject.uiState.value.isCheckingBankInBackground)
+            assertFalse(subject.uiState.value.isCheckingBankUpdate)
+        } finally {
+            gate.complete(Unit)
+            runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { subject.awaitIdle() } }
+        }
     }
 
     @Test
@@ -1477,7 +1820,8 @@ private fun otherSupplier(): SupplierProfile = SupplierProfile(
  */
 private class FakeCompletionApi(
     private val answers: List<String>,
-    private val failure: TestError? = null,
+    /** Flippable: a test can let upstream recover between a round and its retry. */
+    var failure: TestError? = null,
     private val failingModels: Set<String> = emptySet(),
     private val holdMs: Long = 20,
 ) : RelayApi() {
@@ -1514,14 +1858,17 @@ private class FakeCompletionApi(
 }
 
 /**
- * Holds the first request open until the test cancels, so mid-batch cancellation is
- * observed at a known point instead of racing a timer.
+ * Parks one request until cancellation, optionally holding its cleanup open so the
+ * panel can be exercised while the cancelled job is still completing.
  */
 private class GatedCompletionApi(
     private val answers: List<String>,
+    private val gatedPosition: Int = 0,
+    private val cancellationGate: CompletableDeferred<Unit>? = null,
 ) : RelayApi() {
-    /** Completed once the first request is inside the relay and parked. */
+    /** Completed once the selected request is inside the relay and parked. */
     val started = CompletableDeferred<Unit>()
+    val cancellationStarted = CompletableDeferred<Unit>()
     private val gate = CompletableDeferred<Unit>()
     val models = Collections.synchronizedList(mutableListOf<String>())
 
@@ -1535,11 +1882,19 @@ private class GatedCompletionApi(
     ): ApiResult<String> {
         val position = models.size
         models += model
-        if (position == 0) {
+        if (position == gatedPosition) {
             started.complete(Unit)
-            gate.await()
+            try {
+                gate.await()
+            } catch (error: CancellationException) {
+                cancellationStarted.complete(Unit)
+                cancellationGate?.let { cleanup ->
+                    withContext(NonCancellable) { cleanup.await() }
+                }
+                throw error
+            }
         }
-        return ApiResult.Success(answers[0])
+        return ApiResult.Success(answers[position % answers.size])
     }
 }
 

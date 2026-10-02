@@ -4,6 +4,7 @@ import com.relaytester.app.core.fingerprint.BankDiscardResult
 import com.relaytester.app.core.fingerprint.BankInstallResult
 import com.relaytester.app.core.fingerprint.BankReader
 import com.relaytester.app.core.fingerprint.BankSource
+import com.relaytester.app.core.fingerprint.FingerprintBank
 import com.relaytester.app.core.fingerprint.FingerprintBankStore
 import com.relaytester.app.core.fingerprint.sha256Hex
 import org.junit.Assert.assertEquals
@@ -151,15 +152,61 @@ class FingerprintBankStoreTest {
     }
 
     @Test
-    fun `removing still succeeds when only the backup delete fails`() {
-        // The rollback copy is disposable: a backup that cannot be removed must not make
-        // the panel report the removal as failed and leave it looking provisioned.
+    fun `removing a primary package needs no backup delete when no copy exists`() {
         val files = MemoryBankFileSystem(deleteBackupFails = true)
-
         assertEquals(BankDiscardResult.Removed, files.store().discardInstalled())
-
         assertNull(files.installed)
         assertEquals(BankSource.NOT_PROVISIONED, files.store().load().source)
+    }
+
+    @Test
+    fun `a surviving rollback copy prevents a false successful removal`() {
+        val primary = bankWithBuiltAt(newStamp)
+        val files = MemoryBankFileSystem(
+            installed = primary,
+            backup = fixtureBankBytes(),
+            deleteBackupFails = true,
+        )
+        val store = files.store()
+        assertEquals(newStamp, store.load().loaded!!.identity.builtAt)
+
+        assertEquals(BankDiscardResult.Failed, store.discardInstalled())
+
+        assertTrue(primary.contentEquals(files.installed))
+        assertNotNull(files.backup)
+        assertEquals(newStamp, store.load().loaded!!.identity.builtAt)
+        assertEquals(newStamp, files.store().load().loaded!!.identity.builtAt)
+    }
+
+    @Test
+    fun `removing the package in use also removes the rollback copy it fell back to`() {
+        // The copy is the active package in this state (see the adoption test above), so a
+        // removal that left it behind would be undone by the next probe: the package would
+        // come back after a restart even though the panel said it was gone.
+        val files = MemoryBankFileSystem(installed = null, backup = fixtureBankBytes())
+        val store = files.store()
+        assertEquals(BankSource.INSTALLED, store.load().source)
+
+        assertEquals(BankDiscardResult.Removed, store.discardInstalled())
+
+        assertNull("回退副本必须一起删除", files.backup)
+        // A fresh store stands in for the next launch: nothing may be adopted again.
+        assertEquals(BankSource.NOT_PROVISIONED, files.store().load().source)
+    }
+
+    @Test
+    fun `a copy that cannot be removed keeps the panel provisioned`() {
+        // The other side of the same rule: when the copy carries the panel and it cannot be
+        // deleted, the removal did not happen and the panel must not claim otherwise.
+        val files = MemoryBankFileSystem(
+            installed = null,
+            backup = fixtureBankBytes(),
+            deleteBackupFails = true,
+        )
+
+        assertEquals(BankDiscardResult.Failed, files.store().discardInstalled())
+
+        assertNotNull(files.backup)
     }
 
     @Test
@@ -239,6 +286,51 @@ class FingerprintBankStoreTest {
 
         assertTrue(result is BankInstallResult.Rejected)
         assertNull(files.installed)
+    }
+
+    @Test
+    fun `an environment template of another width is rejected`() {
+        // Both sides of the width: a package assembled for a wider or narrower feature
+        // vector would otherwise install and then throw - or silently drop coordinates -
+        // while scoring, which is the one inconsistency a single packed file can hide.
+        for (width in listOf(78, 70)) {
+            // Asserted on the parse, because that is where the dimension is named: the
+            // store deliberately answers a download with one generic message, and a
+            // desynchronised stream would fail here with "长度与内容不一致" instead.
+            val error = runCatching { FingerprintBank.fromPackageBytes(bankWithEnvironmentColumns(width)) }
+                .exceptionOrNull()
+
+            assertTrue("宽度 $width 未被拒绝", error != null)
+            assertTrue(
+                "宽度 $width 的拒绝原因不是维度校验：${error?.message}",
+                error?.message.orEmpty().contains("环境模板维度"),
+            )
+            val files = MemoryBankFileSystem(installed = null)
+            assertTrue(files.store().install(bankWithEnvironmentColumns(width)) is BankInstallResult.Rejected)
+            assertNull(files.installed)
+        }
+    }
+
+    @Test
+    fun `the fixture itself is accepted at the width the checker expects`() {
+        // The rewrite above only means something while this holds: the checker accepts
+        // exactly one width, so a fixture that parses proves its own environment
+        // templates agree with it and the rejection above cannot be an artefact of the
+        // fixture being wrong in the first place.
+        assertTrue(BankFixtures.bank().modelCount > 0)
+    }
+
+    @Test
+    fun `a verifier reference of another width is rejected before installation`() {
+        for (width in listOf(425, 433)) {
+            val bytes = bankWithVerifierReferenceColumns(width)
+            val error = runCatching { FingerprintBank.fromPackageBytes(bytes) }.exceptionOrNull()
+            assertTrue("宽度 $width 未被拒绝", error is IllegalArgumentException)
+            assertTrue("拒绝原因：${error?.message}", error?.message.orEmpty().contains("核验器参考维度"))
+            val files = MemoryBankFileSystem(installed = null)
+            assertTrue(files.store().install(bytes) is BankInstallResult.Rejected)
+            assertNull(files.installed)
+        }
     }
 
     @Test
