@@ -1,11 +1,14 @@
 package com.relaytester.app.feature.fingerprint
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -17,14 +20,20 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.List
+import androidx.compose.material.icons.automirrored.outlined.OpenInNew
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.ContentCopy
+import androidx.compose.material.icons.outlined.ExpandLess
+import androidx.compose.material.icons.outlined.ExpandMore
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Button
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
@@ -38,6 +47,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedCard
+import androidx.compose.material3.OutlinedIconButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
@@ -55,17 +65,23 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.relaytester.app.core.fingerprint.BankSource
 import com.relaytester.app.core.fingerprint.FingerprintCandidate
 import com.relaytester.app.core.fingerprint.minimumNumbersFor
+import com.relaytester.app.ui.components.QuietIconButton
 import com.relaytester.app.ui.components.RelayAppHeader
+import com.relaytester.app.ui.components.copyToClipboard
+import com.relaytester.app.ui.components.openUriSafely
 import com.relaytester.app.ui.navigation.AppDestination
 
 @Composable
@@ -220,40 +236,37 @@ private fun FingerprintContent(
                             enabled = !state.isRunning,
                         )
                         Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                // The row is the control: a bare Switch announces only
-                                // "switch, off" with no idea what it toggles, because its
-                                // label lives in a sibling node. Making the row the
-                                // toggleable merges the title, the explanation and the
-                                // switch state into one accessible control.
-                                .toggleable(
-                                    value = state.useParallel,
-                                    enabled = !state.isRunning,
-                                    role = Role.Switch,
-                                    onValueChange = onParallelChange,
-                                ),
+                            modifier = Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
-                                Text("并行发送三题", style = MaterialTheme.typography.bodyMedium)
                                 Text(
-                                    "只影响同一个模型的三道题；多个模型始终按顺序逐个检测",
+                                    "并行发送三题",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    // 名字挂在开关上，标题就不再单独播报一遍，否则读屏会把
+                                    // 同一句话念两次（标题一次、开关一次）。
+                                    modifier = Modifier.clearAndSetSemantics {},
+                                )
+                                Text(
+                                    "多模型仍逐个检测",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
                             }
+                            // 只有开关本身可切换：整行可点会带来两件用户不想要的事——点标题也
+                            // 翻状态，以及在一整行上铺一层高光（看着像选中效果）。整行合并语义
+                            // 试过不成立（开关自己就是合并节点，仍旧单独留在无障碍树里），所以
+                            // 名字挂在开关上：不这样读屏只会念「开关，已开启」。
                             Switch(
                                 checked = state.useParallel,
-                                // Null: the row above handles the gesture, so the switch
-                                // is a state indicator rather than a second target.
-                                onCheckedChange = null,
+                                onCheckedChange = onParallelChange,
                                 enabled = !state.isRunning,
+                                modifier = Modifier.semantics { contentDescription = "并行发送三题" },
                             )
                         }
                     } else {
                         Text(
-                            "把三道题目分别发给目标模型，再把回答粘贴回对应输入框。适合只有聊天界面、没有 API Key 的情况。",
+                            "把三道题目发给目标模型，再把回答粘回对应输入框。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -331,6 +344,7 @@ private fun ReferenceBankCard(
     onInstallBankUpdate: () -> Unit,
     onRemovePackage: () -> Unit,
 ) {
+    val context = LocalContext.current
     val busy = state.isCheckingBankUpdate || state.isInstallingBank || state.isRunning
     OutlinedCard {
         Column(
@@ -381,7 +395,7 @@ private fun ReferenceBankCard(
             // button is offered; the panel still has to say why, on every entry.
             state.bankRequiringNewerApp?.let {
                 Text(
-                    "上游发布了新的检测包，需要更高版本的 App 才能安装；请先更新应用。",
+                    "新检测包需要更高版本的 App 才能安装。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
                 )
@@ -389,7 +403,7 @@ private fun ReferenceBankCard(
 
             if (state.bankSource == BankSource.NOT_PROVISIONED) {
                 Text(
-                    "检测需要先下载一次检测包；装好之后检测本身完全离线，不联网。",
+                    "需先下载一次检测包；之后检测完全离线。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -456,15 +470,46 @@ private fun ReferenceBankCard(
                 ) { Text("删除已安装的检测包") }
             }
 
-            SupportedModelsSection(models = state.bankModels)
+            SupportedModelsButton(models = state.bankModels)
 
             Text(
-                "检测本身不联网：每次进入本面板会取一次更新清单（只有版本信息，不上传任何数据），" +
-                    "点「检查更新」也会取一次；点「下载/更新检测包」才会下载文件。" +
-                    "参考数据由 lm-detector (MIT) 提供。",
+                "检测离线；取清单与装包才联网。",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            // MIT 要求署名，这一行不是解释文案，压缩轮里保留原文。
+            Text(
+                "参考数据由 lm-detector (MIT) 提供。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            // 项目地址单独一行做成链接。行内链接（LinkAnnotation）要 material3 的
+            // Text 支持 textLinkStyles，本项目的 material3 1.3.1 还没有这个重载，
+            // 与其依赖一个可能不派发点击的版本，不如把链接做成一个明确的点击行。
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 44.dp)
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                    ) { openUriSafely(context, LM_DETECTOR_URL) },
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Icon(
+                    Icons.AutoMirrored.Outlined.OpenInNew,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(16.dp),
+                )
+                Text(
+                    LM_DETECTOR_URL,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    textDecoration = TextDecoration.Underline,
+                )
+            }
         }
     }
 }
@@ -472,48 +517,76 @@ private fun ReferenceBankCard(
 /**
  * Which models the package in use can identify.
  *
- * The roster is 53 entries in the published package, so it stays folded behind a button
- * and scrolls inside a bounded box: expanded by default it would push the rest of the
- * panel off screen. Nothing here is shown without a readable package, which is also why
- * the empty case renders nothing at all rather than an empty list.
- *
- * The fold is [rememberSaveable] because this sits in a LazyColumn item: a plain
- * `remember` is dropped when the card scrolls out of composition, so reading a few rows,
- * scrolling up and coming back would silently collapse the list again (found on device).
+ * 53 entries would push the rest of the panel off screen, so the roster lives in a dialog
+ * opened from a bordered button: the card keeps one line, grouped by family (the package's
+ * own dimension — GPT / Claude / Gemini …), and nothing is shown without a readable
+ * package.
  */
 @Composable
-private fun SupportedModelsSection(models: List<BankModelInfo>) {
+private fun SupportedModelsButton(models: List<BankModelInfo>) {
     if (models.isEmpty()) return
-    var expanded by rememberSaveable { mutableStateOf(false) }
-    Column(modifier = Modifier.fillMaxWidth()) {
-        TextButton(
-            onClick = { expanded = !expanded },
-            modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
-        ) {
-            Text(
-                if (expanded) "收起支持的模型" else "查看支持的模型（${models.size} 个）",
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-        if (expanded) {
+    var open by rememberSaveable { mutableStateOf(false) }
+    OutlinedButton(
+        onClick = { open = true },
+        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary),
+    ) {
+        Icon(
+            Icons.AutoMirrored.Outlined.List,
+            contentDescription = null,
+            modifier = Modifier.size(18.dp),
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(
+            "查看支持的模型（${models.size} 个）",
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+    if (open) {
+        SupportedModelsDialog(models = models, onDismiss = { open = false })
+    }
+}
+
+@Composable
+private fun SupportedModelsDialog(models: List<BankModelInfo>, onDismiss: () -> Unit) {
+    // 按家族分段：groupBy 保留首次出现的顺序，所以分段不改变包内顺序。
+    val families = remember(models) { models.groupBy { it.familyName }.entries.toList() }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("检测包支持的模型") },
+        text = {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(max = 260.dp)
+                    .heightIn(max = MODELS_DIALOG_MAX_HEIGHT)
                     .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
-                models.forEach { model ->
+                Text(
+                    "共 ${models.size} 个模型 · ${families.size} 个家族",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                families.forEach { (family, members) ->
                     Text(
-                        "${model.displayName} · ${model.familyName}",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        "$family · ${members.size}",
+                        modifier = Modifier.padding(top = 10.dp, bottom = 2.dp),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
                     )
+                    members.forEach { model ->
+                        Text(
+                            model.displayName,
+                            modifier = Modifier.padding(start = 12.dp, top = 1.dp),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
             }
-        }
-    }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
+    )
 }
 
 /**
@@ -564,8 +637,7 @@ private fun IntentNote() {
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Text(
-                "让模型凭第一反应写出约 300 个 1–355 的整数。每个模型写出的“随机数”分布相对稳定，" +
-                    "把结果与检测包比对就能看出后端最接近哪个模型。",
+                "让模型凭第一反应写约 300 个 1–355 整数，再与检测包比对。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -613,12 +685,14 @@ private fun SupplierPicker(
 }
 
 /**
- * Model filter, tick list and selection summary.
+ * Model filter, its list dialog and the selection summary.
  *
- * The text field is a search key over the supplier's catalogue, not a model name;
- * ticking rows chooses what to detect, in tick order. When the keyword matches nothing
- * — including a supplier whose models were never pulled — the typed name is offered as
- * a model of its own, so such a model stays reachable.
+ * The text field is a search key over the supplier's catalogue, not a model name; the
+ * catalogue itself lives behind the list button, where ticking rows chooses what to
+ * detect, in tick order. Keeping the list off the panel is what keeps the run button and
+ * the challenge cards on screen. When the keyword matches nothing — including a supplier
+ * whose models were never pulled — the typed name is offered as a model of its own, so
+ * such a model stays reachable.
  */
 @Composable
 private fun ModelPicker(
@@ -630,93 +704,151 @@ private fun ModelPicker(
 ) {
     val matches = filterModels(state.models, state.modelFilter)
     val unmatched = unmatchedKeyword(state.models, state.modelFilter)
+    var listOpen by rememberSaveable { mutableStateOf(false) }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text("模型", style = MaterialTheme.typography.labelLarge)
 
-        OutlinedTextField(
-            value = state.modelFilter,
-            onValueChange = onFilterChange,
-            modifier = Modifier.fillMaxWidth(),
-            enabled = enabled,
-            singleLine = true,
-            label = { Text("筛选模型") },
-            placeholder = { Text("输入关键词，筛选该供应商的模型") },
-            leadingIcon = { Icon(Icons.Outlined.Search, contentDescription = null) },
-            trailingIcon = {
-                if (state.modelFilter.isNotEmpty()) {
-                    IconButton(onClick = { onFilterChange("") }, enabled = enabled) {
-                        Icon(Icons.Outlined.Close, contentDescription = "清空筛选")
-                    }
-                }
-            },
-        )
-
-        if (state.models.isEmpty() && unmatched == null) {
-            Text(
-                "该供应商还没有已拉取的模型。到“模型测试”里拉取后即可勾选；也可以直接把模型名" +
-                    "输入上面的筛选框，列表里会出现一行供你勾选。",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        } else {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    // Five rows at a time; the rest scroll inside this box so the run
-                    // button and the challenge cards are never pushed off the page.
-                    .heightIn(max = MODEL_ROW_HEIGHT * VISIBLE_MODEL_ROWS)
-                    .verticalScroll(rememberScrollState()),
-            ) {
-                unmatched?.let { keyword ->
-                    ModelRow(
-                        label = keyword,
-                        supporting = "该供应商的列表里没有这个名字，将直接用它检测",
-                        order = state.selectedModels.indexOf(keyword).takeIf { it >= 0 }?.plus(1),
-                        selected = keyword in state.selectedModels,
-                        enabled = enabled,
-                        onToggle = { onToggleModel(keyword) },
-                    )
-                }
-                matches.forEach { model ->
-                    ModelRow(
-                        label = model,
-                        supporting = null,
-                        order = state.selectedModels.indexOf(model).takeIf { it >= 0 }?.plus(1),
-                        selected = model in state.selectedModels,
-                        enabled = enabled,
-                        onToggle = { onToggleModel(model) },
-                    )
-                }
-            }
-        }
-
         Row(
             modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text(
-                if (state.selectedModels.isEmpty()) {
-                    "勾选要检测的模型；勾一个就测一个，勾多个会按勾选顺序逐个检测。"
-                } else {
-                    "将按顺序检测：" + state.selectedModels.joinToString(" → ")
-                },
+            OutlinedTextField(
+                value = state.modelFilter,
+                onValueChange = onFilterChange,
                 modifier = Modifier.weight(1f),
-                style = MaterialTheme.typography.bodySmall,
-                color = if (state.selectedModels.isEmpty()) {
-                    MaterialTheme.colorScheme.onSurfaceVariant
-                } else {
-                    MaterialTheme.colorScheme.primary
+                enabled = enabled,
+                singleLine = true,
+                label = { Text("筛选模型") },
+                // 没有 placeholder：聚焦时它会被挤成两行，而字段名已经说明这里是筛选用。
+                leadingIcon = { Icon(Icons.Outlined.Search, contentDescription = null) },
+                trailingIcon = {
+                    if (state.modelFilter.isNotEmpty()) {
+                        IconButton(onClick = { onFilterChange("") }, enabled = enabled) {
+                            Icon(Icons.Outlined.Close, contentDescription = "清空筛选")
+                        }
+                    }
                 },
             )
-            if (state.selectedModels.isNotEmpty()) {
-                TextButton(
-                    onClick = onClearSelection,
+            BadgedBox(
+                badge = {
+                    if (state.selectedModels.isNotEmpty()) {
+                        Badge { Text("${state.selectedModels.size}") }
+                    }
+                },
+            ) {
+                OutlinedIconButton(
+                    onClick = { listOpen = true },
                     enabled = enabled,
-                ) { Text("清空") }
+                    modifier = Modifier.size(52.dp),
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Outlined.List,
+                        contentDescription = "选择模型",
+                        modifier = Modifier.size(22.dp),
+                    )
+                }
             }
         }
+
+        Text(
+            if (state.selectedModels.isEmpty()) {
+                "勾一个测一个；多选按勾选顺序逐个检测。"
+            } else {
+                "将按顺序检测：" + state.selectedModels.joinToString(" → ")
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = if (state.selectedModels.isEmpty()) {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            } else {
+                MaterialTheme.colorScheme.primary
+            },
+        )
     }
+
+    if (listOpen) {
+        ModelListDialog(
+            matches = matches,
+            unmatched = unmatched,
+            catalogueEmpty = state.models.isEmpty(),
+            selectedModels = state.selectedModels,
+            enabled = enabled,
+            onToggleModel = onToggleModel,
+            onClearSelection = onClearSelection,
+            onDismiss = { listOpen = false },
+        )
+    }
+}
+
+/**
+ * The catalogue as a dialog, one row per model plus the typed fallback.
+ *
+ * The filter field above keeps working while this is open, so typing narrows the list
+ * here rather than behind the dialog. "清空" lives here rather than on the panel because
+ * this is the only place a tick can be undone.
+ */
+@Composable
+private fun ModelListDialog(
+    matches: List<String>,
+    unmatched: String?,
+    catalogueEmpty: Boolean,
+    selectedModels: List<String>,
+    enabled: Boolean,
+    onToggleModel: (String) -> Unit,
+    onClearSelection: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("选择模型") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (catalogueEmpty && unmatched == null) {
+                    Text(
+                        "暂无模型；可在「模型测试」拉取，或直接输入模型名。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            // 一屏五行；其余在这个框里滚动，弹窗本身不会再长高。
+                            .heightIn(max = MODEL_ROW_HEIGHT * VISIBLE_MODEL_ROWS)
+                            .verticalScroll(rememberScrollState()),
+                    ) {
+                        unmatched?.let { keyword ->
+                            ModelRow(
+                                label = keyword,
+                                supporting = "该供应商的列表里没有这个名字，将直接用它检测",
+                                order = selectedModels.indexOf(keyword).takeIf { it >= 0 }?.plus(1),
+                                selected = keyword in selectedModels,
+                                enabled = enabled,
+                                onToggle = { onToggleModel(keyword) },
+                            )
+                        }
+                        matches.forEach { model ->
+                            ModelRow(
+                                label = model,
+                                supporting = null,
+                                order = selectedModels.indexOf(model).takeIf { it >= 0 }?.plus(1),
+                                selected = model in selectedModels,
+                                enabled = enabled,
+                                onToggle = { onToggleModel(model) },
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("完成") } },
+        dismissButton = {
+            if (selectedModels.isNotEmpty()) {
+                TextButton(onClick = onClearSelection) { Text("清空") }
+            }
+        },
+    )
 }
 
 @Composable
@@ -778,7 +910,13 @@ private fun ModelRow(
     }
 }
 
-/** The batch output: one row per tested model, in the order they were run. */
+/**
+ * The batch output: one row per tested model, in the order they were run.
+ *
+ * A finished row opens on tap and shows that model's candidate ranking — the same list the
+ * single-model analysis card shows, so a batch no longer tells you less about a model than
+ * testing it alone did.
+ */
 @Composable
 private fun BatchResultList(results: List<ModelFingerprintResult>) {
     val settled = settledModelCount(results)
@@ -790,51 +928,88 @@ private fun BatchResultList(results: List<ModelFingerprintResult>) {
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         results.forEachIndexed { index, row ->
+            val expandable = row.status == ModelDetectionStatus.DONE
+            var expanded by rememberSaveable(row.model, row.status) { mutableStateOf(false) }
             OutlinedCard {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 12.dp, vertical = 10.dp),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        "${index + 1}",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    Column(modifier = Modifier.weight(1f)) {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .then(
+                                if (expandable) {
+                                    Modifier.clickable(
+                                        interactionSource = remember { MutableInteractionSource() },
+                                        indication = null,
+                                        role = Role.Button,
+                                    ) { expanded = !expanded }
+                                } else {
+                                    Modifier
+                                },
+                            )
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
                         Text(
-                            row.model,
-                            style = MaterialTheme.typography.bodyLarge,
-                            maxLines = 1,
-                            softWrap = false,
-                            overflow = TextOverflow.Ellipsis,
+                            "${index + 1}",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
-                        Text(
-                            when (row.status) {
-                                ModelDetectionStatus.PENDING -> "等待检测"
-                                ModelDetectionStatus.RUNNING -> "正在检测…"
-                                ModelDetectionStatus.DONE ->
-                                    listOfNotNull(row.candidateName, row.familyName).joinToString(" · ") +
-                                        "（有效回答 ${row.usableAnswers}/${row.submittedAnswers}）"
-                                ModelDetectionStatus.FAILED -> row.error ?: "检测失败"
-                            },
-                            style = MaterialTheme.typography.labelSmall,
-                            color = when (row.status) {
-                                ModelDetectionStatus.DONE -> Color(0xFF15803D)
-                                ModelDetectionStatus.FAILED -> MaterialTheme.colorScheme.error
-                                ModelDetectionStatus.RUNNING -> Color(0xFF1D4ED8)
-                                ModelDetectionStatus.PENDING -> MaterialTheme.colorScheme.onSurfaceVariant
-                            },
-                            maxLines = 2,
-                        )
-                    }
-                    if (row.status == ModelDetectionStatus.DONE) {
-                        row.probability?.let { probability ->
+                        Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                "${(probability * 100).toInt()}%",
-                                style = MaterialTheme.typography.titleSmall,
+                                row.model,
+                                style = MaterialTheme.typography.bodyLarge,
+                                maxLines = 1,
+                                softWrap = false,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                when (row.status) {
+                                    ModelDetectionStatus.PENDING -> "等待检测"
+                                    ModelDetectionStatus.RUNNING -> "正在检测…"
+                                    ModelDetectionStatus.DONE ->
+                                        listOfNotNull(row.candidateName, row.familyName).joinToString(" · ") +
+                                            "（有效回答 ${row.usableAnswers}/${row.submittedAnswers}）"
+                                    ModelDetectionStatus.FAILED -> row.error ?: "检测失败"
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = when (row.status) {
+                                    ModelDetectionStatus.DONE -> Color(0xFF15803D)
+                                    ModelDetectionStatus.FAILED -> MaterialTheme.colorScheme.error
+                                    ModelDetectionStatus.RUNNING -> Color(0xFF1D4ED8)
+                                    ModelDetectionStatus.PENDING -> MaterialTheme.colorScheme.onSurfaceVariant
+                                },
+                                maxLines = 2,
+                            )
+                        }
+                        if (row.status == ModelDetectionStatus.DONE) {
+                            row.probability?.let { probability ->
+                                Text(
+                                    "${(probability * 100).toInt()}%",
+                                    style = MaterialTheme.typography.titleSmall,
+                                )
+                            }
+                            Icon(
+                                if (expanded) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore,
+                                contentDescription = if (expanded) "收起候选" else "展开候选",
+                                modifier = Modifier.size(20.dp),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                    if (expanded) {
+                        if (row.candidates.isEmpty()) {
+                            Text(
+                                "这个模型没有候选数据。",
+                                modifier = Modifier.padding(start = 12.dp, end = 12.dp, bottom = 10.dp),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        } else {
+                            CandidateList(
+                                candidates = row.candidates,
+                                modifier = Modifier.padding(start = 12.dp, end = 12.dp, bottom = 10.dp),
+                                showTitle = false,
                             )
                         }
                     }
@@ -847,6 +1022,12 @@ private fun BatchResultList(results: List<ModelFingerprintResult>) {
 /** Row height used to cap the model list at [VISIBLE_MODEL_ROWS] rows. */
 private val MODEL_ROW_HEIGHT = 48.dp
 
+/** Past this the dialog scrolls instead of growing past the screen. */
+private val MODELS_DIALOG_MAX_HEIGHT = 380.dp
+
+/** Where the detection package's reference data comes from. */
+private const val LM_DETECTOR_URL = "https://github.com/Ikaleio/lm-detector"
+
 @Composable
 private fun ChallengeList(
     state: FingerprintUiState,
@@ -854,7 +1035,7 @@ private fun ChallengeList(
     onRetryChallenge: (Int) -> Unit,
     onRegenerate: () -> Unit,
 ) {
-    val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
     val manual = state.mode == DetectionMode.MANUAL
     // In manual mode nothing sets RECEIVED until analysis runs, so count pastes that
     // already clear the threshold; otherwise the header reads 0/3 while three usable
@@ -906,9 +1087,18 @@ private fun ChallengeList(
                 manual = state.mode == DetectionMode.MANUAL,
                 enabled = !state.isRunning,
                 minimumNumbers = minimumNumbersFor(entry.challenge.expectedCount, state.minimumValidNumbers),
-                onCopy = { clipboard.setText(AnnotatedString(entry.challenge.prompt)) },
+                onCopy = {
+                    copyToClipboard(
+                        context,
+                        entry.challenge.prompt,
+                        "已复制题目 ${index + 1} 的提示词",
+                    )
+                },
                 onAnswerChange = { onManualAnswerChange(index, it) },
                 onRetry = { onRetryChallenge(index) },
+                // 哪几题还有没跑完的：由视图模型按**本轮所有模型**的缓存派生，不能看
+                // progress——它最后只留最后一个模型的回答，前面失败的模型会因此丢掉入口。
+                retryable = index in state.retryableQuestionIndices,
             )
         }
     }
@@ -924,6 +1114,7 @@ private fun ChallengeCard(
     onCopy: () -> Unit,
     onAnswerChange: (String) -> Unit,
     onRetry: () -> Unit,
+    retryable: Boolean,
 ) {
     OutlinedCard {
         Column(
@@ -948,7 +1139,12 @@ private fun ChallengeCard(
                     softWrap = false,
                     overflow = TextOverflow.Ellipsis,
                 )
-                IconButton(onClick = onCopy, enabled = enabled) {
+                // 不带涟漪：复制由弹窗确认，格子上的圆形高光只是多余的一闪。
+                QuietIconButton(
+                    onClick = onCopy,
+                    modifier = Modifier.size(48.dp),
+                    enabled = enabled,
+                ) {
                     Icon(
                         Icons.Outlined.ContentCopy,
                         contentDescription = "复制题目 ${index + 1} 的提示词",
@@ -965,9 +1161,11 @@ private fun ChallengeCard(
 
             entry.error?.let { error ->
                 Text(error, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
-                if (!manual) {
-                    OutlinedButton(onClick = onRetry, enabled = enabled) { Text("重试本题") }
-                }
+            }
+            // 断掉的这一轮从这里接着跑：题目没拿到有效回答、结果行却还在，就值得单独重试
+            // 这一题；没有这个入口，一次中断就只能把整轮从头再来。
+            if (!manual && retryable) {
+                OutlinedButton(onClick = onRetry, enabled = enabled) { Text("重试本题") }
             }
 
             if (manual) {
@@ -1080,10 +1278,9 @@ private fun DetectionResultCard(analysis: com.relaytester.app.core.fingerprint.F
             if (analysis.candidates.firstOrNull()?.probability == null) {
                 Text(
                     if (analysis.usableAnswers < 3) {
-                        "只有 ${analysis.usableAnswers}/3 条有效回答：先给出候选排序，" +
-                            "补齐三条有效回答后才有检验分数与置信度。"
+                        "仅 ${analysis.usableAnswers}/3 条有效回答：只给排序，无置信度。"
                     } else {
-                        "这份检测包没有可用的置信度标定，本结果只按候选排序给出。"
+                        "本包无置信度标定，只给排序。"
                     },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1091,16 +1288,14 @@ private fun DetectionResultCard(analysis: com.relaytester.app.core.fingerprint.F
             }
             if (analysis.verifierAgrees == false) {
                 Text(
-                    "排名与核验给出的第一候选不一致：候选顺序仍由排名分数决定，请谨慎对待。",
+                    "排名与核验的第一候选不一致，请谨慎。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
                 )
             }
             HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
             Text(
-                "这是检测包内的封闭集合排序：不在库中的模型同样会得到一个最接近的候选，" +
-                    "分数不是身份证明。同家族相邻版本的区分尤其需要谨慎。置信度是检测包标定的，" +
-                    "不是「这就是该模型」的概率。",
+                "仅为库内最接近候选，非身份证明；相近版本需谨慎。",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -1109,9 +1304,15 @@ private fun DetectionResultCard(analysis: com.relaytester.app.core.fingerprint.F
 }
 
 @Composable
-private fun CandidateList(candidates: List<FingerprintCandidate>) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("候选排序", style = MaterialTheme.typography.titleMedium)
+private fun CandidateList(
+    candidates: List<FingerprintCandidate>,
+    modifier: Modifier = Modifier,
+    showTitle: Boolean = true,
+) {
+    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (showTitle) {
+            Text("候选排序", style = MaterialTheme.typography.titleMedium)
+        }
         candidates.take(RENDERED_CANDIDATES).forEachIndexed { index, candidate ->
             OutlinedCard {
                 Row(

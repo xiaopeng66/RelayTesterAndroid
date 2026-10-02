@@ -179,11 +179,6 @@ internal class BalanceQueryScript {
         else -> null
     }
 
-    private fun String.redactSecrets(): String = replace(
-        Regex("(?i)(bearer\\s+|x-api-key[=:]\\s*|api[_-]?key[=:]\\s*|access[_-]?token[=:]\\s*)[^\\s,}]+"),
-        "\$1***",
-    )
-
     private companion object {
         const val MAX_SCRIPT_CHARS = 16 * 1024
         const val MAX_SCRIPT_OUTPUT_CHARS = 16 * 1024

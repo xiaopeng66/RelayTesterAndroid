@@ -125,7 +125,7 @@ fun ConfigurationBackupDialog(
     when {
         state.exportPayload != null -> ConfigurationBackupBusyDialog(
             title = "等待保存位置",
-            description = "请在系统文件选择器中保存备份。取消后不会改变现有配置。",
+            description = "在系统文件选择器中保存；取消不影响现有配置。",
         )
 
         state.isBusy -> ConfigurationBackupBusyDialog(
@@ -231,11 +231,11 @@ private fun ConfigurationBackupHomeDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(
-                    "备份会迁移供应商、模型、测试参数和余额模板。",
+                    "含供应商、模型、参数、余额模板与全部凭据（API Key、PAT、用户 ID）。",
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 Text(
-                    "其中包含 API Key、PAT 和用户 ID；测试结果 JSON 不包含这些凭据。",
+                    "测试结果 JSON 不含这些凭据。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -314,7 +314,7 @@ private fun ConfigurationBackupExportPasswordDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
-                    "请使用至少 ${ConfigurationBackupCodec.MIN_PASSWORD_LENGTH} 个字符的独立密码。备份中包含敏感凭据。",
+                    "至少 ${ConfigurationBackupCodec.MIN_PASSWORD_LENGTH} 个字符的独立密码；备份含敏感凭据。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -369,9 +369,9 @@ private fun ConfigurationBackupImportPasswordDialog(
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
                     if (encrypted) {
-                        "输入创建此备份时的密码。验证成功后会先显示摘要，尚不会覆盖当前配置。"
+                        "输入创建时的密码；验证后先看摘要，不会立即覆盖。"
                     } else {
-                        "正在读取未加密备份，稍后会显示摘要。"
+                        "正在读取未加密备份，稍后显示摘要。"
                     },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -429,7 +429,7 @@ private fun ConfigurationBackupImportConfirmationDialog(
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 Text(
-                    "继续会替换当前全部配置，并清空本次运行的测试结果与余额快照；不会自动请求站点。",
+                    "继续会替换全部配置，并清空本次运行的测试结果与余额快照；不会自动请求站点。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
                 )

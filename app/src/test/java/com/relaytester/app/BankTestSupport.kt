@@ -130,6 +130,133 @@ internal fun bankWithMinimumValid(value: Int): ByteArray {
 internal fun bankWithTrailingByte(): ByteArray = BankFixtures.packageBytes() + byteArrayOf(0)
 
 /**
+ * The fixture re-packed with an environment section whose rows are [columns] wide.
+ *
+ * Patching only the width field would desynchronise the stream — every array is sized
+ * from the file, so the rows behind it would be read at the wrong stride and the package
+ * would be refused for "length does not match content" instead. The section is therefore
+ * rebuilt at the new width, which is what a package assembled for another feature width
+ * really looks like.
+ */
+private fun bankReaderAtEnvironments(bytes: ByteArray): BankReader {
+    val reader = BankReader(bytes)
+    reader.expectMagic("LMFPA002")
+    reader.string() // source reference digest
+    reader.string() // build stamp
+    reader.string() // reference digest
+    val modelCount = reader.u32()
+    repeat(modelCount) { repeat(4) { reader.string() } }
+    reader.float64() // tau
+    reader.float64() // recommended queries
+    reader.float64() // minimum valid numbers
+
+    fun params() {
+        val blocks = reader.u32()
+        repeat(blocks) {
+            val size = reader.u32()
+            reader.floats(size)
+            reader.floats(size)
+        }
+    }
+
+    fun featureBank() {
+        val size = reader.u32()
+        reader.floats(size)
+        reader.floats(size)
+        val basisRows = reader.u32()
+        if (basisRows > 0) reader.matrix(basisRows, reader.u32())
+        reader.matrix(reader.u32(), size)
+    }
+
+    params() // LDA standardiser
+    reader.matrix(reader.u32(), reader.u32()) // LDA weights
+    reader.floats(reader.u32()) // LDA bias
+    params() // full-feature standardiser
+    featureBank() // Hellinger bank
+    featureBank() // ordered bank
+    return reader
+}
+
+internal fun bankWithEnvironmentColumns(columns: Int): ByteArray {
+    val bytes = BankFixtures.packageBytes()
+    val reader = bankReaderAtEnvironments(bytes)
+    val environmentCount = reader.u32()
+    val models = reader.u32()
+    val storedColumns = reader.u32()
+    val widthAt = reader.consumed - Int.SIZE_BYTES
+    require(environmentCount > 0 && models > 0) { "夹具的环境模板段是空的，改写没有意义" }
+    require(columns != storedColumns) { "改写后的宽度与夹具相同：$storedColumns" }
+    val storedBytes = environmentCount * models * storedColumns * Int.SIZE_BYTES
+
+    val out = java.io.ByteArrayOutputStream(bytes.size + environmentCount * models * columns * Int.SIZE_BYTES)
+    out.write(bytes, 0, widthAt)
+    for (index in 0 until Int.SIZE_BYTES) out.write((columns shr (8 * index)) and 0xFF)
+    // Zero rows: the row count and width are what the reader takes from the file, and a
+    // zero template still passes every finiteness check the package runs.
+    out.write(ByteArray(environmentCount * models * columns * Int.SIZE_BYTES))
+    out.write(bytes, widthAt + Int.SIZE_BYTES + storedBytes, bytes.size - widthAt - Int.SIZE_BYTES - storedBytes)
+    require(out.size() != bytes.size) { "改写后的长度与夹具相同" }
+    return out.toByteArray()
+}
+
+internal fun bankWithVerifierReferenceColumns(columns: Int): ByteArray {
+    val bytes = BankFixtures.packageBytes()
+    val reader = bankReaderAtEnvironments(bytes)
+    val environmentCount = reader.u32()
+    if (environmentCount > 0) {
+        val models = reader.u32()
+        val width = reader.u32()
+        repeat(environmentCount) { reader.matrix(models, width) }
+    }
+    reader.quantizedReferences()
+    repeat(reader.u32()) {
+        val size = reader.u32()
+        reader.floats(size)
+        reader.floats(size)
+    }
+    reader.float64()
+    reader.floats(reader.u32())
+    reader.matrix(reader.u32(), reader.u32())
+    reader.floats(reader.u32())
+
+    fun gaussian() {
+        reader.matrix(reader.u32(), reader.u32())
+        reader.float64()
+    }
+
+    gaussian()
+    repeat(reader.u32()) {
+        reader.floats(reader.u32())
+        repeat(4) { gaussian() }
+    }
+    val sectionAt = reader.consumed
+    val bits = reader.u32()
+    val storedColumns = reader.u32()
+    val models = reader.u32()
+    require(columns > 0 && columns != storedColumns && models > 0)
+    val width = bits / 8
+    val out = java.io.ByteArrayOutputStream()
+    out.write(bytes, 0, sectionAt)
+
+    fun writeU32(value: Int) {
+        repeat(Int.SIZE_BYTES) { index -> out.write((value shr (8 * index)) and 0xFF) }
+    }
+
+    writeU32(bits)
+    writeU32(columns)
+    writeU32(models)
+    repeat(models) {
+        val rows = reader.u32()
+        writeU32(rows)
+        out.write(reader.bytes(rows * Float.SIZE_BYTES))
+        reader.bytes(rows * storedColumns * width)
+        out.write(ByteArray(rows * columns * width))
+    }
+    out.write(bytes, reader.consumed, bytes.size - reader.consumed)
+    return out.toByteArray()
+}
+
+/**
  * An in-memory [BankFileSystem].
  *
  * The real one needs a Context, and none of this behaviour needs a device: whether a
@@ -158,6 +285,8 @@ internal class MemoryBankFileSystem(
         private set
 
     override fun installedLength(): Long? = installed?.size?.toLong()
+
+    override fun backupLength(): Long? = backup?.size?.toLong()
 
     override fun readInstalled(): ByteArray? {
         installedReads++

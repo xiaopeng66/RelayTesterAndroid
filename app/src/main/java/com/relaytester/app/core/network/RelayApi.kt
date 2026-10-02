@@ -354,9 +354,9 @@ open class RelayApi(
     }
 
     private fun protocolHint(body: JSONObject, fallback: String): String = when {
-        body.has("choices") -> "上游返回 Chat 格式响应，请将接口协议切换为 Chat"
-        body.has("output") -> "上游返回 Responses 格式响应，请将接口协议切换为 Responses"
-        body.has("content") -> "上游返回 Anthropic 格式响应，请将接口协议切换为 Anthropic"
+        body.has("choices") -> "上游返回 Chat 格式；请把协议切换为 Chat"
+        body.has("output") -> "上游返回 Responses 格式；请把协议切换为 Responses"
+        body.has("content") -> "上游返回 Anthropic 格式；请把协议切换为 Anthropic"
         else -> fallback
     }
 
@@ -391,8 +391,16 @@ open class RelayApi(
         )
     }
 
-    private fun errorForThrowable(error: Throwable): TestError = when (error) {
+    internal fun errorForThrowable(error: Throwable): TestError = when (error) {
         is InterruptedIOException -> TestError(ErrorKind.TIMEOUT, "请求超时")
+        // Before the generic IOException: an oversized body is a property of the upstream
+        // answer, not of the link. Reported as a network failure it also entered the retry
+        // set, so the largest responses burned the whole retry budget and then blamed the
+        // connection.
+        is ResponseTooLargeException -> TestError(
+            ErrorKind.INVALID_RESPONSE,
+            "响应体过大（超过 ${MAX_RESPONSE_BYTES / 1024} KB）",
+        )
         // Before the generic IOException: the refusal carries the reason a redirect was
         // not followed, and collapsing it to "网络连接失败" would hide an attack shape.
         is RedirectRefusedException ->
@@ -415,11 +423,6 @@ open class RelayApi(
         // Authorization/API-key value can never reach the result list or export.
         body.replace(Regex("\\s+"), " ").redactSecrets().take(MAX_ERROR_CHARS)
     }
-
-    private fun String.redactSecrets(): String = replace(
-        Regex("(?i)(bearer\\s+|x-api-key[=:]\\s*|api[_-]?key[=:]\\s*)[^\\s,}]+"),
-        "$1***",
-    )
 
     private fun failed(
         model: String,
@@ -447,7 +450,7 @@ open class RelayApi(
             val buffer = Buffer()
             while (source.read(buffer, READ_CHUNK_BYTES) != -1L) {
                 if (buffer.size > MAX_RESPONSE_BYTES) {
-                    throw IOException("响应体过大")
+                    throw ResponseTooLargeException()
                 }
             }
             return buffer.readUtf8()
@@ -458,6 +461,9 @@ open class RelayApi(
         val status: Int,
         val body: String,
     )
+
+    /** An answer larger than [MAX_RESPONSE_BYTES]; the link is fine, the answer is not. */
+    internal class ResponseTooLargeException : IOException("响应体过大")
 
     private companion object {
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()

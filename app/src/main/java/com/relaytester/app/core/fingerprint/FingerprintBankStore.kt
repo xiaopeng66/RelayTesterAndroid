@@ -87,6 +87,9 @@ interface BankFileSystem {
     /** Length of the installed package, or null when none exists. */
     fun installedLength(): Long?
 
+    /** Length of the rollback copy, or null when there is none. */
+    fun backupLength(): Long?
+
     /** The installed package, or null when none exists. */
     fun readInstalled(): ByteArray?
 
@@ -113,6 +116,8 @@ class AndroidBankFileSystem(context: Context) : BankFileSystem {
     private val backup = File(installed.parentFile, "${installed.name}.bak")
 
     override fun installedLength(): Long? = if (installed.isFile) installed.length() else null
+
+    override fun backupLength(): Long? = if (backup.isFile) backup.length() else null
 
     override fun readInstalled(): ByteArray? =
         if (installed.isFile) installed.readBytes() else null
@@ -282,27 +287,29 @@ class FingerprintBankStore(
      *
      * A file that cannot be removed stays the active package, which the panel has to
      * say instead of claiming the removal happened.
+     *
+     * The rollback copy counts as a package here: when the installed file is missing it is
+     * the one [probe] adopts, so removing only the installed file would leave the panel
+     * empty until the next launch, when the copy would be adopted again — the deletion the
+     * user asked for would silently undo itself.
      */
     @Synchronized
     fun discardInstalled(): BankDiscardResult {
-        val present = try {
-            files.installedLength() != null
-        } catch (error: IOException) {
-            false
+        val installedPresent = present { files.installedLength() }
+        val backupPresent = present { files.backupLength() }
+        // Remove the rollback copy first: a surviving copy would be adopted at next launch.
+        if (backupPresent) {
+            try {
+                files.deleteBackup()
+            } catch (error: IOException) {
+                return BankDiscardResult.Failed
+            }
         }
-        if (present) {
+        if (installedPresent) {
             try {
                 files.deleteInstalled()
             } catch (error: IOException) {
                 return BankDiscardResult.Failed
-            }
-            // Best effort, and after the delete that matters: a leftover rollback copy is
-            // not what the user asked to remove, and reporting a failure here would leave
-            // the panel claiming the package is still installed after it is gone.
-            try {
-                files.deleteBackup()
-            } catch (error: IOException) {
-                // ignored on purpose
             }
         }
         cached = null
@@ -311,7 +318,18 @@ class FingerprintBankStore(
         usedBackup = false
         problem = null
         probed = true
-        return if (present) BankDiscardResult.Removed else BankDiscardResult.NothingInstalled
+        return if (installedPresent || backupPresent) {
+            BankDiscardResult.Removed
+        } else {
+            BankDiscardResult.NothingInstalled
+        }
+    }
+
+    /** An unreadable path is treated as absent, as [probe] does. */
+    private inline fun present(length: () -> Long?): Boolean = try {
+        length() != null
+    } catch (error: IOException) {
+        false
     }
 
     /**

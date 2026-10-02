@@ -20,6 +20,7 @@ import com.relaytester.app.core.fingerprint.ChallengeGenerator
 import com.relaytester.app.core.fingerprint.FingerprintAnalysis
 import com.relaytester.app.core.fingerprint.FingerprintBank
 import com.relaytester.app.core.fingerprint.FingerprintBankStore
+import com.relaytester.app.core.fingerprint.FingerprintCandidate
 import com.relaytester.app.core.fingerprint.FingerprintChallenge
 import com.relaytester.app.core.fingerprint.LoadedBank
 import com.relaytester.app.core.fingerprint.OkHttpBankFetcher
@@ -92,6 +93,16 @@ data class ModelFingerprintResult(
     val usableAnswers: Int = 0,
     val submittedAnswers: Int = 0,
     val error: String? = null,
+    /**
+     * This model's full ranking, so a finished row can be opened and read.
+     *
+     * A batch used to keep only the winner, which meant testing a model inside a batch
+     * told you less than testing it alone. The list is the same one the single-model card
+     * renders, so the two views agree by construction.
+     */
+    val candidates: List<FingerprintCandidate> = emptyList(),
+    /** False when the verifier disagreed with the ranking's winner (see the card's caveat). */
+    val verifierAgrees: Boolean? = null,
 )
 
 @Immutable
@@ -123,6 +134,15 @@ data class FingerprintUiState(
     val bankModels: List<BankModelInfo> = emptyList(),
     /** True while a user-requested check is talking to the release endpoint. */
     val isCheckingBankUpdate: Boolean = false,
+    /**
+     * True while the panel's own entry check is in flight.
+     *
+     * Kept apart from [isCheckingBankUpdate] on purpose: the entry check is nobody's
+     * button, so it must not put the card's controls into a waiting state, block a manual
+     * check or hold up a detection round. It only decides whether the delay is worth a
+     * silent retry.
+     */
+    val isCheckingBankInBackground: Boolean = false,
     /** True while the checked bank is downloading and being installed. */
     val isInstallingBank: Boolean = false,
     /** Set when a check found a different published bank. */
@@ -147,6 +167,8 @@ data class FingerprintUiState(
     val useParallel: Boolean = true,
     val isRunning: Boolean = false,
     val progress: List<ChallengeProgress> = emptyList(),
+    /** Question slots that can continue the cached API round across its models. */
+    val retryableQuestionIndices: Set<Int> = emptySet(),
     /** Floor from the reference bank; the panel previews pastes against it. */
     val minimumValidNumbers: Int = 80,
     val analysis: FingerprintAnalysis? = null,
@@ -238,6 +260,78 @@ class FingerprintViewModel(
     val uiState = _uiState
 
     private var runJob: Job? = null
+
+    /**
+     * Every model's answers from the last round, by model.
+     *
+     * Re-scoring after a single-question retry needs the answers that model gave to the
+     * other questions, and [FingerprintUiState.progress] cannot supply them: it is one
+     * screen-wide list that each model overwrites as the batch walks down the rows, so by
+     * the end it holds only the last model's answers.
+     */
+    private var roundAnswers: Map<String, List<ChallengeProgress>> = emptyMap()
+
+    /**
+     * Stores one slot of one model's round, as soon as the request that slot owns returns.
+     *
+     * Written per challenge rather than once per model on purpose: a round that is
+     * cancelled with two answers already in hand must keep them, or the retry of the
+     * interrupted slot would have to start the whole round over.
+     */
+    private fun cacheAnswer(
+        model: String,
+        index: Int,
+        challenges: List<FingerprintChallenge>,
+        answer: ChallengeProgress,
+    ) {
+        val slots = roundAnswers[model]?.toMutableList()
+            ?.takeIf { it.size == challenges.size }
+            ?: challenges.map { challenge -> ChallengeProgress(challenge) }.toMutableList()
+        if (index !in slots.indices) return
+        slots[index] = answer
+        setRoundAnswers(roundAnswers + (model to slots))
+    }
+
+    /** Publishes the answers and the retry entry they imply in one write. */
+    private fun setRoundAnswers(next: Map<String, List<ChallengeProgress>>) {
+        roundAnswers = next
+        _uiState.update { it.copy(retryableQuestionIndices = retryableFrom(next)) }
+    }
+
+    /**
+     * Which question slots still have something to finish.
+     *
+     * Derived across every model of the round, not from the progress list: that list ends
+     * up holding only the last model's answers, so a model that failed early would lose
+     * its "重试本题" button the moment a healthy model finished. A slot counts as
+     * retryable when any model still lacks a received answer for it.
+     */
+    private fun retryableFrom(cached: Map<String, List<ChallengeProgress>>): Set<Int> {
+        if (cached.isEmpty()) return emptySet()
+        val slots = cached.values.maxOf { it.size }
+        return (0 until slots).filterTo(mutableSetOf()) { index ->
+            cached.values.any { it.getOrNull(index)?.state != ChallengeState.RECEIVED }
+        }
+    }
+
+    /**
+     * True while a round owns the panel, including a cancelled round's tail.
+     *
+     * `isRunning` alone is not enough: it is only a published flag, while a job that was
+     * just cancelled may still be running its cleanup (a request releasing its connection,
+     * a NonCancellable block). Starting anything in that window would overlap two rounds
+     * and let the dying one write over the new one's state.
+     */
+    private fun runInFlight(): Boolean = _uiState.value.isRunning || runJob?.isCompleted == false
+
+    /**
+     * The supplier and key the last round used, so one question can be re-asked.
+     *
+     * Held from the round itself rather than re-read at retry time: a retry continues the
+     * round that is on screen, and re-reading could pick up a supplier the user changed in
+     * between.
+     */
+    private var roundCredentials: Pair<com.relaytester.app.core.model.SupplierProfile, String>? = null
 
     /** The catalogue refresh, tracked so tests can join it deterministically. */
     private var refreshJob: Job? = null
@@ -345,6 +439,8 @@ class FingerprintViewModel(
      * rather than dropped.
      */
     fun prefill(supplierId: String?, model: String) {
+        if (runInFlight()) return
+        dropRoundContext()
         if (supplierId == null) {
             _uiState.update {
                 it.copy(
@@ -384,6 +480,7 @@ class FingerprintViewModel(
         if (_uiState.value.isRunning) return
         // The challenge set is re-rolled for the new mode, so old per-model verdicts
         // can no longer describe what is on screen.
+        dropRoundContext()
         _uiState.update { it.copy(mode = mode, analysis = null, batchResults = emptyList()) }
         refreshProgress()
     }
@@ -391,6 +488,9 @@ class FingerprintViewModel(
     fun selectSupplier(supplierId: String) {
         if (_uiState.value.isRunning) return
         val supplier = knownSuppliers.firstOrNull { it.id == supplierId }
+        // The next round will use another supplier, so the last one's key must not be
+        // what a retry reaches for.
+        dropRoundContext()
         _uiState.update {
             it.copy(
                 selectedSupplierId = supplierId,
@@ -478,6 +578,8 @@ class FingerprintViewModel(
     /** Ticks or unticks [model]; the tick order is the order the round will follow. */
     fun toggleModelSelection(model: String) {
         if (_uiState.value.isRunning) return
+        // Clearing the rows clears the round they described, retry context included.
+        dropRoundContext()
         _uiState.update {
             it.copy(
                 selectedModels = toggleModel(it.selectedModels, model),
@@ -489,6 +591,7 @@ class FingerprintViewModel(
 
     fun clearModelSelection() {
         if (_uiState.value.isRunning) return
+        dropRoundContext()
         _uiState.update { it.copy(selectedModels = emptyList(), analysis = null, batchResults = emptyList()) }
     }
 
@@ -527,6 +630,8 @@ class FingerprintViewModel(
     /** Re-rolls the challenge set and clears the answers that belonged to it. */
     fun regenerateChallenges() {
         if (_uiState.value.isRunning) return
+        // The questions a round was built on are gone, so a retry has no round to continue.
+        dropRoundContext()
         _uiState.update {
             it.copy(
                 analysis = null,
@@ -539,12 +644,97 @@ class FingerprintViewModel(
         }
     }
 
-    /** Replaces the challenge at [index] with a fresh one of a different length. */
+    /**
+     * Forgets the round a single-question retry could continue.
+     *
+     * Called wherever the result rows are cleared, and wherever the supplier or the model
+     * selection changes: with no rows on screen there is no round to finish, and a stale
+     * credential would let a later retry spend a request against a configuration the user
+     * has already moved away from.
+     */
+    private fun dropRoundContext() {
+        setRoundAnswers(emptyMap())
+        roundCredentials = null
+    }
+
+    /**
+     * Re-asks one question and keeps the round it belongs to.
+     *
+     * This used to only swap in a fresh prompt and drop every result, so a round that
+     * tripped on one question had to be restarted from the first model. When there is a
+     * round to continue — a supplier and key in hand, and a result row to put the verdict
+     * on — the question is requested again for each model of that round, only that slot is
+     * replaced, and every model is re-scored from its own answers, so the panel converges
+     * on a result instead of starting over.
+     *
+     * With nothing to continue (manual mode, or before the first round) a fresh prompt is
+     * the whole retry, which is what this button has always meant there.
+     */
     fun retryChallenge(index: Int) {
-        if (_uiState.value.isRunning) return
+        if (runInFlight()) return
         val state = _uiState.value
         if (index !in state.progress.indices) return
-        val used = state.progress.map { it.challenge.expectedCount }
+
+        val credentials = roundCredentials
+        val models = state.batchResults.map { it.model }
+        if (credentials == null || models.isEmpty()) {
+            replaceChallenge(index)
+            return
+        }
+        if (refuseWhileBankJobRuns()) return
+        if (bankOrReport() == null) return
+
+        val template = state.progress.map { it.challenge }
+        val challenge = template[index]
+        runJob = viewModelScope.launch {
+            _uiState.update { it.copy(isRunning = true, analysis = null) }
+            try {
+                for (model in models) {
+                    _uiState.update { it.copy(activeModel = model) }
+                    updateResult(model) { it.copy(status = ModelDetectionStatus.RUNNING) }
+                    val answered = requestChallenge(
+                        index = index,
+                        supplier = credentials.first,
+                        apiKey = credentials.second,
+                        model = model,
+                        challenge = challenge,
+                        slots = template,
+                    )
+                    // The other slots keep that model's own answers; a model whose round
+                    // never got that far is filled with the placeholder slots the retry is
+                    // about to score, so the re-scoring never mixes two editors' answers.
+                    val previous = roundAnswers[model]
+                    val answers = (if (previous != null && previous.size == template.size) {
+                        previous.toMutableList()
+                    } else {
+                        template.map { ChallengeProgress(it) }.toMutableList()
+                    }).also { list -> list[index] = answered }
+                    setRoundAnswers(roundAnswers + (model to answers))
+                    recordRound(model, answers, answers.map { it.challenge })
+                }
+                _uiState.update { it.copy(isRunning = false, activeModel = null) }
+            } catch (error: CancellationException) {
+                // The answers already in hand are kept: they are what lets the next retry
+                // of this slot finish the round instead of starting it over.
+                _uiState.update { it.copy(isRunning = false, activeModel = null) }
+                throw error
+            } catch (error: Throwable) {
+                val reason = error.message ?: "重试中断"
+                _uiState.update { it.copy(isRunning = false, activeModel = null) }
+                abandonUnfinishedRows(reason)
+                showMessage(reason, isError = true)
+            }
+        }
+    }
+
+    /**
+     * Swaps in a fresh prompt for [index], clearing what the swap invalidated.
+     *
+     * The manual path: the panel is scoring by hand, so a different question means the
+     * verdicts on screen no longer describe the questions under them.
+     */
+    private fun replaceChallenge(index: Int) {
+        val used = _uiState.value.progress.map { it.challenge.expectedCount }
         val replacement = ChallengeGenerator.generate(count = 1, usedLengths = used).first()
         _uiState.update {
             it.copy(
@@ -562,7 +752,7 @@ class FingerprintViewModel(
         // are in, and the second tap of a double tap lands inside that window. Without
         // this both launches survive, both spend upstream requests, and `cancelRun` can
         // only reach the newer one.
-        if (_uiState.value.isRunning || runJob?.isActive == true) return
+        if (runInFlight()) return
         if (refuseWhileBankJobRuns()) return
         val state = _uiState.value
         val supplierId = state.selectedSupplierId
@@ -628,6 +818,10 @@ class FingerprintViewModel(
             showMessage("该供应商没有可用的 API Key", isError = true)
             return
         }
+        // The round's own credentials and answers: a single-question retry continues this
+        // round, and must do it with the supplier it actually ran against.
+        roundCredentials = supplier to apiKey
+        setRoundAnswers(emptyMap())
 
         _uiState.update {
             it.copy(
@@ -652,6 +846,7 @@ class FingerprintViewModel(
             updateResult(model) { it.copy(status = ModelDetectionStatus.RUNNING) }
 
             val results = requestRound(challenges, supplier, apiKey, model)
+            setRoundAnswers(roundAnswers + (model to results))
             recordRound(model, results, challenges)
         }
 
@@ -671,12 +866,12 @@ class FingerprintViewModel(
         return if (parallel) {
             coroutineScope {
                 challenges.indices.map { index ->
-                    async { requestChallenge(index, supplier, apiKey, model, challenges[index]) }
+                    async { requestChallenge(index, supplier, apiKey, model, challenges[index], challenges) }
                 }.awaitAll()
             }
         } else {
             challenges.indices.map { index ->
-                requestChallenge(index, supplier, apiKey, model, challenges[index])
+                requestChallenge(index, supplier, apiKey, model, challenges[index], challenges)
             }
         }
     }
@@ -704,6 +899,11 @@ class FingerprintViewModel(
                 usableAnswers = analysis?.usableAnswers ?: 0,
                 submittedAnswers = analysis?.submittedAnswers ?: challenges.size,
                 error = if (analysis == null) roundFailureReason(results) else null,
+                // The full ranking travels with the row: a batch row opens onto the same
+                // candidate list the single-model card shows, instead of telling the user
+                // less for testing more models.
+                candidates = analysis?.candidates.orEmpty(),
+                verifierAgrees = analysis?.verifierAgrees,
             )
         }
     }
@@ -737,6 +937,8 @@ class FingerprintViewModel(
         apiKey: String,
         model: String,
         challenge: FingerprintChallenge,
+        /** The whole round's slots, so a finished answer is cached in its own place. */
+        slots: List<FingerprintChallenge>,
     ): ChallengeProgress {
         updateProgress(index) { it.copy(state = ChallengeState.REQUESTING, answer = "", error = null) }
         val result = try {
@@ -761,6 +963,7 @@ class FingerprintViewModel(
                 error = error.message ?: "请求异常",
             )
             updateProgress(index) { rejected }
+            cacheAnswer(model, index, slots, rejected)
             return rejected
         }
         val progress = when (result) {
@@ -786,13 +989,14 @@ class FingerprintViewModel(
                 }
             }
 
-            is ApiResult.Failure -> ChallengeProgress(
+                  is ApiResult.Failure -> ChallengeProgress(
                 challenge = challenge,
                 state = ChallengeState.REJECTED,
                 error = result.error.message,
             )
         }
         updateProgress(index) { progress }
+        cacheAnswer(model, index, slots, progress)
         return progress
     }
 
@@ -889,8 +1093,10 @@ class FingerprintViewModel(
     }
 
     fun cancelRun() {
+        // The handle is deliberately kept: the cancelled job may still be finishing its
+        // cleanup, and until it really completes a new round must not start, or the dying
+        // one could write its finale over the new one's state.
         runJob?.cancel()
-        runJob = null
         _uiState.update {
             it.copy(
                 isRunning = false,
@@ -1001,9 +1207,41 @@ class FingerprintViewModel(
     }
 
     private fun startBankCheck(silent: Boolean) {
-        if (bankUpdateBusy()) return
+        val state = _uiState.value
+        // A round in flight wins: swapping the package underneath it would leave it scoring
+        // with one package while its rows report a ranking from another.
+        if (state.isRunning || state.isLoading || state.isInstallingBank) {
+            // Said out loud: a button that quietly does nothing reads as a broken button.
+            if (!silent) showMessage("检测正在进行，请稍候再试", isError = true)
+            return
+        }
+        if (state.isCheckingBankUpdate) return
+        // A second panel entry while the first silent check is still dialing: keep the
+        // job the takeover path knows how to cancel instead of stranding it and opening a
+        // duplicate request nobody owns. The check in flight already owes the offer, so
+        // nothing is left pending either.
+        if (silent && state.isCheckingBankInBackground) {
+            entryCheckPending = false
+            return
+        }
+        if (!silent) standDownBackgroundCheck()
         entryCheckPending = false
         bankUpdateJob = viewModelScope.launch { checkBankUpdateNow(silent) }
+    }
+
+    /**
+     * Stands the quiet entry check down so a job the user asked for can own the slot.
+     *
+     * Cancelling it loses nothing: its only output is the update offer, and the job that
+     * replaces it computes that same offer. What it does buy is that the user never waits
+     * on a request they did not make — and that a stale offer cannot be republished over a
+     * package a newer job just installed or removed.
+     */
+    private fun standDownBackgroundCheck() {
+        if (!_uiState.value.isCheckingBankInBackground) return
+        bankUpdateJob?.cancel()
+        bankUpdateJob = null
+        _uiState.update { it.copy(isCheckingBankInBackground = false) }
     }
 
     /**
@@ -1025,7 +1263,9 @@ class FingerprintViewModel(
      * state: [FingerprintUiState.availableBankUpdate] is set either way.
      */
     private suspend fun checkBankUpdateNow(silent: Boolean = false) {
-        _uiState.update { it.copy(isCheckingBankUpdate = true) }
+        _uiState.update {
+            if (silent) it.copy(isCheckingBankInBackground = true) else it.copy(isCheckingBankUpdate = true)
+        }
         try {
             val loaded = withContext(ioDispatcher) { bankStore.load() }.also { loadedBank = it.loaded }
             _uiState.update { it.withBank(loaded) }
@@ -1038,7 +1278,9 @@ class FingerprintViewModel(
         } catch (error: Throwable) {
             if (!silent) showMessage(error.message ?: "检查更新失败", isError = true)
         } finally {
-            _uiState.update { it.copy(isCheckingBankUpdate = false) }
+            _uiState.update {
+                if (silent) it.copy(isCheckingBankInBackground = false) else it.copy(isCheckingBankUpdate = false)
+            }
         }
     }
 
@@ -1079,6 +1321,9 @@ class FingerprintViewModel(
     fun installBankUpdate() {
         val manifest = _uiState.value.availableBankUpdate ?: return
         if (bankUpdateBusy()) return
+        // Before the field is reassigned: an entry check left running could republish the
+        // offer for the very package this install is about to make current.
+        standDownBackgroundCheck()
         bankUpdateJob = viewModelScope.launch {
             _uiState.update { it.copy(isInstallingBank = true) }
             try {
@@ -1120,6 +1365,9 @@ class FingerprintViewModel(
      */
     fun removeInstalledPackage() {
         if (bankUpdateBusy()) return
+        // Same reason as the install: the removal's own trailing check is the one whose
+        // result should stand.
+        standDownBackgroundCheck()
         bankUpdateJob = viewModelScope.launch {
             _uiState.update { it.copy(isInstallingBank = true) }
             var removed = false
@@ -1154,25 +1402,35 @@ class FingerprintViewModel(
     }
 
     /**
-     * True when a package job is in flight, so a round must not start.
+     * True when a package swap is in flight, so a round must not start.
      *
      * A round resolves the package once per model through [bankOrReport]; if an install
      * swapped the package underneath it, the rows of one batch would carry rankings and
      * reference stamps from two different packages. The reverse direction is already
-     * covered — [bankUpdateBusy] refuses to start an install during a round — so
-     * refusing here closes the pair.
+     * covered — [bankUpdateBusy] refuses to start an install during a round — so refusing
+     * here closes the pair.
+     *
+     * Only the swap counts. A check in flight — the entry one or one the user pressed —
+     * writes nothing but the offer, and a detection must not be held up by it: the entry
+     * check stands down instead, which is the whole point of its own busy flag.
      */
     private fun refuseWhileBankJobRuns(): Boolean {
-        if (bankUpdateJob?.isActive != true) return false
-        showMessage("检测包正在更新，请稍候再试", isError = true)
-        return true
+        if (_uiState.value.isInstallingBank) {
+            showMessage("检测包正在更新，请稍候再试", isError = true)
+            return true
+        }
+        standDownBackgroundCheck()
+        return false
     }
 
     /**
      * True when the panel must not start another bank job.
      *
      * A round in flight wins: swapping the bank underneath it would leave it scoring
-     * with one bank while the rows report a ranking from another.
+     * with one bank while the rows report a ranking from another. The quiet entry check is
+     * deliberately not part of this: a manual check, an install and a removal all stand it
+     * down and then run, so it cannot make the user wait for something they did not ask
+     * for.
      */
     private fun bankUpdateBusy(): Boolean {
         val state = _uiState.value
