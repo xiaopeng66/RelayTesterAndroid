@@ -1053,7 +1053,18 @@ private fun DetectionResultCard(analysis: com.relaytester.app.core.fingerprint.F
             Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                 Column {
                     Text("有效回答", style = MaterialTheme.typography.labelSmall)
-                    Text("${analysis.usableAnswers}/${analysis.submittedAnswers}", style = MaterialTheme.typography.titleSmall)
+                    // 少于 3 条就没有检验分数（红）；全部采用（绿）与部分采用（青）分开，
+                    // 与挑战行、状态词共用同一套语义色。
+                    val usableColor = when {
+                        analysis.usableAnswers < 3 -> MaterialTheme.colorScheme.error
+                        analysis.usableAnswers == analysis.submittedAnswers -> Color(0xFF15803D)
+                        else -> MaterialTheme.colorScheme.tertiary
+                    }
+                    Text(
+                        "${analysis.usableAnswers}/${analysis.submittedAnswers}",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = usableColor,
+                    )
                 }
                 Column {
                     Text("家族", style = MaterialTheme.typography.labelSmall)
