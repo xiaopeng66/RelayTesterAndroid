@@ -1069,7 +1069,7 @@ class FingerprintViewModel(
                     it.copy(availableBankUpdate = null, bankRequiringNewerApp = check.manifest)
                 }
                 if (!silent) {
-                    showMessage("发布的检测包需要更新的 App 版本，请先更新应用", isError = true)
+                    showMessage("发布的检测包需要更高版本的 App，请先更新应用", isError = true)
                 }
             }
         }

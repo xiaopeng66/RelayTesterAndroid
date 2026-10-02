@@ -121,10 +121,10 @@ open class BalanceApi(
         } catch (error: InterruptedIOException) {
             BalanceQueryResult.Failure("查询超时，请检查站点或提高超时设置")
         } catch (error: IOException) {
-            BalanceQueryResult.Failure("网络连接失败，请检查站点地址和网络")
+            BalanceQueryResult.Failure("网络连接失败，请检查中转站地址和网络")
         } catch (_: Throwable) {
             // Deliberately do not surface raw upstream content, URLs, or headers.
-            BalanceQueryResult.Failure("余额查询失败，请检查模板与站点配置")
+            BalanceQueryResult.Failure("余额查询失败，请检查模板与供应商配置")
         }
     }
 
@@ -244,9 +244,9 @@ open class BalanceApi(
         } catch (error: InterruptedIOException) {
             BalanceQueryResult.Failure("查询超时，请检查站点或提高超时设置")
         } catch (error: IOException) {
-            BalanceQueryResult.Failure("网络连接失败，请检查站点地址和网络")
+            BalanceQueryResult.Failure("网络连接失败，请检查中转站地址和网络")
         } catch (_: Throwable) {
-            BalanceQueryResult.Failure("余额查询失败，请检查查询脚本与站点配置")
+            BalanceQueryResult.Failure("余额查询失败，请检查查询脚本与供应商配置")
         }
     }
 

@@ -269,7 +269,7 @@ private fun BalanceHome(
         AlertDialog(
             onDismissRequest = { templateToDelete = null },
             title = { Text("删除余额模板？") },
-            text = { Text("“${template.name}”将从所有站点取消绑定。此操作无法撤销。") },
+            text = { Text("“${template.name}”将从所有供应商取消绑定。此操作无法撤销。") },
             confirmButton = {
                 TextButton(
                     onClick = {
@@ -437,10 +437,10 @@ private fun BalanceOverviewHeader(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
-                Text("全部站点余额", style = MaterialTheme.typography.titleMedium)
+                Text("全部供应商余额", style = MaterialTheme.typography.titleMedium)
                 Spacer(Modifier.width(12.dp))
                 Text(
-                    "$supplierCount 个站点",
+                    "$supplierCount 个供应商",
                     modifier = Modifier.widthIn(min = 56.dp),
                     style = MaterialTheme.typography.labelLarge,
                     color = MaterialTheme.colorScheme.primary,
@@ -578,7 +578,7 @@ private fun BalanceSupplierCard(
                             errorMessage != null -> errorMessage
                             snapshot?.planName != null -> snapshot.planName.orEmpty()
                             snapshot != null -> "已更新 ${formatDateTime(snapshot.checkedAt)}"
-                            supplier.baseUrl.isBlank() -> "需要配置站点地址"
+                            supplier.baseUrl.isBlank() -> "需要配置中转站地址"
                             else -> "尚未查询"
                         },
                         style = MaterialTheme.typography.labelSmall,
@@ -888,7 +888,7 @@ private fun BalanceResultCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 Column {
-                    Text("当前站点查询详情", style = MaterialTheme.typography.titleMedium)
+                    Text("当前供应商查询详情", style = MaterialTheme.typography.titleMedium)
                     Text(
                         if (snapshot == null) "数据来自站点 API，不是本地估算" else "最近一次 API 查询结果",
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -899,7 +899,7 @@ private fun BalanceResultCard(
             }
             if (snapshot == null && errorMessage == null) {
                 Text(
-                    "确认站点地址、查询凭据与模板后，可读取当前账户余额。",
+                    "确认中转站地址、查询凭据与模板后，可读取当前账户余额。",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -1174,7 +1174,10 @@ private fun TemplateSecuritySummary() {
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         Text("安全边界", style = MaterialTheme.typography.labelLarge)
-        TemplateSafetyBullet("HTTPS：只能访问当前站点的 HTTPS 地址。")
+        // The guard is same-origin, not TLS-only: a supplier configured as cleartext HTTP
+        // must still be able to query its own balance, so claiming "HTTPS only" here
+        // would describe a rule the code deliberately does not enforce.
+        TemplateSafetyBullet("同源：只访问当前站点的同一来源（协议、域名、端口一致），不会把请求发往其他域名。")
         TemplateSafetyBullet("凭据：API Key / PAT 仅在请求时注入，不写入模板或日志。")
         TemplateSafetyBullet("脚本：只能描述同站请求与 JSON 映射，不能直接联网或访问设备能力。")
     }
@@ -1265,7 +1268,7 @@ private fun BalanceTemplateEditor(
                         if (draft.queryMode == BalanceQueryMode.FORM) {
                             "参数配置适合固定接口与 JSON 路径；复杂的可选字段可在“高级响应映射”中展开。"
                         } else {
-                            "查询脚本采用 cc-switch 风格的 request + extractor 结构；网络请求仍由本机校验后执行。"
+                            "查询脚本采用 request + extractor 结构；网络请求仍由本机校验后执行。"
                         },
                         modifier = Modifier.padding(16.dp),
                         style = MaterialTheme.typography.bodyMedium,
@@ -1521,7 +1524,7 @@ private fun BalanceTemplateEditor(
                     ) {
                         Icon(Icons.Outlined.Refresh, contentDescription = null)
                         Spacer(Modifier.width(8.dp))
-                        Text("保存并查询当前站点")
+                        Text("保存并查询当前供应商")
                     }
                     TextButton(
                         onClick = onBack,
