@@ -525,6 +525,12 @@ private const val MAX_MODEL_SOURCES_PER_ENTRY = 32
 private val RESULT_ACTION_SLOT = 40.dp
 
 /**
+ * The status pill's own horizontal padding. The label that shares the row with the pill
+ * indents by the same amount, so the two texts line up rather than the pill's background.
+ */
+private val RESULT_PILL_INSET = 8.dp
+
+/**
  * Names every supplier whose model pull failed and why. The snackbar only
  * carries one line, so the per-supplier reasons live here until the next pull.
  */
@@ -1684,6 +1690,9 @@ private fun LazyListScope.resultSection(
                 selectable = true,
                 selected = result.model in state.selectedModels,
                 enabled = !state.isRunning,
+                // 勾选框在整批运行期间仍然冻结，但这一行自己的两个动作只看这一行：
+                // 它一旦有结论（成功/失败）就能点，不必等整张列表跑完。
+                actionsEnabled = result.status != TestStatus.PENDING,
                 onToggle = { onToggleModel(result.model) },
                 onCopyName = { model -> onCopy("模型名", listOf(model)) },
                 onFingerprint = onFingerprintModel,
@@ -1856,6 +1865,13 @@ private fun ResultItem(
     selectable: Boolean = false,
     selected: Boolean = false,
     enabled: Boolean = true,
+    /**
+     * Whether this row's own two actions are live. They only exist once the row has an
+     * outcome, and from that moment nothing about the rest of the batch can change them,
+     * so a run still working through other rows leaves this one readable instead of
+     * locking every card until the whole list finishes.
+     */
+    actionsEnabled: Boolean = enabled,
     onToggle: () -> Unit = {},
     onCopyName: ((String) -> Unit)? = null,
     /** Only offered on a reachable model: a failed test has no answer to fingerprint. */
@@ -1881,10 +1897,15 @@ private fun ResultItem(
     val labelStyle = MaterialTheme.typography.labelMedium
     val textMeasurer = rememberTextMeasurer()
     val density = LocalDensity.current
-    val trailingWidth = remember(textMeasurer, labelStyle, density) {
-        val labelPx = listOf("详情", "收起").maxOf { textMeasurer.measure(it, labelStyle).size.width }
-        with(density) { maxOf(RESULT_ACTION_SLOT, labelPx.toDp() + 8.dp) }
+    val labelWidth = remember(textMeasurer, labelStyle, density) {
+        with(density) {
+            listOf("详情", "收起").maxOf { textMeasurer.measure(it, labelStyle).size.width }.toDp()
+        }
     }
+    val trailingWidth = maxOf(RESULT_ACTION_SLOT, labelWidth + RESULT_PILL_INSET)
+    // 指纹图标与「详情」不会同屏出现（一在成功行、一在失败行），但它们同处末格 ⇒ 把
+    // 图标中心放到「详情」文字中心上，动作列在整张列表里就是上下对齐的一条线。
+    val fingerprintOffset = trailingWidth / 2 - RESULT_PILL_INSET - labelWidth / 2
     OutlinedCard {
         Column(
             modifier = Modifier
@@ -1998,9 +2019,9 @@ private fun ResultItem(
                     }
                 }
                 // 动作轨：两格顺序固定（复制 · 指纹/详情/空），所以复制按钮在成功、失败、
-                // 待测行里停在同一 x，不再随第二枚图标的有无左右跳。两枚图标各把本体向内
-                // 移 4dp 让它们靠拢（视觉间隙 24dp → 16dp），格子本身不变。末格只有**宽度**
-                // 随标签放大，高度恒为 RESULT_ACTION_SLOT，否则这一行会被末格撑高。
+                // 待测行里停在同一 x，不再随第二枚图标的有无左右跳。复制图标把本体向内
+                // 移 4dp 让它与末格靠拢，格子本身不变。末格只有**宽度**随标签放大，高度
+                // 恒为 RESULT_ACTION_SLOT，否则这一行会被末格撑高。
                 if (onCopyName != null) {
                     IconButton(
                         onClick = { onCopyName(result.model) },
@@ -2020,22 +2041,30 @@ private fun ResultItem(
                         modifier = Modifier
                             .width(trailingWidth)
                             .height(RESULT_ACTION_SLOT)
-                            .clickable(enabled = enabled, role = Role.Button) { expanded = !expanded },
+                            // 不要涟漪：点击时默认会在这块 40dp 见方的格子上铺一层方形
+                            // 高光，看着像凭空多出一个按钮框。
+                            .clickable(
+                                enabled = actionsEnabled,
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = null,
+                                role = Role.Button,
+                            ) { expanded = !expanded },
                         contentAlignment = Alignment.CenterEnd,
                     ) {
                         Text(
                             if (expanded) "收起" else "详情",
                             // 右缘对齐状态胶囊里的**文字**：胶囊底色比它的字宽 8dp
                             // （胶囊自带的内边距），标签跟着内缩同样的量。
-                            modifier = Modifier.padding(end = 8.dp),
+                            modifier = Modifier.padding(end = RESULT_PILL_INSET),
                             style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.primary,
                             maxLines = 1,
                             softWrap = false,
                         )
                     }
                     onFingerprint != null && result.status == TestStatus.SUCCESS -> IconButton(
                         onClick = { onFingerprint(result.model) },
-                        enabled = enabled,
+                        enabled = actionsEnabled,
                         modifier = Modifier
                             .width(trailingWidth)
                             .height(RESULT_ACTION_SLOT),
@@ -2043,7 +2072,7 @@ private fun ResultItem(
                         Icon(
                             Icons.Outlined.Fingerprint,
                             contentDescription = "检测 ${result.model} 的模型指纹",
-                            modifier = Modifier.size(16.dp).offset(x = (-4).dp),
+                            modifier = Modifier.size(16.dp).offset(x = fingerprintOffset),
                         )
                     }
                     else -> Spacer(
