@@ -379,10 +379,9 @@ private fun ReferenceBankCard(
 
             // The published package demands an app newer than this one, so no install
             // button is offered; the panel still has to say why, on every entry.
-            state.bankRequiringNewerApp?.let { manifest ->
+            state.bankRequiringNewerApp?.let {
                 Text(
-                    "上游发布了新的检测包，它要求最低 App 版本代码 ${manifest.minAppVersionCode}，" +
-                        "当前应用达不到，请先更新应用。",
+                    "上游发布了新的检测包，需要更高版本的 App 才能安装；请先更新应用。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
                 )

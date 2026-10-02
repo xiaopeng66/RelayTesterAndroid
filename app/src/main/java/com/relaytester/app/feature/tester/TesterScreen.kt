@@ -723,7 +723,7 @@ private fun SupplierSelector(
                                         onClick = { onEditSupplier(supplier.id) },
                                     )
                                     .semantics {
-                                        contentDescription = "编辑 ${supplier.name} 站点配置"
+                                        contentDescription = "编辑 ${supplier.name} 的配置"
                                     },
                                 contentAlignment = Alignment.TopEnd,
                             ) {
@@ -771,7 +771,7 @@ private fun SupplierSelector(
             }
         }
         Text(
-            "点击切换站点，双击重新拉取模型；右上角图标编辑站点配置。",
+            "点击切换供应商，双击重新拉取模型；右上角图标编辑供应商配置。",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -820,7 +820,7 @@ private fun SupplierConfigurationDialog(
                             ),
                             verticalArrangement = Arrangement.spacedBy(2.dp),
                         ) {
-                            Text("站点配置", style = MaterialTheme.typography.headlineSmall)
+                            Text("供应商配置", style = MaterialTheme.typography.headlineSmall)
                             Text(
                                 draft.name,
                                 style = MaterialTheme.typography.labelLarge,
@@ -885,13 +885,13 @@ private fun SupplierConfigurationDialog(
                             onClick = onSave,
                             enabled = enabled,
                             modifier = Modifier.heightIn(min = 48.dp),
-                        ) { Text("保存站点") }
+                        ) { Text("保存供应商") }
                     }
                 }
             }
             if (saveCompletedAt > 0L) {
                 Toast(
-                    message = "站点配置已保存",
+                    message = "供应商配置已保存",
                     modifier = Modifier
                         .align(Alignment.TopCenter)
                         .padding(top = 4.dp),
@@ -1060,7 +1060,7 @@ private fun PullOnlyModeRow(
                 enabled = enabled,
             )
             Text(
-                "禁止测试（禁测活网站请勾选）",
+                "禁止测试（仅拉取模型、不发测试请求；不想被探测的站点请勾选）",
                 style = MaterialTheme.typography.labelLarge,
                 modifier = Modifier.weight(1f),
                 maxLines = 1,
@@ -2040,14 +2040,15 @@ private fun ResultActions(
             ) {
                 Icon(Icons.Outlined.ContentCopy, contentDescription = null)
                 Spacer(Modifier.width(6.dp))
-                Text("复制可用")
+                // 动宾结构要对称：“复制失败”会被读成“复制操作失败了”。
+                Text("复制可用项")
             }
             OutlinedButton(
                 onClick = { onCopy("失败模型", failed) },
                 enabled = failed.isNotEmpty(),
                 modifier = Modifier.weight(1f),
             ) {
-                Text("复制失败")
+                Text("复制失败项")
             }
         }
         Button(
@@ -2195,7 +2196,11 @@ private fun StatusLabel(status: TestStatus, isFetchedOnly: Boolean = false) {
     val label = when (status) {
         TestStatus.SUCCESS -> "可用"
         TestStatus.FAILED -> "失败"
-        TestStatus.PENDING -> if (isFetchedOnly) "待测" else "进行中"
+        // PENDING covers both "queued behind other models" and "this row's request is in
+        // flight", so "进行中" here contradicted the body text ("等待测试…") on the same
+        // row. The row itself is what says it is running; the badge only says it is not
+        // finished yet.
+        TestStatus.PENDING -> if (isFetchedOnly) "待测" else "等待中"
     }
     val color = when (status) {
         TestStatus.SUCCESS -> Color(0xFF15803D)
@@ -2325,7 +2330,7 @@ private fun ModelCatalogDialog(
                         style = MaterialTheme.typography.headlineSmall,
                     )
                     Text(
-                        "为同一模型配置多个供应商来源，并单独检查连接状态、延迟和用量。",
+                        "为同一模型配置多个供应商来源，并单独检查各来源的连接状态。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -2561,7 +2566,7 @@ private fun ModelCatalogDialog(
                                         modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                                     ) {
                                         Text(
-                                            selectedModel.ifBlank { "先拉取" },
+                                            selectedModel.ifBlank { "尚未选择模型" },
                                             modifier = Modifier.weight(1f),
                                             maxLines = 1,
                                             overflow = TextOverflow.Ellipsis,

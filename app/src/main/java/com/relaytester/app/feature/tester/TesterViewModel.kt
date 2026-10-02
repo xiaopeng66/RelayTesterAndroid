@@ -1408,7 +1408,7 @@ class TesterViewModel(
                 it.copy(isBusy = true, exportPayload = null, message = null, isMessageError = false)
             }
             try {
-                checkNotNull(persistDraft()) { "当前站点配置无法保存" }
+                checkNotNull(persistDraft()) { "当前供应商配置无法保存" }
                 checkNotNull(persistBalanceCredentials()) { "当前余额凭据无法保存" }
                 val backup = withContext(Dispatchers.IO) { createConfigurationBackupSnapshot() }
                 val exportBytes = withContext(Dispatchers.IO) {
@@ -2653,7 +2653,7 @@ class TesterViewModel(
         } catch (error: CancellationException) {
             throw error
         } catch (_: Throwable) {
-            BalanceRequestPreparation.Invalid("无法读取此站点的查询凭据，请重新保存后重试")
+            BalanceRequestPreparation.Invalid("无法读取该供应商的查询凭据，请重新保存后重试")
         }
         if (preparation is BalanceRequestPreparation.Invalid) {
             _balanceUiState.update {
@@ -2773,7 +2773,7 @@ class TesterViewModel(
                             throw error
                         } catch (_: Throwable) {
                             BalanceRequestPreparation.Invalid(
-                                "无法读取此站点的查询凭据，请重新保存后重试"
+                                "无法读取该供应商的查询凭据，请重新保存后重试"
                             )
                         }
                         if (preparation is BalanceRequestPreparation.Invalid) {
@@ -2829,7 +2829,7 @@ class TesterViewModel(
                     queryingSupplierIds = emptySet(),
                     batchProgressDone = targets.size,
                     message = if (failed == 0) {
-                        "已更新 $succeeded 个站点"
+                        "已更新 $succeeded 个供应商"
                     } else {
                         "已完成：$succeeded 成功，$failed 需要处理"
                     },
@@ -3379,7 +3379,7 @@ class TesterViewModel(
         } catch (error: CancellationException) {
             throw error
         } catch (_: Throwable) {
-            showMessage("站点密钥保存失败，请稍后重试", isError = true)
+            showMessage("供应商配置保存失败，请稍后重试", isError = true)
             null
         }
     }
