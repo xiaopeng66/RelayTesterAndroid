@@ -110,6 +110,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -515,6 +516,13 @@ private fun TesterContent(
 
 private const val INITIAL_DEFERRED_CONTENT_DELAY_MS = 350L
 private const val MAX_MODEL_SOURCES_PER_ENTRY = 32
+
+/**
+ * One cell of a result row's action rail. Material 3's smallest documented icon
+ * button (the "small" container) rather than the 48dp default: two 48dp cells made
+ * the row 48dp tall for 19dp of chips, which was most of the card's height.
+ */
+private val RESULT_ACTION_SLOT = 40.dp
 
 /**
  * Names every supplier whose model pull failed and why. The snackbar only
@@ -1866,12 +1874,23 @@ private fun ResultItem(
                 !failureSummary(result).contains(message)
         }
     val canExpandFailure = !isFetchedOnly && result.status == TestStatus.FAILED && failureDetail != null
+    // 末格宽度：「详情 / 收起」是两个汉字，40dp 的格子扣掉 8dp 右侧内缩后，小字号刚好、
+    // 大字号会顶出去（实测 2.0× 时这两个字要 48dp）。所以按**实际排版宽度**算一次格子
+    // 宽度，不再按字号档位猜。三种末格（标签 / 指纹图标 / 空）在同一个字号下同宽，
+    // 所以复制按钮仍然不随状态左右跳。
+    val labelStyle = MaterialTheme.typography.labelMedium
+    val textMeasurer = rememberTextMeasurer()
+    val density = LocalDensity.current
+    val trailingWidth = remember(textMeasurer, labelStyle, density) {
+        val labelPx = listOf("详情", "收起").maxOf { textMeasurer.measure(it, labelStyle).size.width }
+        with(density) { maxOf(RESULT_ACTION_SLOT, labelPx.toDp() + 8.dp) }
+    }
     OutlinedCard {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 6.dp, vertical = 6.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
+                .padding(horizontal = 6.dp, vertical = 4.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             // 第 1 行：勾选框 · 状态点 · 模型名（占满剩余宽度）· 状态胶囊。勾选框放在行内
             // 而不是另起一列：它因此与名称、胶囊永远在同一条中线上，也不会像旧版那样按
@@ -1978,32 +1997,37 @@ private fun ResultItem(
                         }
                     }
                 }
-                // 动作轨：两格各 48dp、顺序固定（复制 · 指纹/详情/空），所以复制按钮在成功、
-                // 失败、待测行里停在同一 x，不再随第二枚图标的有无左右跳。图标只把本体各
-                // 向内移 6dp 让它们靠拢，触控盒仍是 48dp。
+                // 动作轨：两格顺序固定（复制 · 指纹/详情/空），所以复制按钮在成功、失败、
+                // 待测行里停在同一 x，不再随第二枚图标的有无左右跳。两枚图标各把本体向内
+                // 移 4dp 让它们靠拢（视觉间隙 24dp → 16dp），格子本身不变。末格只有**宽度**
+                // 随标签放大，高度恒为 RESULT_ACTION_SLOT，否则这一行会被末格撑高。
                 if (onCopyName != null) {
                     IconButton(
                         onClick = { onCopyName(result.model) },
-                        modifier = Modifier.size(48.dp),
+                        modifier = Modifier.size(RESULT_ACTION_SLOT),
                     ) {
                         Icon(
                             Icons.Outlined.ContentCopy,
                             contentDescription = "复制模型名 ${result.model}",
-                            modifier = Modifier.size(16.dp).offset(x = 6.dp),
+                            modifier = Modifier.size(16.dp).offset(x = 4.dp),
                         )
                     }
                 } else {
-                    Spacer(Modifier.size(48.dp))
+                    Spacer(Modifier.size(RESULT_ACTION_SLOT))
                 }
                 when {
                     canExpandFailure -> Box(
                         modifier = Modifier
-                            .size(48.dp)
+                            .width(trailingWidth)
+                            .height(RESULT_ACTION_SLOT)
                             .clickable(enabled = enabled, role = Role.Button) { expanded = !expanded },
                         contentAlignment = Alignment.CenterEnd,
                     ) {
                         Text(
                             if (expanded) "收起" else "详情",
+                            // 右缘对齐状态胶囊里的**文字**：胶囊底色比它的字宽 8dp
+                            // （胶囊自带的内边距），标签跟着内缩同样的量。
+                            modifier = Modifier.padding(end = 8.dp),
                             style = MaterialTheme.typography.labelMedium,
                             maxLines = 1,
                             softWrap = false,
@@ -2012,15 +2036,21 @@ private fun ResultItem(
                     onFingerprint != null && result.status == TestStatus.SUCCESS -> IconButton(
                         onClick = { onFingerprint(result.model) },
                         enabled = enabled,
-                        modifier = Modifier.size(48.dp),
+                        modifier = Modifier
+                            .width(trailingWidth)
+                            .height(RESULT_ACTION_SLOT),
                     ) {
                         Icon(
                             Icons.Outlined.Fingerprint,
                             contentDescription = "检测 ${result.model} 的模型指纹",
-                            modifier = Modifier.size(16.dp).offset(x = (-6).dp),
+                            modifier = Modifier.size(16.dp).offset(x = (-4).dp),
                         )
                     }
-                    else -> Spacer(Modifier.size(48.dp))
+                    else -> Spacer(
+                        Modifier
+                            .width(trailingWidth)
+                            .height(RESULT_ACTION_SLOT),
+                    )
                 }
             }
             if (result.status == TestStatus.FAILED && failureDetail != null) {
