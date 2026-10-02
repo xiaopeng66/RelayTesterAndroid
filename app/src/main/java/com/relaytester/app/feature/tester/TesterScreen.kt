@@ -100,6 +100,7 @@ import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
@@ -644,8 +645,8 @@ private fun SupplierSelector(
                         shape = cardShape,
                         colors = CardDefaults.outlinedCardColors(containerColor = containerColor),
                     ) {
-                        // Width-only: a full-size box would clamp the column back to the
-                        // card's minimum height and clip the second line at 2x fonts.
+                        // Width-only: a full-size box would stretch to whatever height the
+                        // card is given and defeat the column's own floor below.
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth(),
@@ -668,6 +669,12 @@ private fun SupplierSelector(
                             Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
+                                    // The column carries the same floor as the card, so the
+                                    // leftover space is its own and Arrangement.Center
+                                    // splits it into equal top and bottom padding. Without
+                                    // this floor a wrapping column would sit at the top and
+                                    // leave all the slack below.
+                                    .heightIn(min = 58.dp)
                                     // Pull-only cards reserve room for the corner marker.
                                     .padding(start = if (supplier.isTestingDisabled) 14.dp else 10.dp)
                                     // Clears the edit control stacked over the corner.
@@ -1698,7 +1705,18 @@ private fun ResultSummaryCard(state: TesterUiState) {
             modifier = Modifier.fillMaxWidth().padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            SectionTitle("测试结果", "可用 " + succeeded + " · 不可用 " + failed)
+            SectionTitle(
+                "测试结果",
+                buildAnnotatedString {
+                    pushStyle(SpanStyle(color = Color(0xFF15803D)))
+                    append("可用 " + succeeded)
+                    pop()
+                    append(" · ")
+                    pushStyle(SpanStyle(color = MaterialTheme.colorScheme.error))
+                    append("不可用 " + failed)
+                    pop()
+                },
+            )
             if (state.isRunning && state.progressTotal > 0) {
                 val progress = state.progressDone.toFloat() / state.progressTotal.toFloat()
                 LinearProgressIndicator(
@@ -1716,8 +1734,14 @@ private fun ResultSummaryCard(state: TesterUiState) {
                     "平均延迟",
                     summary?.averageLatencyMs?.let { it.toString() + " ms" } ?: "—",
                     Modifier.weight(1f),
+                    valueColor = MaterialTheme.colorScheme.tertiary,
                 )
-                SummaryMetric("总 token", summary?.totalTokens?.toString() ?: "—", Modifier.weight(1f))
+                SummaryMetric(
+                    "总 token",
+                    summary?.totalTokens?.toString() ?: "—",
+                    Modifier.weight(1f),
+                    valueColor = MaterialTheme.colorScheme.primary,
+                )
             }
             if (summary != null) {
                 Text(
@@ -1884,16 +1908,47 @@ private fun ResultItem(
                 }
                 when (result.status) {
                     TestStatus.SUCCESS -> {
-                        val meta = buildList {
-                            result.latencyMs?.let { add(it.toString() + " ms") }
-                            result.finishReason?.let { add(finishReasonLabel(it)) }
-                            result.usage?.resolvedTotal?.takeIf { it > 0 }?.let { add(it.toString() + " tok") }
+                        // One color per metric family, shared with the summary strip and
+                        // the balance screen: latency teal, tokens blue, verdict green or
+                        // red. Neutral separators keep the values readable as one line.
+                        val metrics = buildList {
+                            result.latencyMs?.let {
+                                add(it.toString() + " ms" to MaterialTheme.colorScheme.tertiary)
+                            }
+                            result.finishReason?.let { reason ->
+                                val label = finishReasonLabel(reason)
+                                val color = when (label) {
+                                    "正常" -> Color(0xFF15803D)
+                                    "长度截断" -> MaterialTheme.colorScheme.error
+                                    else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                }
+                                add(label to color)
+                            }
+                            result.usage?.resolvedTotal?.takeIf { it > 0 }?.let {
+                                add(it.toString() + " tok" to MaterialTheme.colorScheme.primary)
+                            }
                         }
                         Text(
-                            meta.ifEmpty { listOf("请求成功") }.joinToString("  ·  "),
+                            text = buildAnnotatedString {
+                                if (metrics.isEmpty()) {
+                                    pushStyle(SpanStyle(color = Color(0xFF15803D)))
+                                    append("请求成功")
+                                    pop()
+                                } else {
+                                    metrics.forEachIndexed { index, (value, color) ->
+                                        if (index > 0) {
+                                            pushStyle(SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant))
+                                            append("  ·  ")
+                                            pop()
+                                        }
+                                        pushStyle(SpanStyle(color = color))
+                                        append(value)
+                                        pop()
+                                    }
+                                }
+                            },
                             modifier = Modifier.padding(start = 12.dp),
                             style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1,
                             softWrap = false,
                             overflow = TextOverflow.Ellipsis,
@@ -2085,6 +2140,11 @@ private fun SecurityNote() {
 
 @Composable
 private fun SectionTitle(title: String, subtitle: String) {
+    SectionTitle(title, buildAnnotatedString { append(subtitle) })
+}
+
+@Composable
+private fun SectionTitle(title: String, subtitle: AnnotatedString) {
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         Text(title, style = MaterialTheme.typography.titleMedium)
         Text(
@@ -2175,6 +2235,7 @@ private fun SummaryMetric(
     label: String,
     value: String,
     modifier: Modifier = Modifier,
+    valueColor: Color = MaterialTheme.colorScheme.onSecondaryContainer,
 ) {
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(2.dp)) {
         Text(
@@ -2185,6 +2246,7 @@ private fun SummaryMetric(
         Text(
             value,
             style = MaterialTheme.typography.titleSmall,
+            color = valueColor,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
