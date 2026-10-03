@@ -158,18 +158,12 @@ open class RelayApi(
         maxTokens: Int,
         timeoutSeconds: Int,
     ): ApiResult<String> {
-        val baseUrl = normalizedBaseUrl(profile.baseUrl)
-            ?: return ApiResult.Failure(TestError(ErrorKind.OTHER, "Base URL 必须是有效的 HTTP(S) 地址"))
-        val endpoint = when (profile.protocol) {
-            RelayProtocol.CHAT_COMPLETIONS -> "/chat/completions"
-            RelayProtocol.RESPONSES -> "/responses"
-            RelayProtocol.ANTHROPIC -> "/messages"
+        val prepared = when (val prep = prepareCompletion(profile, apiKey)) {
+            is CompletionPrep.Ready -> prep.builder
+            is CompletionPrep.Refused -> return ApiResult.Failure(prep.error)
         }
-        val url = (baseUrl + endpoint).toHttpUrlOrNull()
-            ?: return ApiResult.Failure(TestError(ErrorKind.OTHER, "Base URL 无法组成请求地址"))
-
-        val request = requestBuilder(url.toString(), profile.protocol, apiKey)
-            .post(buildCompletionPayload(profile.protocol, model, prompt, maxTokens))
+        val request = prepared
+            .post(buildCompletionPayload(profile.protocol, model, prompt, maxTokens, stream = false))
             .build()
 
         return try {
@@ -206,27 +200,216 @@ open class RelayApi(
         }
     }
 
+    /**
+     * Sends one completion as a stream, reporting how much has arrived while it runs.
+     *
+     * Fingerprint detection scores a list of integers, and a long list takes a minute or
+     * more; a panel that shows nothing until the whole body lands reads as frozen. The
+     * callback receives the text accumulated so far, so the caller can count what is
+     * usable instead of guessing from a spinner.
+     *
+     * The stream is an enhancement, never a requirement: an upstream that ignores
+     * `stream: true` and answers with one JSON body (or a relay that buffers the whole
+     * SSE frame) still yields the same text, because the buffered body is handed to the
+     * same extractor. [onProgress] is called from the reading coroutine and must not
+     * block.
+     */
+    open suspend fun completeTextStreaming(
+        profile: SupplierProfile,
+        apiKey: String,
+        model: String,
+        prompt: String,
+        maxTokens: Int,
+        timeoutSeconds: Int,
+        onProgress: suspend (String) -> Unit,
+    ): ApiResult<String> {
+        val prepared = when (val prep = prepareCompletion(profile, apiKey)) {
+            is CompletionPrep.Ready -> prep.builder
+            is CompletionPrep.Refused -> return ApiResult.Failure(prep.error)
+        }
+        val request = prepared
+            .post(buildCompletionPayload(profile.protocol, model, prompt, maxTokens, stream = true))
+            .header("Accept", "text/event-stream")
+            .build()
+
+        return try {
+            // Same dispatcher rule as the buffered path: reading the body blocks the
+            // thread, so it must not happen on the caller's.
+            withContext(Dispatchers.IO) {
+                val totalSeconds = (timeoutSeconds + CLIENT_GRACE_SECONDS).toLong()
+                val ready = client.forSameOriginRequests(totalSeconds, totalSeconds, totalSeconds, totalSeconds)
+                ready.executeSameOrigin(request).use { response ->
+                    if (response.code !in 200..299) {
+                        val errorBody = response.body?.readLimitedUtf8().orEmpty()
+                        // A relay that does not understand `stream: true` must not cost
+                        // the user a detection it used to perform: these three codes are
+                        // the "your request is malformed" family, so the buffered call is
+                        // asked instead. Codes that mean auth, quota or a missing model
+                        // are reported as they are — retrying those would spend a second
+                        // request on an error the flag cannot cause.
+                        if (response.code in STREAM_REFUSAL_CODES) {
+                            return@withContext completeText(
+                                profile = profile,
+                                apiKey = apiKey,
+                                model = model,
+                                prompt = prompt,
+                                maxTokens = maxTokens,
+                                timeoutSeconds = timeoutSeconds,
+                            )
+                        }
+                        return@withContext ApiResult.Failure(
+                            errorForHttp(response.code, errorBody),
+                            httpStatus = response.code,
+                        )
+                    }
+                    val body = response.body
+                        ?: return@withContext ApiResult.Failure(
+                            TestError(ErrorKind.INVALID_RESPONSE, "上游返回 HTTP ${response.code} 但没有响应体"),
+                            httpStatus = response.code,
+                        )
+                    val contentType = body.contentType()?.toString().orEmpty()
+                    val text = if (contentType.contains("event-stream", ignoreCase = true)) {
+                        readEventStream(body, profile.protocol, onProgress)
+                    } else {
+                        // Not an SSE reply: the upstream ignored the flag. Read it whole and
+                        // run it through the same extractor as the buffered path, so a relay
+                        // that only supports complete answers still works, just without the
+                        // live count.
+                        decodeCompletionText(body, profile.protocol)
+                    }
+                    if (text.isBlank()) {
+                        ApiResult.Failure(
+                            TestError(
+                                ErrorKind.INVALID_RESPONSE,
+                                "上游返回 HTTP 200 但没有可用的文本内容",
+                            ),
+                            httpStatus = response.code,
+                        )
+                    } else {
+                        ApiResult.Success(text)
+                    }
+                }
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            ApiResult.Failure(errorForThrowable(error))
+        }
+    }
+
+    /**
+     * The endpoint and headers both completion paths send to.
+     *
+     * Modeled as a result rather than a nullable so each failure keeps the message the
+     * buffered path has always shown: the two Base-URL failures read differently in the
+     * original and collapsing them would change what an existing configuration is told.
+     */
+    private sealed interface CompletionPrep {
+        class Ready(val builder: Request.Builder) : CompletionPrep
+
+        class Refused(val error: TestError) : CompletionPrep
+    }
+
+    private fun prepareCompletion(profile: SupplierProfile, apiKey: String): CompletionPrep {
+        val baseUrl = normalizedBaseUrl(profile.baseUrl) ?: return CompletionPrep.Refused(
+            TestError(ErrorKind.OTHER, "Base URL 必须是有效的 HTTP(S) 地址"),
+        )
+        val endpoint = when (profile.protocol) {
+            RelayProtocol.CHAT_COMPLETIONS -> "/chat/completions"
+            RelayProtocol.RESPONSES -> "/responses"
+            RelayProtocol.ANTHROPIC -> "/messages"
+        }
+        val url = (baseUrl + endpoint).toHttpUrlOrNull() ?: return CompletionPrep.Refused(
+            TestError(ErrorKind.OTHER, "Base URL 无法组成请求地址"),
+        )
+        return CompletionPrep.Ready(requestBuilder(url.toString(), profile.protocol, apiKey))
+    }
+
+    /**
+     * Reads one completion body and returns its text, whether or not it was streamed.
+     *
+     * The buffered branch is not dead weight: it is what makes the streaming call work
+     * against a relay that ignores `stream: true`.
+     */
+    private fun decodeCompletionText(body: ResponseBody, protocol: RelayProtocol): String {
+        val raw = body.readLimitedUtf8()
+        return RelayCompletionText.extractFromBody(raw, protocol)
+    }
+
+    /**
+     * Reads an SSE body, emitting the accumulated text as each delta arrives.
+     *
+     * Only `data:` payloads carry text; `event:`, `id:` and comment lines are skipped as
+     * the format requires. `[DONE]` ends the stream. A malformed frame is skipped rather
+     * than failing the request: a relay that emits one unparseable keep-alive must not
+     * cost the user a whole challenge.
+     *
+     * The `startsWith` filter is belt-and-braces rather than the load-bearing check: any
+     * line that reaches the parser without a `data:` prefix keeps its own `event:`/`id:`
+     * text, which is not JSON and is rejected a few lines later anyway. It stays because
+     * it makes the intent explicit at the point of reading, and it saves parsing every
+     * heartbeat on a long stream.
+     */
+    private suspend fun readEventStream(
+        body: ResponseBody,
+        protocol: RelayProtocol,
+        onProgress: suspend (String) -> Unit,
+    ): String {
+        val accumulated = StringBuilder()
+        val source = body.source()
+        var lastReported = 0
+        while (true) {
+            val line = source.readUtf8Line() ?: break
+            if (line.isBlank()) continue
+            if (!line.startsWith("data:")) continue
+            val payload = line.removePrefix("data:").trim()
+            if (payload.isEmpty()) continue
+            if (payload == "[DONE]") break
+            val delta = runCatching { RelayCompletionText.extractStreamDelta(payload, protocol) }
+                .getOrNull()
+                .orEmpty()
+            if (delta.isEmpty()) continue
+            accumulated.append(delta)
+            // Reported per delta, not per byte: a challenge yields a few hundred small
+            // chunks, and one callback per chunk is what keeps the count live without
+            // flooding the UI state.
+            if (accumulated.length > lastReported) {
+                lastReported = accumulated.length
+                onProgress(accumulated.toString())
+            }
+        }
+        // A stream that carried no deltas at all (some relays answer 200 text/event-stream
+        // with only a [DONE]) has nothing to fall back to here; the caller's blank check
+        // reports it.
+        return accumulated.toString()
+    }
+
     private fun buildCompletionPayload(
         protocol: RelayProtocol,
         model: String,
         prompt: String,
         maxTokens: Int,
+        stream: Boolean,
     ) = when (protocol) {
         RelayProtocol.RESPONSES -> JSONObject()
             .put("model", model)
             .put("input", prompt)
             .put("max_output_tokens", maxTokens)
+            // Responses streams by default and needs the flag to be told otherwise; it
+            // is passed explicitly so the two call sites differ only in this value.
+            .put("stream", stream)
 
         RelayProtocol.ANTHROPIC -> JSONObject()
             .put("model", model)
             .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
             .put("max_tokens", maxTokens)
+            .put("stream", stream)
 
         RelayProtocol.CHAT_COMPLETIONS -> JSONObject()
             .put("model", model)
             .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
             .put("max_tokens", maxTokens)
-            .put("stream", false)
+            .put("stream", stream)
     }.toString().toRequestBody(JSON_MEDIA_TYPE)
 
     private fun parseModels(body: JSONObject): List<String> {
@@ -474,6 +657,13 @@ open class RelayApi(
         const val MAX_RESPONSE_BYTES = 1_048_576L
         const val READ_CHUNK_BYTES = 8_192L
         const val MAX_ERROR_CHARS = 300
+
+        /**
+         * Codes that mean "this request is malformed", the ones a relay sends when it
+         * cannot handle `stream: true`. Detection retries those buffered; anything else
+         * is a real failure and is reported without spending a second request.
+         */
+        val STREAM_REFUSAL_CODES = setOf(400, 415, 422)
     }
 }
 
@@ -510,6 +700,60 @@ object RelayCompletionText {
         }
 
         RelayProtocol.ANTHROPIC -> joinBlocks(body.optJSONArray("content"))
+    }
+
+    /**
+     * Extracts the text from one SSE event's JSON payload.
+     *
+     * A streamed event is not a full response: the text sits under the protocol's own
+     * delta path, which is a different shape per protocol, and an event that carries no
+     * text (a role preamble, a usage tally, a ping) must contribute an empty string
+     * rather than a guess. Kept next to [extract] so both read the same protocol rules.
+     *
+     * @param payload the JSON after `data:`; never `[DONE]`, which the reader handles.
+     */
+    fun extractStreamDelta(payload: String, protocol: RelayProtocol): String {
+        val json = JSONObject(payload)
+        return when (protocol) {
+            RelayProtocol.CHAT_COMPLETIONS -> {
+                val delta = json.optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("delta")
+                when (val content = delta?.opt("content")) {
+                    is String -> content
+                    // Multimodal relays stream the same content-block array as their
+                    // buffered replies; the text still lives in the blocks.
+                    is JSONArray -> joinBlocks(content)
+                    else -> ""
+                }
+            }
+
+            RelayProtocol.RESPONSES -> {
+                // The text delta is the only event type that carries answer text;
+                // `response.output_item.done` repeats what was already streamed, so
+                // counting it too would double every number.
+                if (json.optString("type") != "response.output_text.delta") return ""
+                json.optString("delta")
+            }
+
+            RelayProtocol.ANTHROPIC -> {
+                if (json.optString("type") != "content_block_delta") return ""
+                val delta = json.optJSONObject("delta") ?: return ""
+                // `thinking_delta` carries reasoning, which is not the answer.
+                if (delta.optString("type") != "text_delta") return ""
+                delta.optString("text")
+            }
+        }
+    }
+
+    /**
+     * Extracts text from a whole completion body that may or may not be a stream.
+     *
+     * Used by the streaming call's fallback branch: an upstream that ignored
+     * `stream: true` answers with one JSON document, and one that honoured it but had
+     * its events coalesced may still arrive as a single object.
+     */
+    fun extractFromBody(raw: String, protocol: RelayProtocol): String {
+        val json = runCatching { JSONObject(raw) }.getOrNull() ?: return ""
+        return extract(json, protocol)
     }
 
     private fun joinBlocks(blocks: JSONArray?): String {

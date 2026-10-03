@@ -44,6 +44,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.LocalRippleConfiguration
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedCard
@@ -52,10 +53,12 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -76,7 +79,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.relaytester.app.core.fingerprint.BankSource
+import com.relaytester.app.core.fingerprint.DetectionHistoryEntry
 import com.relaytester.app.core.fingerprint.FingerprintCandidate
+import com.relaytester.app.core.fingerprint.FingerprintHistoryStore
 import com.relaytester.app.core.fingerprint.minimumNumbersFor
 import com.relaytester.app.ui.components.QuietIconButton
 import com.relaytester.app.ui.components.RelayAppHeader
@@ -84,6 +89,14 @@ import com.relaytester.app.ui.components.copyToClipboard
 import com.relaytester.app.ui.components.openUriSafely
 import com.relaytester.app.ui.navigation.AppDestination
 
+/**
+ * Fingerprint detection panel.
+ *
+ * Annotated at the file's entry point for [androidx.compose.material3.ExperimentalMaterial3Api]:
+ * the parallel switch silences its press ripple through `LocalRippleConfiguration`,
+ * which is still an experimental M3 surface in this library version.
+ */
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
 fun FingerprintScreen(
     viewModel: FingerprintViewModel,
@@ -160,12 +173,14 @@ fun FingerprintScreen(
                 onCheckBankUpdate = viewModel::checkBankUpdate,
                 onInstallBankUpdate = viewModel::installBankUpdate,
                 onRemovePackage = viewModel::removeInstalledPackage,
+                onClearHistory = viewModel::clearHistory,
                 contentPadding = innerPadding,
             )
         }
     }
 }
 
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
 private fun FingerprintContent(
     state: FingerprintUiState,
@@ -184,6 +199,7 @@ private fun FingerprintContent(
     onCheckBankUpdate: () -> Unit,
     onInstallBankUpdate: () -> Unit,
     onRemovePackage: () -> Unit,
+    onClearHistory: () -> Unit,
     contentPadding: androidx.compose.foundation.layout.PaddingValues,
 ) {
     LazyColumn(
@@ -257,12 +273,20 @@ private fun FingerprintContent(
                             // 翻状态，以及在一整行上铺一层高光（看着像选中效果）。整行合并语义
                             // 试过不成立（开关自己就是合并节点，仍旧单独留在无障碍树里），所以
                             // 名字挂在开关上：不这样读屏只会念「开关，已开启」。
-                            Switch(
-                                checked = state.useParallel,
-                                onCheckedChange = onParallelChange,
-                                enabled = !state.isRunning,
-                                modifier = Modifier.semantics { contentDescription = "并行发送三题" },
-                            )
+                            //
+                            // 按下时的水波纹整个盖在圆钮上，就是用户说的「圆疙瘩上的虚影」，
+                            // 而且按下态与选中态长得一样，看着像已经选中。这里把涟漪关掉：
+                            // LocalRippleConfiguration 置 null 会让 M3 的开关直接不挂涟漪节点
+                            // （DelegatingThemeAwareRippleNode 读到 null 就 removeRipple），
+                            // 状态仍由滑块位置与轨道颜色如实表达，点击照常切换。
+                            CompositionLocalProvider(LocalRippleConfiguration provides null) {
+                                Switch(
+                                    checked = state.useParallel,
+                                    onCheckedChange = onParallelChange,
+                                    enabled = !state.isRunning,
+                                    modifier = Modifier.semantics { contentDescription = "并行发送三题" },
+                                )
+                            }
                         }
                     } else {
                         Text(
@@ -318,6 +342,13 @@ private fun FingerprintContent(
         }
 
         item {
+            HistoryCard(
+                entries = state.history,
+                onClearHistory = onClearHistory,
+            )
+        }
+
+        item {
             ReferenceBankCard(
                 state = state,
                 onCheckBankUpdate = onCheckBankUpdate,
@@ -327,6 +358,162 @@ private fun FingerprintContent(
         }
     }
 }
+
+/**
+ * The detection history: what was tested, what it looked like, and when.
+ *
+ * Lives next to the results rather than inside the detection-package card because it is
+ * the panel's own output, not a fact about the reference data. Only the newest
+ * [FingerprintHistoryStore.MAX_ENTRIES] are kept, so the list cannot grow without bound;
+ * the count is stated so that cap is visible rather than looking like data loss.
+ */
+@Composable
+private fun HistoryCard(
+    entries: List<DetectionHistoryEntry>,
+    onClearHistory: () -> Unit,
+) {
+    var open by rememberSaveable { mutableStateOf(false) }
+    var confirmClear by rememberSaveable { mutableStateOf(false) }
+    OutlinedCard {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        "检测历史",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    Text(
+                        if (entries.isEmpty()) {
+                            "还没有记录；每测完一个模型就留一条。"
+                        } else {
+                            "最近 ${entries.size} 条（最多保留 ${FingerprintHistoryStore.MAX_ENTRIES} 条）"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            OutlinedButton(
+                onClick = { open = true },
+                enabled = entries.isNotEmpty(),
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+            ) { Text("查看历史记录") }
+        }
+    }
+
+    if (open) {
+        HistoryDialog(
+            entries = entries,
+            onRequestClear = { confirmClear = true },
+            onDismiss = { open = false },
+        )
+    }
+    if (confirmClear) {
+        AlertDialog(
+            onDismissRequest = { confirmClear = false },
+            title = { Text("清空检测历史？") },
+            text = { Text("将删除全部 ${entries.size} 条记录，此操作无法撤销。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    onClearHistory()
+                    confirmClear = false
+                    open = false
+                }) { Text("清空") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmClear = false }) { Text("取消") }
+            },
+        )
+    }
+}
+
+@Composable
+private fun HistoryDialog(
+    entries: List<DetectionHistoryEntry>,
+    onRequestClear: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("检测历史") },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = HISTORY_DIALOG_MAX_HEIGHT)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                entries.forEach { entry ->
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(
+                            entry.model,
+                            style = MaterialTheme.typography.bodyMedium,
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            historyOutcome(entry),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (entry.error == null) {
+                                Color(0xFF15803D)
+                            } else {
+                                MaterialTheme.colorScheme.error
+                            },
+                        )
+                        Text(
+                            buildString {
+                                append(formatHistoryTime(entry.finishedAt))
+                                if (entry.supplierName.isNotBlank()) {
+                                    append(" · ")
+                                    append(entry.supplierName)
+                                }
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )                    }
+                    HorizontalDivider()
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onRequestClear) { Text("清空历史") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("关闭") }
+        },
+    )
+}
+
+/**
+ * One line saying what the detection concluded.
+ *
+ * A failed attempt says why instead of showing an empty ranking: "这个模型没测出来" and
+ * "这个模型在 12 天前就返回 502" are different facts, and only the second one is worth
+ * remembering.
+ */
+internal fun historyOutcome(entry: DetectionHistoryEntry): String {
+    val candidate = listOfNotNull(entry.candidateName, entry.familyName).joinToString(" · ")
+    val percent = entry.probability?.let { "（${(it * 100).toInt()}%）" }.orEmpty()
+    return when {
+        entry.error != null -> "失败：${entry.error}"
+        candidate.isBlank() -> "未识别出候选"
+        else -> "$candidate$percent · 有效回答 ${entry.usableAnswers}/${entry.submittedAnswers}"
+    }
+}
+
+/** Local wall-clock stamp for a history row, e.g. `10-03 14:22`. */
+internal fun formatHistoryTime(epochMillis: Long): String =
+    java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault())
+        .format(java.util.Date(epochMillis))
 
 /**
  * Which detection package the panel is scoring with, and how to move it forward.
@@ -712,7 +899,11 @@ private fun ModelPicker(
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalAlignment = Alignment.CenterVertically,
+            // 贴底对齐，不是居中：OutlinedTextField 的布局盒比它画出来的框高 8 dp
+            // （带浮动标签时顶端要预留标签的位置），按布局盒居中会让按钮看着偏高
+            // ——实测按钮圆心比输入框可见边框的圆心高 9.5 px。两个都贴底，圆钮再
+            // 让出半个高度差，就与输入框的可见边框同心。
+            verticalAlignment = Alignment.Bottom,
         ) {
             OutlinedTextField(
                 value = state.modelFilter,
@@ -737,6 +928,7 @@ private fun ModelPicker(
                         Badge { Text("${state.selectedModels.size}") }
                     }
                 },
+                modifier = Modifier.padding(bottom = MODEL_LIST_BUTTON_INSET),
             ) {
                 OutlinedIconButton(
                     onClick = { listOpen = true },
@@ -1022,8 +1214,25 @@ private fun BatchResultList(results: List<ModelFingerprintResult>) {
 /** Row height used to cap the model list at [VISIBLE_MODEL_ROWS] rows. */
 private val MODEL_ROW_HEIGHT = 48.dp
 
+/**
+ * How far the model-list button is lifted off the text field's bottom edge.
+ *
+ * An outlined text field's layout box is 8 dp taller than the box it draws: with a
+ * floating label the top 8 dp are kept clear of the border (device measurement at
+ * 420 dpi: layout box 64 dp, drawn border 56 dp, both ending on the same bottom edge).
+ * Centring a 52 dp button against that whole layout box therefore floats its circle
+ * 4 dp above the border's centre — the "button sits a bit high" this fixes.
+ *
+ * Bottom-aligning the two boxes removes the label reserve; this constant then centres
+ * the 52 dp circle inside the 56 dp container slot: (56 - 52) / 2.
+ */
+private val MODEL_LIST_BUTTON_INSET = 2.dp
+
 /** Past this the dialog scrolls instead of growing past the screen. */
 private val MODELS_DIALOG_MAX_HEIGHT = 380.dp
+
+/** Past this the history list scrolls; 50 entries would never fit otherwise. */
+private val HISTORY_DIALOG_MAX_HEIGHT = 420.dp
 
 /** Where the detection package's reference data comes from. */
 private const val LM_DETECTOR_URL = "https://github.com/Ikaleio/lm-detector"
@@ -1047,6 +1256,11 @@ private fun ChallengeList(
     } else {
         state.progress.count { it.state == ChallengeState.RECEIVED }
     }
+    // The bar tracks the whole round, not the current model's three questions: it used
+    // to reset to empty at every model change, so a three-model run looked like it kept
+    // restarting from nothing.
+    val roundSize = roundQuestionsTotal(state.batchResults, state.progress)
+    val roundDone = roundQuestionsDone(state.batchResults, state.progress)
 
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(
@@ -1058,9 +1272,14 @@ private fun ChallengeList(
                 Text(
                     buildString {
                         if (state.activeModel != null) {
-                            val position = state.selectedModels.indexOf(state.activeModel) + 1
-                            append("正在检测 ")
-                            if (position > 0) append("$position/${state.selectedModels.size} · ")
+                            val position = activeModelPosition(state.batchResults, state.activeModel)
+                            append("第 ")
+                            if (position != null) {
+                                append("$position/${state.batchResults.size} ")
+                            } else {
+                                append("?/${state.batchResults.size} ")
+                            }
+                            append("个模型 · ")
                             append(state.activeModel)
                             append(" · ")
                         }
@@ -1075,10 +1294,22 @@ private fun ChallengeList(
             }
         }
         if (state.isRunning) {
+            val fraction = if (roundSize > 0) roundDone.toFloat() / roundSize else 0f
             LinearProgressIndicator(
-                progress = { state.progress.count { it.state != ChallengeState.PENDING }.toFloat() / maxOf(state.progress.size, 1) },
+                progress = { fraction.coerceIn(0f, 1f) },
                 modifier = Modifier.fillMaxWidth(),
             )
+            Text(
+                "整轮进度 $roundDone/$roundSize 题",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        // The queue itself, so the order is readable without scrolling to the result
+        // list: a batch used to show only "正在检测 2/3" and the user had to count rows
+        // to know which models were still ahead.
+        if (state.batchResults.size > 1) {
+            BatchQueue(state.batchResults)
         }
         state.progress.forEachIndexed { index, entry ->
             ChallengeCard(
@@ -1100,6 +1331,64 @@ private fun ChallengeList(
                 // progress——它最后只留最后一个模型的回答，前面失败的模型会因此丢掉入口。
                 retryable = index in state.retryableQuestionIndices,
             )
+        }
+    }
+}
+
+/**
+ * The ticked models in the order the round will visit them, each with its state.
+ *
+ * One line, horizontally scrollable when the names are long: the point is that the
+ * sequence and what is left are visible at once, which the numbered result rows cannot
+ * do while a round is still running.
+ */
+@Composable
+private fun BatchQueue(results: List<ModelFingerprintResult>) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        results.forEachIndexed { index, row ->
+            val current = row.status == ModelDetectionStatus.RUNNING
+            Surface(
+                shape = MaterialTheme.shapes.small,
+                color = when (row.status) {
+                    ModelDetectionStatus.DONE -> Color(0xFFDCFCE7)
+                    ModelDetectionStatus.FAILED -> MaterialTheme.colorScheme.errorContainer
+                    ModelDetectionStatus.RUNNING -> MaterialTheme.colorScheme.primaryContainer
+                    ModelDetectionStatus.PENDING -> MaterialTheme.colorScheme.surfaceVariant
+                },
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "${index + 1}",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        row.model,
+                        style = MaterialTheme.typography.labelSmall,
+                        maxLines = 1,
+                        softWrap = false,
+                    )
+                    Text(
+                        when (row.status) {
+                            ModelDetectionStatus.DONE -> "✓"
+                            ModelDetectionStatus.FAILED -> "×"
+                            ModelDetectionStatus.RUNNING -> "…"
+                            ModelDetectionStatus.PENDING -> "待"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+            }
         }
     }
 }
@@ -1139,11 +1428,12 @@ private fun ChallengeCard(
                     softWrap = false,
                     overflow = TextOverflow.Ellipsis,
                 )
-                // 不带涟漪：复制由弹窗确认，格子上的圆形高光只是多余的一闪。
+                // 复制不受检测状态限制：题目全文是静态的，检测中正要拿它去别处比对，
+                // 所以这里不接 enabled。带涟漪的按钮在检测中会跟着禁用，正是用户
+                // 报的「检测中复制按钮点不动」。
                 QuietIconButton(
                     onClick = onCopy,
                     modifier = Modifier.size(48.dp),
-                    enabled = enabled,
                 ) {
                     Icon(
                         Icons.Outlined.ContentCopy,
@@ -1213,10 +1503,20 @@ private fun ChallengeCard(
  * A rejection must not repeat [ChallengeProgress.error] here: the reason already
  * renders on its own line directly below, and echoing it in the status line prints
  * the same sentence twice on every failed card.
+ *
+ * While a request is in flight the line counts the integers that have actually
+ * arrived, so a challenge that takes a minute reads as progress rather than a frozen
+ * "正在接收…". The count is only shown once something countable has landed: the first
+ * seconds of a request deliver prose, and "0 个整数" would look like a stall.
  */
 internal fun stateLabel(entry: ChallengeProgress): String = when (entry.state) {
     ChallengeState.PENDING -> "等待发送"
-    ChallengeState.REQUESTING -> "正在接收…"
+    ChallengeState.REQUESTING ->
+        if (entry.receivedNumbers > 0) {
+            "正在接收… 已收到 ${entry.receivedNumbers} 个整数"
+        } else {
+            "正在接收…"
+        }
     ChallengeState.RECEIVED -> "已接收 ${entry.parsedNumbers} 个有效数字"
     ChallengeState.REJECTED -> "未采用"
 }
