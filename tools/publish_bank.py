@@ -202,12 +202,19 @@ def download(url, cache_bust=False):
         return response.read()
 
 
-def verify(release, bank_bytes, manifest_bytes, attempts=5, wait_seconds=4.0):
+def verify(release, bank_bytes, manifest_bytes, attempts=6, wait_seconds=5.0):
     """Download both assets back and compare them with what we meant to publish.
 
-    A just-replaced asset can still be served from a CDN cache for a moment, so the
-    read-back is retried with a cache-busting query before it is called a mismatch: a
-    false "不一致" here would look exactly like a corrupted upload.
+    Two different things are retried here, because both are normal right after an upload
+    and neither means the publish went wrong:
+
+      * a byte mismatch — a just-replaced asset can still be served from a CDN cache for a
+        moment, so the read-back carries a cache-busting query and is retried before it is
+        called a mismatch (a false "不一致" looks exactly like a corrupted upload);
+      * a failed download — github.com answered the read-back with `HTTP Error 503` right
+        after the assets had been uploaded, which turned a publish that had already
+        succeeded into a red run. 503/timeouts are transient, so they are retried like a
+        mismatch instead of aborting here.
     """
     assets = {asset["name"]: asset for asset in release["assets"]}
     for name in ("lite-bank.bin", "latest.json"):
@@ -216,15 +223,27 @@ def verify(release, bank_bytes, manifest_bytes, attempts=5, wait_seconds=4.0):
     bank_url = assets["lite-bank.bin"]["browser_download_url"]
     manifest_url = assets["latest.json"]["browser_download_url"]
     seen = None
+    last_error = None
     for attempt in range(attempts):
-        fetched_bank = download(bank_url, cache_bust=True)
-        fetched_manifest = download(manifest_url, cache_bust=True)
+        try:
+            fetched_bank = download(bank_url, cache_bust=True)
+            fetched_manifest = download(manifest_url, cache_bust=True)
+        except urllib.error.URLError as error:
+            # HTTPError is a subclass of URLError, so a 5xx answer lands here too.
+            last_error = error
+            print(f"回读失败（第 {attempt + 1}/{attempts} 次）：{error}")
+            if attempt + 1 < attempts:
+                time.sleep(wait_seconds)
+            continue
+        last_error = None
         if fetched_bank == bank_bytes and fetched_manifest == manifest_bytes:
             print("verified: 两个资产回读均与本地逐字节一致")
             return json.loads(fetched_manifest)
         seen = (len(fetched_bank), len(fetched_manifest))
         if attempt + 1 < attempts:
             time.sleep(wait_seconds)
+    if seen is None:
+        raise SystemExit(f"回读校验未能完成（重试 {attempts} 次）：{last_error}")
     raise SystemExit(
         f"回读校验失败（重试 {attempts} 次）：本地 {len(bank_bytes)}/{len(manifest_bytes)} 字节，"
         f"线上 {seen[0]}/{seen[1]} 字节",
