@@ -304,6 +304,7 @@ private suspend fun <T> serialized(block: suspend () -> T): T =
 - `tools/publish_bank.py`：格式版本从**文件自身的魔数**推导（`LMFPA002`→2、`LMFPA003`→3），清单不再写死。
 - App 侧：`FingerprintBank` 同时认 `LMFPA003` 与旧的 `LMFPA002`，旧包按长度整段跳过核验器（跳过顺序与旧写入端逐字段对齐）、不参与打分；打分只剩排序器 + `softmax(tau·排序)`；`BankUpdate` 的格式门是 `[2, 3]`。
 - `SharedScoring` / `FingerprintViewModel` / `FingerprintScreen` 里核验器相关的字段与那句「排名与核验的第一候选不一致，请谨慎。」一并删除（进 `verify_apk_wording.py` 的退休表）。
+- `tools/publish_bank.py` 的回读校验改为**可重试**：第一次重发（run 37156823597）里重建与发布都已成功，却在发布后的回读那一步被 `HTTP 503: Service Unavailable` 打断——刚传上去的资产还在 CDN 传播，读回拿到 503；重试与「字节不一致」走同一条重试路径（`URLError`/`HTTPError` 都算瞬时，6 次 × 5 秒），只有真的连续失败才判红。
 
 ## 3. 本轮真缺陷
 
@@ -318,6 +319,7 @@ private suspend fun <T> serialized(block: suspend () -> T): T =
 - **构建警告**：`assembleOptimized --rerun-tasks` 全量重编译（49 个任务全部 executed），Kotlin 警告 **0** 条；日志里唯一一行 `WARNING:` 是 Gradle 对 `android.overridePathCheck=true` 的实验性提示，与源码无关。
 - **产物一致性**：`tools/verify_apk_wording.py` 双向核验（**23 条最终文案在包内 / 10 条退役文案 0 处**）；本轮新增 `更新清单的格式版本`，退役 `排名与核验的第一候选不一致，请谨慎。`。
 - **安装件 == 构建件**：`pm path` 拉回的 `base.apk` 与 `app/build/outputs/apk/optimized/app-optimized.apk` 的 sha256 逐字节一致（`186c1353…`，2,937,319 字节），设备走查跑的就是这一份。
+- **检测包发布链**（`1c34f0d` 上重发工作流，run **37156963391** = `success`，6 个步骤全绿）：构建脚本按上游 `d53d3f5b` 重建出 **58 个模型 / `LMFPA003` / 2,119,616 字节 / `1d341337fdcb`**，与线上现存包逐字节相同 ⇒ 日志显示 `发布更新：58 → 58 个模型，体积 +0 字节`（内容没变就不重复改动），资产重传后走到此前 503 打断的那一步，打印 `verified: 两个资产回读均与本地逐字节一致`。**线上回读独立复核**：`bank` 预发布的 `latest.json` 为 `{formatVersion: 3, modelCount: 58, sizeBytes: 2119616, sha256: 1d341337…3050, minAppVersionCode: 10505}`，匿名下载 `lite-bank.bin` 得到 2,119,616 字节、sha256 与清单内 `sha256` 逐字符相等。
 - **设备走查**（API 35 模拟器，发布件安装实测，`E:/AI/Zcode/tmp/fp_stage11.py`，**17/17 通过**，日志 `relay-final-verification/device/stage11-run.txt`）：
   - **① 复制落在「可用」文字中心**：`alpha-gpt-4o-preview`（成功）行上，复制图标墨迹中心 x=**971.5**，「可用」文字墨迹中心 x=**972.0**，差 **0.5 px**；
   - **② 复制在三行里同一个 x**：待测 **971.5** / 成功 **971.5** / 失败 **971.5**，两两差 **0.0 px**（`omega-bad-upstream` 失败行与运行前的待测行各量一次）；
