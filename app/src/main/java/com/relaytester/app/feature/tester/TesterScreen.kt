@@ -1918,8 +1918,8 @@ private fun ResultItem(
     val canExpandFailure = !isFetchedOnly && result.status == TestStatus.FAILED && failureDetail != null
     // 末格宽度：「详情 / 收起」是两个汉字，40dp 的格子扣掉 8dp 右侧内缩后，小字号刚好、
     // 大字号会顶出去（实测 2.0× 时这两个字要 48dp）。所以按**实际排版宽度**算一次格子
-    // 宽度，不再按字号档位猜。三种末格（标签 / 指纹图标 / 空）在同一个字号下同宽，
-    // 所以复制按钮仍然不随状态左右跳。
+    // 宽度，不再按字号档位猜。末格只有「详情」有（失败行），其余行是同宽占位，所以复制
+    // 按钮仍然不随状态左右跳。
     val labelStyle = MaterialTheme.typography.labelMedium
     val textMeasurer = rememberTextMeasurer()
     val density = LocalDensity.current
@@ -1929,9 +1929,6 @@ private fun ResultItem(
         }
     }
     val trailingWidth = maxOf(RESULT_ACTION_SLOT, labelWidth + RESULT_PILL_INSET)
-    // 指纹图标与「详情」不会同屏出现（一在成功行、一在失败行），但它们同处末格 ⇒ 把
-    // 图标中心放到「详情」文字中心上，动作列在整张列表里就是上下对齐的一条线。
-    val fingerprintOffset = trailingWidth / 2 - RESULT_PILL_INSET - labelWidth / 2
     OutlinedCard {
         Column(
             modifier = Modifier
@@ -2044,10 +2041,32 @@ private fun ResultItem(
                         }
                     }
                 }
-                // 动作轨：两格顺序固定（复制 · 指纹/详情/空），所以复制按钮在成功、失败、
-                // 待测行里停在同一 x，不再随第二枚图标的有无左右跳。复制图标把本体向内
-                // 移 4dp 让它与末格靠拢，格子本身不变。末格只有**宽度**随标签放大，高度
-                // 恒为 RESULT_ACTION_SLOT，否则这一行会被末格撑高。
+                // 动作轨：三格固定总宽 —— [指纹/空 · 40dp][复制 · 40dp][详情/空 · trailingWidth]。
+                //
+                // 复制落在**中间**那格，所以它在成功、失败、待测行里停在同一个 x，不再随
+                // 别的图标的有无左右跳（用户明确要求过「复制按钮不要左右乱跳」）。末格仍是
+                // 「详情/收起」，右缘内缩 8dp 对齐状态胶囊里的字（也是用户前后两轮要求过的
+                // 对齐）。指纹从末格挪到首格，即本轮要求的「复制与指纹互换」；它从此不再与
+                // 「详情」共享格子，所以不再需要把图标中心对到标签中心。
+                //
+                // 三格都渲染（缺内容用同宽占位）是必须的：只要有一行缺格，这一行的总宽就
+                // 比别的行窄，复制的 x 就会跟着变。行高恒为 RESULT_ACTION_SLOT，免得这一行
+                // 被末格撑高。
+                if (onFingerprint != null && result.status == TestStatus.SUCCESS) {
+                    IconButton(
+                        onClick = { onFingerprint(result.model) },
+                        enabled = actionsEnabled,
+                        modifier = Modifier.size(RESULT_ACTION_SLOT),
+                    ) {
+                        Icon(
+                            Icons.Outlined.Fingerprint,
+                            contentDescription = "检测 ${result.model} 的模型指纹",
+                            modifier = Modifier.size(16.dp),
+                        )
+                    }
+                } else {
+                    Spacer(Modifier.size(RESULT_ACTION_SLOT))
+                }
                 if (onCopyName != null) {
                     QuietIconButton(
                         onClick = { onCopyName(result.model) },
@@ -2056,14 +2075,14 @@ private fun ResultItem(
                         Icon(
                             Icons.Outlined.ContentCopy,
                             contentDescription = "复制模型名 ${result.model}",
-                            modifier = Modifier.size(16.dp).offset(x = 4.dp),
+                            modifier = Modifier.size(16.dp),
                         )
                     }
                 } else {
                     Spacer(Modifier.size(RESULT_ACTION_SLOT))
                 }
-                when {
-                    canExpandFailure -> Box(
+                if (canExpandFailure) {
+                    Box(
                         modifier = Modifier
                             .width(trailingWidth)
                             .height(RESULT_ACTION_SLOT)
@@ -2088,20 +2107,8 @@ private fun ResultItem(
                             softWrap = false,
                         )
                     }
-                    onFingerprint != null && result.status == TestStatus.SUCCESS -> IconButton(
-                        onClick = { onFingerprint(result.model) },
-                        enabled = actionsEnabled,
-                        modifier = Modifier
-                            .width(trailingWidth)
-                            .height(RESULT_ACTION_SLOT),
-                    ) {
-                        Icon(
-                            Icons.Outlined.Fingerprint,
-                            contentDescription = "检测 ${result.model} 的模型指纹",
-                            modifier = Modifier.size(16.dp).offset(x = fingerprintOffset),
-                        )
-                    }
-                    else -> Spacer(
+                } else {
+                    Spacer(
                         Modifier
                             .width(trailingWidth)
                             .height(RESULT_ACTION_SLOT),

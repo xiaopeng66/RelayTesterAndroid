@@ -30,7 +30,10 @@ android {
         // 1.5.0 keeps one public release; every rebuild code must still upgrade 10500.
         // 10502 adds the detection history, the round progress display, the copy button
         // and the parallel-switch fixes on top of 10501.
-        versionCode = 10_502
+        // 10503 adds the swapped result-row actions, the unified expand panel (evaluation
+        // card then candidate list), the usable-answer counter beside the model name and
+        // the per-model single-question retry.
+        versionCode = 10_503
         versionName = "1.5.0"
         ndk {
             abiFilters += "arm64-v8a"

@@ -414,21 +414,24 @@ class FingerprintViewModelTest {
     }
 
     @Test
-    fun `a single-question retry only touches the slot it was asked for`() {
+    fun `a question every model answered offers no retry and sends nothing`() {
         val api = FakeCompletionApi(goldenCase().answers)
         val subject = readyApiViewModel(api, models = listOf("m-one", "m-two"))
         subject.runApiDetection()
         runBlocking { subject.awaitIdle() }
         assertEquals(6, api.calls.get())
         val idsBefore = subject.uiState.value.progress.map { it.challenge.id }
+        assertEquals("每个模型都答对的题不该有重试入口", emptyMap<Int, List<String>>(), subject.uiState.value.retryableModels)
 
         subject.retryChallenge(1)
         runBlocking { subject.awaitIdle() }
 
-        assertEquals("两个模型各补发这一题，其它两题不许重发", 8, api.calls.get())
+        // 重试只针对**失败**的模型；一个答案健康的题被要求重试时必须什么都不发，
+        // 否则「重试本题」会变成「把所有模型都再问一遍」——正是用户报的那个毛病。
+        assertEquals("健康的题不许重发", 6, api.calls.get())
         assertEquals("题目集合不动", idsBefore, subject.uiState.value.progress.map { it.challenge.id })
         assertTrue(
-            "每行的结论都要按新回答刷新",
+            "每行的结论保持不变",
             subject.uiState.value.batchResults.all { it.status == ModelDetectionStatus.DONE },
         )
     }
@@ -450,7 +453,8 @@ class FingerprintViewModelTest {
         val cancelled = subject.uiState.value
         assertEquals(before.take(2), cancelled.progress.take(2))
         assertEquals(ChallengeState.PENDING, cancelled.progress[2].state)
-        assertEquals(setOf(2), cancelled.retryableQuestionIndices)
+        assertEquals(setOf(2), cancelled.retryableModels.keys)
+        assertEquals("入口要指明是哪个模型这一题没有跑完", listOf("test-model"), cancelled.retryableModels[2])
 
         subject.retryChallenge(2)
         runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { subject.awaitIdle() } }
@@ -463,7 +467,7 @@ class FingerprintViewModelTest {
         assertEquals(3, state.analysis?.usableAnswers)
         assertEquals(3, state.batchResults.single().usableAnswers)
         assertEquals(ModelDetectionStatus.DONE, state.batchResults.single().status)
-        assertEquals(emptySet<Int>(), state.retryableQuestionIndices)
+        assertEquals(emptyMap<Int, List<String>>(), state.retryableModels)
     }
 
     @Test
@@ -482,19 +486,159 @@ class FingerprintViewModelTest {
         assertEquals(ModelDetectionStatus.FAILED, state.batchResults.first().status)
         assertEquals(ModelDetectionStatus.DONE, state.batchResults.last().status)
         assertTrue("最后一个模型的三题都健康，仍要能重试前一个模型", state.progress.all { it.state == ChallengeState.RECEIVED })
-        assertEquals(setOf(0, 1, 2), state.retryableQuestionIndices)
+        assertEquals(setOf(0, 1, 2), state.retryableModels.keys)
+        assertEquals("每一题都只应重试失败的那个模型", List(3) { listOf("broken") }, state.retryableModels.values.toList())
 
         failingModels.clear()
+        val callsBeforeRetry = api.calls.get()
         subject.retryChallenge(0)
         runBlocking { subject.awaitIdle() }
 
         val retried = subject.uiState.value
-        assertEquals("显式重试仍为两个模型各补发一次", 8, api.calls.get())
+        // 用户要求「哪个模型有问题就重试哪个模型」：健康的那个不许被重新问一遍，
+        // 否则一次单题重试会白花掉另一个模型的请求。
+        assertEquals("只重试 broken 这一题", callsBeforeRetry + 1, api.calls.get())
+        assertEquals("只重试 broken 这一题", "broken", api.models.last())
         assertEquals(1, retried.batchResults.first().usableAnswers)
         assertEquals(3, retried.batchResults.last().usableAnswers)
-        assertEquals(setOf(1, 2), retried.retryableQuestionIndices)
+        assertEquals(setOf(1, 2), retried.retryableModels.keys)
+        assertEquals(listOf("broken"), retried.retryableModels[1])
         subject.regenerateChallenges()
-        assertEquals("换题后旧轮次的重试入口必须清除", emptySet<Int>(), subject.uiState.value.retryableQuestionIndices)
+        assertEquals("换题后旧轮次的重试入口必须清除", emptyMap<Int, List<String>>(), subject.uiState.value.retryableModels)
+    }
+
+    @Test
+    fun `a chosen model is the only one re-asked for a failed question`() {
+        val failingModels = mutableSetOf("m-one", "m-two")
+        val api = FakeCompletionApi(goldenCase().answers, failingModels = failingModels)
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            api,
+            models = listOf("m-one", "m-two"),
+        )
+        subject.runApiDetection()
+        runBlocking { subject.awaitIdle() }
+        assertEquals(6, api.calls.get())
+        assertEquals("两个模型都失败，两题入口都要列出它们", listOf("m-one", "m-two"), subject.uiState.value.retryableModels[0])
+
+        failingModels.clear()
+        val callsBeforeRetry = api.calls.get()
+        // 用户在多模型失败时要能选：只补 m-two 这一题，m-one 一动不动。
+        subject.retryChallenge(0, listOf("m-two"))
+        runBlocking { subject.awaitIdle() }
+
+        assertEquals("只补发被选中的那个模型", callsBeforeRetry + 1, api.calls.get())
+        assertEquals("被选中的是 m-two", 4, api.models.count { it == "m-two" })
+        assertEquals("没被选中的模型不许被重问", 3, api.models.count { it == "m-one" })
+        val rows = subject.uiState.value.batchResults.associateBy { it.model }
+        assertEquals("没被选中的模型保持失败", ModelDetectionStatus.FAILED, rows.getValue("m-one").status)
+        assertEquals("被选中的模型重答后出结论", ModelDetectionStatus.DONE, rows.getValue("m-two").status)
+    }
+
+    @Test
+    fun `a retry in flight withdraws its own entry and cannot be double-fired`() {
+        val api = ParkedRetryApi(goldenCase().answers)
+        val subject = readyApiViewModelFor(SingleSupplierStore(testSupplier()), api).apply {
+            updateParallel(false)
+        }
+        val prompt0 = subject.uiState.value.progress[0].challenge.prompt
+
+        subject.runApiDetection()
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { subject.awaitIdle() } }
+        assertEquals(setOf(0), subject.uiState.value.retryableModels.keys)
+
+        subject.retryChallenge(0)
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.retryParked.await() } }
+
+        // 正在接收＝入口必须让位：补发在飞时这一题不再算「可重试」，否则按钮会在
+        // 请求已发出的情况下继续显示「重试本题」。
+        assertTrue("补发在飞时这一题要从入口里消失", 0 !in subject.uiState.value.retryableModels.keys)
+
+        subject.retryChallenge(0)
+        // 显式点名（多模型时「全部重试」走的就是这条路）也要被挡住：入口虽然已经撤下，
+        // 但调用方仍可能指定模型，去重必须自己成立。
+        subject.retryChallenge(0, listOf("test-model"))
+        runBlocking { delay(300) }
+        assertEquals("同一模型同一题不许并发补发", 2, api.prompts.count { it == prompt0 })
+
+        api.release()
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { subject.awaitIdle() } }
+        assertEquals("补发成功后入口清空", emptyMap<Int, List<String>>(), subject.uiState.value.retryableModels)
+    }
+
+    @Test
+    fun `a rejected question is retryable before its own model finishes the others`() {
+        val api = FirstSlotFailsThenParksApi(goldenCase().answers)
+        val subject = readyApiViewModelFor(SingleSupplierStore(testSupplier()), api).apply {
+            updateParallel(false)
+        }
+        val prompt0 = subject.uiState.value.progress[0].challenge.prompt
+
+        subject.runApiDetection()
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.parked.await() } }
+
+        val mid = subject.uiState.value
+        assertTrue("这一轮还在跑", mid.isRunning)
+        assertEquals(ChallengeState.REJECTED, mid.progress[0].state)
+        // 用户要求「失败了就可以点击了，不用等其他的」：第 1 题已判失败，入口立刻在，
+        // 而第 2 题正在接收——它不能出现在入口里（否则就是「正在接收时就显示」）。
+        assertEquals("只有已失败的那一题出现", setOf(0), mid.retryableModels.keys)
+        assertEquals(listOf("test-model"), mid.retryableModels[0])
+
+        subject.retryChallenge(0)
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.retried.await() } }
+        assertEquals("补发的是第 1 题", 2, api.prompts.count { it == prompt0 })
+        assertTrue("整轮没结束也照发", subject.uiState.value.isRunning)
+        // 这一轮仍然持有这个模型的结果行：补发不该把它翻成「已出结果」，否则整轮进度
+        // 会往回跳，而且这一行会被两个写者同时改。
+        assertEquals(
+            "补发期间结果行仍归整轮所有",
+            ModelDetectionStatus.RUNNING,
+            subject.uiState.value.batchResults.single().status,
+        )
+
+        api.release()
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { subject.awaitIdle() } }
+        val done = subject.uiState.value
+        assertTrue(done.progress.all { it.state == ChallengeState.RECEIVED })
+        assertEquals(ModelDetectionStatus.DONE, done.batchResults.single().status)
+        assertEquals(3, done.batchResults.single().usableAnswers)
+        assertEquals("全部答出来后入口清空", emptyMap<Int, List<String>>(), done.retryableModels)
+    }
+
+    @Test
+    fun `a failed model is retryable while the rest of the batch is still running`() {
+        val api = FirstFailsThenParksApi(goldenCase().answers, failingModel = "broken")
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            api,
+            models = listOf("broken", "slow"),
+        ).apply { updateParallel(false) }
+
+        subject.runApiDetection()
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.parked.await() } }
+
+        val mid = subject.uiState.value
+        assertTrue("整批还在跑", mid.isRunning)
+        assertEquals(ModelDetectionStatus.FAILED, mid.batchResults.first().status)
+        assertEquals(ModelDetectionStatus.RUNNING, mid.batchResults.last().status)
+        // 用户要求「失败了就可以点击了，不用等其他的」：入口必须在这一刻就在，
+        // 而不是等 slow 也跑完。
+        assertEquals("失败的模型落定即可重试", setOf(0, 1, 2), mid.retryableModels.keys)
+        assertEquals("仍在接收的模型不许出现在入口里", List(3) { listOf("broken") }, mid.retryableModels.values.toList())
+
+        subject.retryChallenge(0)
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.retried.await() } }
+
+        // 请求真的在整批运行中被发出去了，不是被「等整批结束」挡下。
+        assertTrue("整批运行中也要能补发这一题", subject.uiState.value.isRunning)
+
+        api.release()
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { subject.awaitIdle() } }
+        // 这一题的补发又失败了（这个假上游对 broken 一失败到底），所以入口仍在，
+        // 这正是「失败就可重试」的另一面：只要还有结论可捞，按钮就不该消失。
+        assertEquals(setOf(0, 1, 2), subject.uiState.value.retryableModels.keys)
+        assertEquals(ModelDetectionStatus.FAILED, subject.uiState.value.batchResults.first().status)
     }
 
     @Test
@@ -1951,6 +2095,173 @@ private class GatedCompletionApi(
     }
 
     /** Routed to the gated [completeText], so the parked request is the streaming one too. */
+    override suspend fun completeTextStreaming(
+        profile: SupplierProfile,
+        apiKey: String,
+        model: String,
+        prompt: String,
+        maxTokens: Int,
+        timeoutSeconds: Int,
+        onProgress: suspend (String) -> Unit,
+    ): ApiResult<String> = completeText(profile, apiKey, model, prompt, maxTokens, timeoutSeconds)
+}
+
+/**
+ * Parks the single-question retry, so the panel can be read while it is in flight.
+ *
+ * Question 1 fails in the round; questions 2 and 3 succeed; the retry of question 1
+ * parks. That is the state where a retry entry still showing, or a second retry being
+ * accepted, would mean two requests for the same slot.
+ */
+private class ParkedRetryApi(
+    private val answers: List<String>,
+) : RelayApi() {
+    /** Completed once the retry of question 1 is parked. */
+    val retryParked = CompletableDeferred<Unit>()
+    private val gate = CompletableDeferred<Unit>()
+    private val calls = AtomicInteger(0)
+    val prompts = Collections.synchronizedList(mutableListOf<String>())
+
+    fun release() {
+        gate.complete(Unit)
+    }
+
+    override suspend fun completeText(
+        profile: SupplierProfile,
+        apiKey: String,
+        model: String,
+        prompt: String,
+        maxTokens: Int,
+        timeoutSeconds: Int,
+    ): ApiResult<String> {
+        prompts += prompt
+        return when (calls.getAndIncrement()) {
+            0 -> ApiResult.Failure(TestError(ErrorKind.UPSTREAM, "上游返回 HTTP 502"))
+            // The round's own three questions come first; the fourth call is the retry.
+            3 -> {
+                retryParked.complete(Unit)
+                gate.await()
+                ApiResult.Success(answers[0])
+            }
+            else -> ApiResult.Success(answers[1])
+        }
+    }
+
+    override suspend fun completeTextStreaming(
+        profile: SupplierProfile,
+        apiKey: String,
+        model: String,
+        prompt: String,
+        maxTokens: Int,
+        timeoutSeconds: Int,
+        onProgress: suspend (String) -> Unit,
+    ): ApiResult<String> = completeText(profile, apiKey, model, prompt, maxTokens, timeoutSeconds)
+}
+
+/**
+ * Rejects the first question, then parks the second, all for one model.
+ *
+ * The state the user described inside a single model: question 1 already failed while
+ * question 2 is still receiving. The retry for question 1 must be available right then,
+ * and question 2 must not be offered.
+ */
+private class FirstSlotFailsThenParksApi(
+    private val answers: List<String>,
+) : RelayApi() {
+    /** Completed once the second question's request is parked. */
+    val parked = CompletableDeferred<Unit>()
+
+    /** Completed once any request beyond the parked one is answered. */
+    val retried = CompletableDeferred<Unit>()
+    private val gate = CompletableDeferred<Unit>()
+    private val calls = AtomicInteger(0)
+    val prompts = Collections.synchronizedList(mutableListOf<String>())
+
+    fun release() {
+        gate.complete(Unit)
+    }
+
+    override suspend fun completeText(
+        profile: SupplierProfile,
+        apiKey: String,
+        model: String,
+        prompt: String,
+        maxTokens: Int,
+        timeoutSeconds: Int,
+    ): ApiResult<String> {
+        prompts += prompt
+        return when (calls.getAndIncrement()) {
+            // The round's first question fails outright…
+            0 -> ApiResult.Failure(TestError(ErrorKind.UPSTREAM, "上游返回 HTTP 502"))
+            // …the second parks, so the panel can be read mid-round…
+            1 -> {
+                parked.complete(Unit)
+                gate.await()
+                ApiResult.Success(answers[1])
+            }
+            // …and anything after that is the retry (or the last question) and succeeds.
+            else -> {
+                retried.complete(Unit)
+                ApiResult.Success(answers[2])
+            }
+        }
+    }
+
+    override suspend fun completeTextStreaming(
+        profile: SupplierProfile,
+        apiKey: String,
+        model: String,
+        prompt: String,
+        maxTokens: Int,
+        timeoutSeconds: Int,
+        onProgress: suspend (String) -> Unit,
+    ): ApiResult<String> = completeText(profile, apiKey, model, prompt, maxTokens, timeoutSeconds)
+}
+
+/**
+ * Fails one model outright, then parks the other mid-round.
+ *
+ * This is the shape the user described: three questions in, one model has already
+ * failed while another is still receiving. The panel has to offer the retry for the
+ * failed one right then — not after the batch finishes — and must not list the model
+ * that is still requesting.
+ */
+private class FirstFailsThenParksApi(
+    private val answers: List<String>,
+    private val failingModel: String,
+) : RelayApi() {
+    /** Completed once the healthy model's first request is parked. */
+    val parked = CompletableDeferred<Unit>()
+
+    /** Completed when a request for [failingModel] arrives after its own round part. */
+    val retried = CompletableDeferred<Unit>()
+    private val gate = CompletableDeferred<Unit>()
+    val models = Collections.synchronizedList(mutableListOf<String>())
+
+    fun release() {
+        gate.complete(Unit)
+    }
+
+    override suspend fun completeText(
+        profile: SupplierProfile,
+        apiKey: String,
+        model: String,
+        prompt: String,
+        maxTokens: Int,
+        timeoutSeconds: Int,
+    ): ApiResult<String> {
+        models += model
+        if (model == failingModel) {
+            // The round's own three requests fail; a fourth one can only be the retry,
+            // so that is the signal a test joins on.
+            if (models.count { it == failingModel } > 3) retried.complete(Unit)
+            return ApiResult.Failure(TestError(ErrorKind.UPSTREAM, "上游返回 HTTP 502"))
+        }
+        parked.complete(Unit)
+        gate.await()
+        return ApiResult.Success(answers[models.size % answers.size])
+    }
+
     override suspend fun completeTextStreaming(
         profile: SupplierProfile,
         apiKey: String,
