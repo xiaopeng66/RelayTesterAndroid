@@ -180,8 +180,15 @@ data class FingerprintUiState(
     val useParallel: Boolean = true,
     val isRunning: Boolean = false,
     val progress: List<ChallengeProgress> = emptyList(),
-    /** Question slots that can continue the cached API round across its models. */
-    val retryableQuestionIndices: Set<Int> = emptySet(),
+    /**
+     * Questions with something to re-ask, mapped to the models that failed them.
+     *
+     * The retry button sits on the challenge card, but a batch can fail the same question
+     * on several models — and the user picks which one to re-ask, so the entry carries the
+     * model list rather than a bare "retryable" flag. Empty until a settled model lacks an
+     * answer for a slot; a slot still being requested never appears here.
+     */
+    val retryableModels: Map<Int, List<String>> = emptyMap(),
     /** Floor from the reference bank; the panel previews pastes against it. */
     val minimumValidNumbers: Int = 80,
     val analysis: FingerprintAnalysis? = null,
@@ -284,6 +291,16 @@ class FingerprintViewModel(
     private var runJob: Job? = null
 
     /**
+     * Single-question retries in flight, by (model, question).
+     *
+     * Kept apart from [runJob] on purpose: a retry must be able to run **alongside** a
+     * round — the failed model has already settled, so its slot can be re-asked while the
+     * round works through the next one — and cancelling the round must not kill a retry
+     * the user explicitly asked for. A new round, on the other hand, waits for these.
+     */
+    private val retryJobs = mutableMapOf<Pair<String, Int>, Job>()
+
+    /**
      * Every model's answers from the last round, by model.
      *
      * Re-scoring after a single-question retry needs the answers that model gave to the
@@ -314,26 +331,92 @@ class FingerprintViewModel(
         setRoundAnswers(roundAnswers + (model to slots))
     }
 
-    /** Publishes the answers and the retry entry they imply in one write. */
+    /** Publishes the answers and the retry entries they imply in one write. */
     private fun setRoundAnswers(next: Map<String, List<ChallengeProgress>>) {
         roundAnswers = next
-        _uiState.update { it.copy(retryableQuestionIndices = retryableFrom(next)) }
+        publishRetryable()
     }
 
     /**
-     * Which question slots still have something to finish.
+     * Folds a round pass's answers into what the cache already holds.
+     *
+     * A successful answer is never downgraded: the pass's list was captured before any
+     * single-question retry that landed while this model was still being asked, so it can
+     * still carry the rejection the retry just repaired. Everything else — a fresh
+     * rejection, a fresh success, an untouched placeholder — is taken from the pass.
+     */
+    private fun mergeChallengeAnswers(
+        cached: List<ChallengeProgress>?,
+        fresh: List<ChallengeProgress>,
+    ): List<ChallengeProgress> {
+        if (cached == null || cached.size != fresh.size) return fresh
+        return fresh.mapIndexed { index, entry ->
+            val existing = cached[index]
+            if (existing.state == ChallengeState.RECEIVED && entry.state != ChallengeState.RECEIVED) {
+                existing
+            } else {
+                entry
+            }
+        }
+    }
+
+    /**
+     * Recomputes the retry entries from the cache and the rows that have settled.
+     *
+     * Called after every row-status change as well as after every cache write: a model
+     * only becomes a retry candidate once its own round part is over, and that fact lives
+     * in [FingerprintUiState.batchResults], not in the cache.
+     */
+    private fun publishRetryable() {
+        val settled = _uiState.value.batchResults
+            .filter {
+                it.status == ModelDetectionStatus.DONE || it.status == ModelDetectionStatus.FAILED
+            }
+            .map { it.model }
+            .toSet()
+        val retryable = retryableFrom(roundAnswers, settled)
+        _uiState.update { it.copy(retryableModels = retryable) }
+    }
+
+    /**
+     * Which question slots still have something to finish, and on which models.
      *
      * Derived across every model of the round, not from the progress list: that list ends
      * up holding only the last model's answers, so a model that failed early would lose
-     * its "重试本题" button the moment a healthy model finished. A slot counts as
-     * retryable when any model still lacks a received answer for it.
+     * its "重试本题" button the moment a healthy model finished.
+     *
+     * A slot counts as failed for a model in exactly two ways:
+     *
+     *  * its cached verdict is a rejection — a definitive "this question got no usable
+     *    answer", which is offerable the moment it lands, even while the other questions
+     *    of the same model are still in flight (the user asked for that explicitly);
+     *  * it is still the untouched placeholder and the model has already settled — an
+     *    interrupted round's leftover (cancel, crash, a slot that never ran).
+     *
+     * A slot being requested right now is neither: the round's in-flight question has no
+     * cached entry yet, and a retry's own placeholder is [ChallengeState.REQUESTING], so
+     * the button never shows while something is still receiving and cannot be double-fired.
      */
-    private fun retryableFrom(cached: Map<String, List<ChallengeProgress>>): Set<Int> {
-        if (cached.isEmpty()) return emptySet()
+    private fun retryableFrom(
+        cached: Map<String, List<ChallengeProgress>>,
+        settledModels: Set<String>,
+    ): Map<Int, List<String>> {
+        if (cached.isEmpty()) return emptyMap()
         val slots = cached.values.maxOf { it.size }
-        return (0 until slots).filterTo(mutableSetOf()) { index ->
-            cached.values.any { it.getOrNull(index)?.state != ChallengeState.RECEIVED }
+        val entries = mutableMapOf<Int, List<String>>()
+        for (index in 0 until slots) {
+            val models = cached.mapNotNull { (model, answers) ->
+                val entry = answers.getOrNull(index) ?: return@mapNotNull null
+                val failed = when (entry.state) {
+                    ChallengeState.REJECTED -> true
+                    ChallengeState.PENDING -> model in settledModels
+                    ChallengeState.RECEIVED, ChallengeState.REQUESTING -> false
+                }
+                if (failed) model else null
+            }
+            if (models.isNotEmpty()) entries[index] = models
         }
+        return entries
     }
 
     /**
@@ -379,6 +462,14 @@ class FingerprintViewModel(
         runJob?.join()
         bankUpdateJob?.join()
         historyJob?.join()
+        // A single-question retry outlives the round that spawned the failed model, so the
+        // round's join alone would let a test finish while a re-ask it triggered is still in
+        // flight. Snapshot first: a joined job removes itself from the map.
+        while (true) {
+            val pending = retryJobs.values.toList()
+            if (pending.isEmpty()) break
+            pending.forEach { it.join() }
+        }
     }
 
     /**
@@ -699,72 +790,97 @@ class FingerprintViewModel(
     }
 
     /**
-     * Re-asks one question and keeps the round it belongs to.
+     * Re-asks one question for the models the user picked, keeping the round it belongs to.
      *
      * This used to only swap in a fresh prompt and drop every result, so a round that
      * tripped on one question had to be restarted from the first model. When there is a
      * round to continue — a supplier and key in hand, and a result row to put the verdict
-     * on — the question is requested again for each model of that round, only that slot is
-     * replaced, and every model is re-scored from its own answers, so the panel converges
-     * on a result instead of starting over.
+     * on — only the chosen models' slot is requested again, and each is re-scored from its
+     * own answers, so the panel converges on a result instead of starting over. The models
+     * come from the caller: one failed model retries directly, several open the chooser,
+     * and a healthy model is never re-asked for a question it already answered.
+     *
+     * A running round does not block this any more: the failed model has already settled,
+     * so its slot can be re-asked while the round works on the next one. What is still
+     * refused is a round that is *dying* — cancelled, with cleanup in flight — because its
+     * last writes would land on top of the retry's.
      *
      * With nothing to continue (manual mode, or before the first round) a fresh prompt is
      * the whole retry, which is what this button has always meant there.
      */
-    fun retryChallenge(index: Int) {
-        if (runInFlight()) return
+    fun retryChallenge(index: Int, models: List<String>? = null) {
         val state = _uiState.value
         if (index !in state.progress.indices) return
 
         val credentials = roundCredentials
-        val models = state.batchResults.map { it.model }
-        if (credentials == null || models.isEmpty()) {
+        if (credentials == null || state.batchResults.isEmpty()) {
             replaceChallenge(index)
             return
         }
+        if (!state.isRunning && runJob?.isCompleted == false) return
+        val failed = (models ?: state.retryableModels[index].orEmpty())
+            .filter { candidate -> state.batchResults.any { it.model == candidate } }
+        if (failed.isEmpty()) return
         if (refuseWhileBankJobRuns()) return
         if (bankOrReport() == null) return
 
         val template = state.progress.map { it.challenge }
         val challenge = template[index]
-        runJob = viewModelScope.launch {
-            _uiState.update { it.copy(isRunning = true, analysis = null) }
-            try {
-                for (model in models) {
-                    _uiState.update { it.copy(activeModel = model) }
-                    updateResult(model) { it.copy(status = ModelDetectionStatus.RUNNING) }
-                    val answered = requestChallenge(
-                        index = index,
-                        supplier = credentials.first,
-                        apiKey = credentials.second,
-                        model = model,
-                        challenge = challenge,
-                        slots = template,
-                    )
-                    // The other slots keep that model's own answers; a model whose round
-                    // never got that far is filled with the placeholder slots the retry is
-                    // about to score, so the re-scoring never mixes two editors' answers.
-                    val previous = roundAnswers[model]
-                    val answers = (if (previous != null && previous.size == template.size) {
-                        previous.toMutableList()
-                    } else {
-                        template.map { ChallengeProgress(it) }.toMutableList()
-                    }).also { list -> list[index] = answered }
-                    setRoundAnswers(roundAnswers + (model to answers))
-                    recordRound(model, answers, answers.map { it.challenge })
-                }
-                _uiState.update { it.copy(isRunning = false, activeModel = null) }
-            } catch (error: CancellationException) {
-                // The answers already in hand are kept: they are what lets the next retry
-                // of this slot finish the round instead of starting it over.
-                _uiState.update { it.copy(isRunning = false, activeModel = null) }
-                throw error
-            } catch (error: Throwable) {
-                val reason = error.message ?: "重试中断"
-                _uiState.update { it.copy(isRunning = false, activeModel = null) }
-                abandonUnfinishedRows(reason)
-                showMessage(reason, isError = true)
+        val fresh = failed.filter { (it to index) !in retryJobs }
+        if (fresh.isEmpty()) return
+        for (model in fresh) {
+            val job = viewModelScope.launch {
+                retrySlot(index, model, challenge, template, credentials)
             }
+            retryJobs[model to index] = job
+            job.invokeOnCompletion { retryJobs.remove(model to index) }
+        }
+    }
+
+    /**
+     * One model's single re-asked slot, from request to re-scored verdict.
+     *
+     * The row is not flipped to "running" for this: the whole-round progress bar counts
+     * settled models, and bouncing a settled row would march the bar backwards. The slot
+     * on the challenge card shows the request's own progress instead, and the row updates
+     * once when the new answer lands.
+     *
+     * The re-score is skipped while the round still owns this model: its own completion
+     * re-scores from the cache, which already holds the new answer, and scoring here too
+     * would have two writers racing the same row. The moment the round moves past the
+     * model, this re-score runs and the row converges.
+     */
+    private suspend fun retrySlot(
+        index: Int,
+        model: String,
+        challenge: FingerprintChallenge,
+        template: List<FingerprintChallenge>,
+        credentials: Pair<com.relaytester.app.core.model.SupplierProfile, String>,
+    ) {
+        // A REQUESTING slot in the cache withdraws the retry entry for as long as this
+        // re-ask runs, so the button cannot be double-fired into two parallel requests.
+        cacheAnswer(model, index, template, ChallengeProgress(challenge, state = ChallengeState.REQUESTING))
+        val answered = requestChallenge(
+            index = index,
+            supplier = credentials.first,
+            apiKey = credentials.second,
+            model = model,
+            challenge = challenge,
+            slots = template,
+        )
+        // The other slots keep that model's own answers; a model whose round never got
+        // that far is filled with the placeholder slots the retry is about to score, so
+        // the re-scoring never mixes two editors' answers.
+        val previous = roundAnswers[model]
+        val answers = (if (previous != null && previous.size == template.size) {
+            previous.toMutableList()
+        } else {
+            template.map { ChallengeProgress(it) }.toMutableList()
+        }).also { list -> list[index] = answered }
+        setRoundAnswers(roundAnswers + (model to answers))
+        val stateNow = _uiState.value
+        if (!(stateNow.isRunning && stateNow.activeModel == model)) {
+            recordRound(model, answers, template)
         }
     }
 
@@ -887,8 +1003,14 @@ class FingerprintViewModel(
             updateResult(model) { it.copy(status = ModelDetectionStatus.RUNNING) }
 
             val results = requestRound(challenges, supplier, apiKey, model)
-            setRoundAnswers(roundAnswers + (model to results))
-            recordRound(model, results, challenges)
+            // The round's own list is not the whole truth any more: a single-question retry
+            // may have landed for this model while its questions were still being asked, and
+            // this list was fixed before that. Merging (never downgrading a successful
+            // answer) keeps the retry's answer instead of overwriting it with the stale
+            // rejection the user just fixed.
+            val merged = mergeChallengeAnswers(roundAnswers[model], results)
+            setRoundAnswers(roundAnswers + (model to merged))
+            recordRound(model, merged, challenges)
         }
 
         _uiState.update { it.copy(isRunning = false, activeModel = null) }
@@ -1018,6 +1140,11 @@ class FingerprintViewModel(
                 },
             )
         }
+        // A row status change is what moves a model from "still being tested" to "settled",
+        // and settling is exactly what makes its failed questions re-askable. Republish on
+        // every write so the button appears the moment the model's own round part ends —
+        // not when the whole batch does.
+        publishRetryable()
     }
 
     private fun freshProgress(challenges: List<FingerprintChallenge>): List<ChallengeProgress> =
@@ -1243,6 +1370,9 @@ class FingerprintViewModel(
                 },
             )
         }
+        // The rows that just settled are exactly the ones whose unfinished questions become
+        // re-askable; without this the button would wait for an unrelated cache write.
+        publishRetryable()
     }
 
     private fun updateProgress(index: Int, transform: (ChallengeProgress) -> ChallengeProgress) {

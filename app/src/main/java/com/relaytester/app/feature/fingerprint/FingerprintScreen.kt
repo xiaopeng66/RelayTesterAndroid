@@ -195,7 +195,7 @@ private fun FingerprintContent(
     onAnalyze: () -> Unit,
     onCancel: () -> Unit,
     onRegenerate: () -> Unit,
-    onRetryChallenge: (Int) -> Unit,
+    onRetryChallenge: (Int, List<String>) -> Unit,
     onCheckBankUpdate: () -> Unit,
     onInstallBankUpdate: () -> Unit,
     onRemovePackage: () -> Unit,
@@ -336,9 +336,14 @@ private fun FingerprintContent(
             item { BatchResultList(state.batchResults) }
         }
 
-        state.analysis?.let { analysis ->
-            item { DetectionResultCard(analysis) }
-            item { CandidateList(analysis.candidates) }
+        // 手动模式没有结果行，分析结果本身就是全部输出，单独渲染。
+        // API 模式也有 analysis（单模型），但它属于那一行结果——行里展开就能看到同样的
+        // 评价卡与候选榜；再在下边渲染一遍正是用户报的「重复」，所以这里加了空行条件。
+        if (state.batchResults.isEmpty()) {
+            state.analysis?.let { analysis ->
+                item { DetectionResultCard(analysis) }
+                item { CandidateList(analysis.candidates) }
+            }
         }
 
         item {
@@ -1148,20 +1153,44 @@ private fun BatchResultList(results: List<ModelFingerprintResult>) {
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                         Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                row.model,
-                                style = MaterialTheme.typography.bodyLarge,
-                                maxLines = 1,
-                                softWrap = false,
-                                overflow = TextOverflow.Ellipsis,
-                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                Text(
+                                    row.model,
+                                    modifier = Modifier.weight(1f),
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    maxLines = 1,
+                                    softWrap = false,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                // 有效回答 n/n 原来挤在下面那句候选说明的括号里，跟模型名
+                                // 无关的一堆字混在一起。挪到模型名右边并换成对比色，一行
+                                // 就看出「哪个模型·吃了几条」。
+                                if (row.status == ModelDetectionStatus.DONE) {
+                                    Text(
+                                        "有效 ${row.usableAnswers}/${row.submittedAnswers}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = when {
+                                            row.usableAnswers < 3 -> MaterialTheme.colorScheme.error
+                                            row.usableAnswers == row.submittedAnswers ->
+                                                MaterialTheme.colorScheme.primary
+                                            else -> MaterialTheme.colorScheme.tertiary
+                                        },
+                                        maxLines = 1,
+                                        softWrap = false,
+                                    )
+                                }
+                            }
                             Text(
                                 when (row.status) {
                                     ModelDetectionStatus.PENDING -> "等待检测"
                                     ModelDetectionStatus.RUNNING -> "正在检测…"
                                     ModelDetectionStatus.DONE ->
-                                        listOfNotNull(row.candidateName, row.familyName).joinToString(" · ") +
-                                            "（有效回答 ${row.usableAnswers}/${row.submittedAnswers}）"
+                                        listOfNotNull(row.candidateName, row.familyName)
+                                            .joinToString(" · ")
                                     ModelDetectionStatus.FAILED -> row.error ?: "检测失败"
                                 },
                                 style = MaterialTheme.typography.labelSmall,
@@ -1190,19 +1219,26 @@ private fun BatchResultList(results: List<ModelFingerprintResult>) {
                         }
                     }
                     if (expanded) {
-                        if (row.candidates.isEmpty()) {
-                            Text(
-                                "这个模型没有候选数据。",
-                                modifier = Modifier.padding(start = 12.dp, end = 12.dp, bottom = 10.dp),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        } else {
-                            CandidateList(
-                                candidates = row.candidates,
-                                modifier = Modifier.padding(start = 12.dp, end = 12.dp, bottom = 10.dp),
-                                showTitle = false,
-                            )
+                        Column(
+                            modifier = Modifier.padding(start = 12.dp, end = 12.dp, bottom = 10.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            // 评价卡在上、候选榜在下：展开后先看「这个模型最像谁、吃了几条
+                            // 有效回答」，再往下看整张排序。单模型检测此前在下面另起一份
+                            // 评价卡＋候选榜，跟这里的展开内容重复——现在两处只有这一份。
+                            ModelEvaluationCard(row)
+                            if (row.candidates.isEmpty()) {
+                                Text(
+                                    "这个模型没有候选数据。",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            } else {
+                                CandidateList(
+                                    candidates = row.candidates,
+                                    showTitle = false,
+                                )
+                            }
                         }
                     }
                 }
@@ -1241,7 +1277,7 @@ private const val LM_DETECTOR_URL = "https://github.com/Ikaleio/lm-detector"
 private fun ChallengeList(
     state: FingerprintUiState,
     onManualAnswerChange: (Int, String) -> Unit,
-    onRetryChallenge: (Int) -> Unit,
+    onRetryChallenge: (Int, List<String>) -> Unit,
     onRegenerate: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -1326,10 +1362,11 @@ private fun ChallengeList(
                     )
                 },
                 onAnswerChange = { onManualAnswerChange(index, it) },
-                onRetry = { onRetryChallenge(index) },
-                // 哪几题还有没跑完的：由视图模型按**本轮所有模型**的缓存派生，不能看
+                onRetry = { models -> onRetryChallenge(index, models) },
+                // 哪几个模型这一题还没跑完：由视图模型按**本轮所有模型**的缓存派生，不能看
                 // progress——它最后只留最后一个模型的回答，前面失败的模型会因此丢掉入口。
-                retryable = index in state.retryableQuestionIndices,
+                // 列表为空＝这一题还没有定论（仍在接收，或整轮还在跑它），按钮就不出现。
+                retryableModels = state.retryableModels[index].orEmpty(),
             )
         }
     }
@@ -1402,8 +1439,8 @@ private fun ChallengeCard(
     minimumNumbers: Int,
     onCopy: () -> Unit,
     onAnswerChange: (String) -> Unit,
-    onRetry: () -> Unit,
-    retryable: Boolean,
+    onRetry: (List<String>) -> Unit,
+    retryableModels: List<String>,
 ) {
     OutlinedCard {
         Column(
@@ -1454,8 +1491,41 @@ private fun ChallengeCard(
             }
             // 断掉的这一轮从这里接着跑：题目没拿到有效回答、结果行却还在，就值得单独重试
             // 这一题；没有这个入口，一次中断就只能把整轮从头再来。
-            if (!manual && retryable) {
-                OutlinedButton(onClick = onRetry, enabled = enabled) { Text("重试本题") }
+            //
+            // 出现的时机＝这一题**有了定论**（某个模型已结算而它这一格不是有效回答），不再
+            // 等整轮跑完：所以按钮不带 enabled，落定就能点，正在接收时它根本不渲染。
+            if (!manual && retryableModels.isNotEmpty()) {
+                var choosing by rememberSaveable { mutableStateOf(false) }
+                Text(
+                    if (retryableModels.size == 1) {
+                        "这一题 ${retryableModels.first()} 没有有效回答"
+                    } else {
+                        "这一题有 ${retryableModels.size} 个模型没有有效回答"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedButton(
+                    onClick = {
+                        // 一个模型直接重试它；多个才需要问「重试哪个」，因为用户明确要求
+                        // 只补有问题的那个模型，而不是从头再跑。
+                        if (retryableModels.size == 1) onRetry(retryableModels) else choosing = true
+                    },
+                ) { Text("重试本题") }
+                if (choosing) {
+                    RetryModelDialog(
+                        models = retryableModels,
+                        onPick = { model ->
+                            choosing = false
+                            onRetry(listOf(model))
+                        },
+                        onRetryAll = {
+                            choosing = false
+                            onRetry(retryableModels)
+                        },
+                        onDismiss = { choosing = false },
+                    )
+                }
             }
 
             if (manual) {
@@ -1498,6 +1568,50 @@ private fun ChallengeCard(
 }
 
 /**
+ * Picks which failed model a single-question retry should re-ask.
+ *
+ * Only shown when more than one model lacks an answer for the question: with several
+ * failures the panel must not silently restart from the first model, and it must not
+ * re-ask the models that already answered — the user chooses. "全部重试" is offered
+ * last so the common case (one bad model) is the shortest path.
+ */
+@Composable
+private fun RetryModelDialog(
+    models: List<String>,
+    onPick: (String) -> Unit,
+    onRetryAll: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("重试本题") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    "选择要重跑这一题的模型：",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                models.forEach { model ->
+                    TextButton(
+                        onClick = { onPick(model) },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                    ) {
+                        Text(model, modifier = Modifier.fillMaxWidth(), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onRetryAll) { Text("全部重试（${models.size} 个）") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        },
+    )
+}
+
+/**
  * Short status word for a challenge card.
  *
  * A rejection must not repeat [ChallengeProgress.error] here: the reason already
@@ -1530,7 +1644,53 @@ private fun stateColor(state: ChallengeState): Color = when (state) {
 
 @Composable
 private fun DetectionResultCard(analysis: com.relaytester.app.core.fingerprint.FingerprintAnalysis) {
-    val top = analysis.prediction
+    EvaluationCard(
+        displayName = analysis.prediction?.displayName,
+        familyName = analysis.familyName,
+        probability = analysis.prediction?.probability,
+        usableAnswers = analysis.usableAnswers,
+        submittedAnswers = analysis.submittedAnswers,
+        calibrated = analysis.candidates.firstOrNull()?.probability != null,
+        verifierDisagrees = analysis.verifierAgrees == false,
+    )
+}
+
+/**
+ * The evaluation card for one settled batch row — the same content, from row fields.
+ *
+ * A batch row used to open straight onto the candidate ranking, while the single-model
+ * run put this card above it. Both now show card-then-list, so testing a model alone and
+ * testing it in a batch read identically (the user asked for exactly that unification).
+ */
+@Composable
+private fun ModelEvaluationCard(row: ModelFingerprintResult) {
+    EvaluationCard(
+        displayName = row.candidateName,
+        familyName = row.familyName.orEmpty(),
+        probability = row.probability,
+        usableAnswers = row.usableAnswers,
+        submittedAnswers = row.submittedAnswers,
+        calibrated = row.candidates.firstOrNull()?.probability != null,
+        verifierDisagrees = row.verifierAgrees == false,
+    )
+}
+
+/**
+ * The one "how close was this" card, shared by the single-model run and a batch row.
+ *
+ * Takes primitives rather than a [FingerprintAnalysis] so a row — which keeps only the
+ * fields it needs to show — can render the identical card without faking an analysis.
+ */
+@Composable
+private fun EvaluationCard(
+    displayName: String?,
+    familyName: String,
+    probability: Double?,
+    usableAnswers: Int,
+    submittedAnswers: Int,
+    calibrated: Boolean,
+    verifierDisagrees: Boolean,
+) {
     OutlinedCard(
         colors = CardDefaults.outlinedCardColors(
             containerColor = MaterialTheme.colorScheme.secondaryContainer,
@@ -1542,7 +1702,7 @@ private fun DetectionResultCard(analysis: com.relaytester.app.core.fingerprint.F
         ) {
             Text("最接近的候选", style = MaterialTheme.typography.labelMedium)
             Text(
-                top?.displayName ?: "暂不可评分",
+                displayName ?: "暂不可评分",
                 style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.SemiBold),
                 maxLines = 1,
                 softWrap = false,
@@ -1554,31 +1714,31 @@ private fun DetectionResultCard(analysis: com.relaytester.app.core.fingerprint.F
                     // 少于 3 条就没有检验分数（红）；全部采用（绿）与部分采用（青）分开，
                     // 与挑战行、状态词共用同一套语义色。
                     val usableColor = when {
-                        analysis.usableAnswers < 3 -> MaterialTheme.colorScheme.error
-                        analysis.usableAnswers == analysis.submittedAnswers -> Color(0xFF15803D)
+                        usableAnswers < 3 -> MaterialTheme.colorScheme.error
+                        usableAnswers == submittedAnswers -> Color(0xFF15803D)
                         else -> MaterialTheme.colorScheme.tertiary
                     }
                     Text(
-                        "${analysis.usableAnswers}/${analysis.submittedAnswers}",
+                        "$usableAnswers/$submittedAnswers",
                         style = MaterialTheme.typography.titleSmall,
                         color = usableColor,
                     )
                 }
                 Column {
                     Text("家族", style = MaterialTheme.typography.labelSmall)
-                    Text(analysis.familyName, style = MaterialTheme.typography.titleSmall)
+                    Text(familyName, style = MaterialTheme.typography.titleSmall)
                 }
-                top?.probability?.let { probability ->
+                probability?.let {
                     Column {
                         Text("置信", style = MaterialTheme.typography.labelSmall)
-                        Text("${(probability * 100).toInt()}%", style = MaterialTheme.typography.titleSmall)
+                        Text("${(it * 100).toInt()}%", style = MaterialTheme.typography.titleSmall)
                     }
                 }
             }
-            if (analysis.candidates.firstOrNull()?.probability == null) {
+            if (!calibrated) {
                 Text(
-                    if (analysis.usableAnswers < 3) {
-                        "仅 ${analysis.usableAnswers}/3 条有效回答：只给排序，无置信度。"
+                    if (usableAnswers < 3) {
+                        "仅 $usableAnswers/3 条有效回答：只给排序，无置信度。"
                     } else {
                         "本包无置信度标定，只给排序。"
                     },
@@ -1586,7 +1746,7 @@ private fun DetectionResultCard(analysis: com.relaytester.app.core.fingerprint.F
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            if (analysis.verifierAgrees == false) {
+            if (verifierDisagrees) {
                 Text(
                     "排名与核验的第一候选不一致，请谨慎。",
                     style = MaterialTheme.typography.bodySmall,
@@ -1636,7 +1796,9 @@ private fun CandidateList(
                         Text(
                             candidate.familyName,
                             style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            // 供应商/家族名原来跟其他说明文字一样是灰的，夹在候选名下面
+                            // 看不出是另一类信息；换成 tertiary 让「名字·来源」分层。
+                            color = MaterialTheme.colorScheme.tertiary,
                         )
                     }
                     candidate.probability?.let { probability ->
