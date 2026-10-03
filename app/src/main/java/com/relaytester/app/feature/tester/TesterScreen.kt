@@ -111,6 +111,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.DialogProperties
@@ -555,6 +556,33 @@ private val RESULT_ACTION_SLOT = 40.dp
  * indents by the same amount, so the two texts line up rather than the pill's background.
  */
 private val RESULT_PILL_INSET = 8.dp
+
+/**
+ * How far the copy icon has to move so its centre lands on the pill's **text** centre.
+ *
+ * The rail's last cell is [slotWidth] wide and sits flush with the content's right edge, so
+ * its centre is `slotWidth / 2` from that edge; the pill's text centre is
+ * `pillInset + pillLabelWidth / 2` from it. The difference is a function of the rendered
+ * label width, not of a font-scale step: at 1.0× the two are 1dp apart and at 2.0× ten,
+ * which is why the caller measures the label instead of guessing a tier.
+ *
+ * A free function so the invariant is unit-tested rather than only measured on a device.
+ */
+internal fun copyAlignmentOffset(slotWidth: Dp, pillInset: Dp, pillLabelWidth: Dp): Dp =
+    slotWidth / 2 - pillInset - pillLabelWidth / 2
+
+/**
+ * The pill's own wording, in one place: the row that aligns the copy with the pill measures
+ * the same label the pill draws, so the two can never drift apart.
+ */
+internal fun statusChipLabel(status: TestStatus, isFetchedOnly: Boolean): String = when (status) {
+    TestStatus.SUCCESS -> "可用"
+    TestStatus.FAILED -> "失败"
+    // PENDING covers both "queued behind other models" and "this row's request is in
+    // flight", so "进行中" here contradicted the body text on the same row. The row
+    // itself is what says it is running; the badge only says it is not finished yet.
+    TestStatus.PENDING -> if (isFetchedOnly) "待测" else "等待中"
+}
 
 /**
  * Names every supplier whose model pull failed and why. The snackbar only
@@ -1916,10 +1944,10 @@ private fun ResultItem(
                 !failureSummary(result).contains(message)
         }
     val canExpandFailure = !isFetchedOnly && result.status == TestStatus.FAILED && failureDetail != null
-    // 末格宽度：「详情 / 收起」是两个汉字，40dp 的格子扣掉 8dp 右侧内缩后，小字号刚好、
+    // 首格宽度：「详情 / 收起」是两个汉字，40dp 的格子扣掉 8dp 右侧内缩后，小字号刚好、
     // 大字号会顶出去（实测 2.0× 时这两个字要 48dp）。所以按**实际排版宽度**算一次格子
-    // 宽度，不再按字号档位猜。末格只有「详情」有（失败行），其余行是同宽占位，所以复制
-    // 按钮仍然不随状态左右跳。
+    // 宽度，不再按字号档位猜。首格只有「详情」有（失败行），其余行是同宽占位；复制的 x
+    // 只由末格决定，所以它仍然不随状态左右跳。
     val labelStyle = MaterialTheme.typography.labelMedium
     val textMeasurer = rememberTextMeasurer()
     val density = LocalDensity.current
@@ -1929,6 +1957,19 @@ private fun ResultItem(
         }
     }
     val trailingWidth = maxOf(RESULT_ACTION_SLOT, labelWidth + RESULT_PILL_INSET)
+    // 末格是复制，它的中心要落在状态胶囊里**文字**的中心上：胶囊左右各有 8dp 内边距，
+    // 而 40dp 的格子中心离内容右缘 20dp，差的量随字号缩放变（实测「可用」22dp 时差 1dp，
+    // 2.0× 的 44dp 时差 10dp），所以按实排字宽算一次偏移，不按字号档位猜。量的是「可用」：
+    // 用户要的就是与它对齐；「失败 / 待测」同为两个汉字、宽度相同 ⇒ 复制在三种状态行里
+    // 停在同一个 x。
+    val pillStyle = MaterialTheme.typography.labelSmall
+    val pillLabelWidth = remember(textMeasurer, pillStyle, density) {
+        with(density) {
+            textMeasurer.measure(statusChipLabel(TestStatus.SUCCESS, isFetchedOnly = false), pillStyle)
+                .size.width.toDp()
+        }
+    }
+    val copyOffset = copyAlignmentOffset(RESULT_ACTION_SLOT, RESULT_PILL_INSET, pillLabelWidth)
     OutlinedCard {
         Column(
             modifier = Modifier
@@ -2041,31 +2082,62 @@ private fun ResultItem(
                         }
                     }
                 }
-                // 动作轨：三格固定总宽 —— [指纹/空 · 40dp][复制 · 40dp][详情/空 · trailingWidth]。
+                // 动作轨：两格 —— [指纹 / 详情 / 空 · 首格][复制 · 末格]。
                 //
-                // 复制落在**中间**那格，所以它在成功、失败、待测行里停在同一个 x，不再随
-                // 别的图标的有无左右跳（用户明确要求过「复制按钮不要左右乱跳」）。末格仍是
-                // 「详情/收起」，右缘内缩 8dp 对齐状态胶囊里的字（也是用户前后两轮要求过的
-                // 对齐）。指纹从末格挪到首格，即本轮要求的「复制与指纹互换」；它从此不再与
-                // 「详情」共享格子，所以不再需要把图标中心对到标签中心。
+                // 这一轮是**真的把两个图标换位**：复制搬到指纹原来待的那一格（末格，
+                // 中心按 copyOffset 对齐状态胶囊里「可用」两字的中心），指纹搬到复制原来
+                // 待的那一格（首格 40dp，连同旧版复制那个右推 4dp 一起照搬），不再是
+                // 「指纹插到复制左边、复制不动」。
                 //
-                // 三格都渲染（缺内容用同宽占位）是必须的：只要有一行缺格，这一行的总宽就
-                // 比别的行窄，复制的 x 就会跟着变。行高恒为 RESULT_ACTION_SLOT，免得这一行
-                // 被末格撑高。
-                if (onFingerprint != null && result.status == TestStatus.SUCCESS) {
-                    IconButton(
-                        onClick = { onFingerprint(result.model) },
-                        enabled = actionsEnabled,
-                        modifier = Modifier.size(RESULT_ACTION_SLOT),
-                    ) {
-                        Icon(
-                            Icons.Outlined.Fingerprint,
-                            contentDescription = "检测 ${result.model} 的模型指纹",
-                            modifier = Modifier.size(16.dp),
-                        )
+                // 首格在成功行放指纹、失败行放「详情 / 收起」：指纹只在成功行、详情只在
+                // 失败行，两者永不同行，所以共用一个格子。首格宽度按「详情 / 收起」的实排
+                // 宽度算（大字号才顶得出去），复制的 x 只由末格决定 ⇒ 复制在成功 / 失败 /
+                // 待测行里停在同一个 x。两格都渲染（缺内容用同宽占位），行高恒为
+                // RESULT_ACTION_SLOT，免得这一行被首格撑高。
+                when {
+                    onFingerprint != null && result.status == TestStatus.SUCCESS -> {
+                        IconButton(
+                            onClick = { onFingerprint(result.model) },
+                            enabled = actionsEnabled,
+                            modifier = Modifier.size(RESULT_ACTION_SLOT),
+                        ) {
+                            Icon(
+                                Icons.Outlined.Fingerprint,
+                                contentDescription = "检测 ${result.model} 的模型指纹",
+                                // 与旧版复制图标同一个内推：紧贴右边的复制，而不是悬在
+                                // 格子正中。
+                                modifier = Modifier.size(16.dp).offset(x = 4.dp),
+                            )
+                        }
                     }
-                } else {
-                    Spacer(Modifier.size(RESULT_ACTION_SLOT))
+                    canExpandFailure -> {
+                        Box(
+                            modifier = Modifier
+                                .width(trailingWidth)
+                                .height(RESULT_ACTION_SLOT)
+                                // 不要涟漪：点击时默认会在这块 40dp 见方的格子上铺一层
+                                // 方形高光，看着像凭空多出一个按钮框。
+                                .clickable(
+                                    enabled = actionsEnabled,
+                                    interactionSource = remember { MutableInteractionSource() },
+                                    indication = null,
+                                    role = Role.Button,
+                                ) { expanded = !expanded },
+                            contentAlignment = Alignment.CenterEnd,
+                        ) {
+                            Text(
+                                if (expanded) "收起" else "详情",
+                                // 右缘内缩 8dp，于是它贴着右边复制的格子，两行的动作
+                                // 间距一致。
+                                modifier = Modifier.padding(end = RESULT_PILL_INSET),
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.primary,
+                                maxLines = 1,
+                                softWrap = false,
+                            )
+                        }
+                    }
+                    else -> Spacer(Modifier.size(RESULT_ACTION_SLOT))
                 }
                 if (onCopyName != null) {
                     QuietIconButton(
@@ -2075,44 +2147,11 @@ private fun ResultItem(
                         Icon(
                             Icons.Outlined.ContentCopy,
                             contentDescription = "复制模型名 ${result.model}",
-                            modifier = Modifier.size(16.dp),
+                            modifier = Modifier.size(16.dp).offset(x = copyOffset),
                         )
                     }
                 } else {
                     Spacer(Modifier.size(RESULT_ACTION_SLOT))
-                }
-                if (canExpandFailure) {
-                    Box(
-                        modifier = Modifier
-                            .width(trailingWidth)
-                            .height(RESULT_ACTION_SLOT)
-                            // 不要涟漪：点击时默认会在这块 40dp 见方的格子上铺一层方形
-                            // 高光，看着像凭空多出一个按钮框。
-                            .clickable(
-                                enabled = actionsEnabled,
-                                interactionSource = remember { MutableInteractionSource() },
-                                indication = null,
-                                role = Role.Button,
-                            ) { expanded = !expanded },
-                        contentAlignment = Alignment.CenterEnd,
-                    ) {
-                        Text(
-                            if (expanded) "收起" else "详情",
-                            // 右缘对齐状态胶囊里的**文字**：胶囊底色比它的字宽 8dp
-                            // （胶囊自带的内边距），标签跟着内缩同样的量。
-                            modifier = Modifier.padding(end = RESULT_PILL_INSET),
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.primary,
-                            maxLines = 1,
-                            softWrap = false,
-                        )
-                    }
-                } else {
-                    Spacer(
-                        Modifier
-                            .width(trailingWidth)
-                            .height(RESULT_ACTION_SLOT),
-                    )
                 }
             }
             if (result.status == TestStatus.FAILED && failureDetail != null) {
@@ -2367,14 +2406,7 @@ private fun ResultMetricChip(text: String, color: Color, modifier: Modifier = Mo
 /** 状态胶囊：全圆角，把「可用 / 失败 / 待测 / 等待中」放在名称行右端。 */
 @Composable
 private fun ResultStatusChip(status: TestStatus, isFetchedOnly: Boolean = false) {
-    val label = when (status) {
-        TestStatus.SUCCESS -> "可用"
-        TestStatus.FAILED -> "失败"
-        // PENDING covers both "queued behind other models" and "this row's request is in
-        // flight", so "进行中" here contradicted the body text on the same row. The row
-        // itself is what says it is running; the badge only says it is not finished yet.
-        TestStatus.PENDING -> if (isFetchedOnly) "待测" else "等待中"
-    }
+    val label = statusChipLabel(status, isFetchedOnly)
     val color = when (status) {
         TestStatus.SUCCESS -> Color(0xFF15803D)
         TestStatus.FAILED -> MaterialTheme.colorScheme.error

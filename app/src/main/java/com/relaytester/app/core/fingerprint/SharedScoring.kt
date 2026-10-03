@@ -1,22 +1,26 @@
 package com.relaytester.app.core.fingerprint
 
 import kotlin.math.exp
-import kotlin.math.ln
 import kotlin.math.sqrt
 
 /**
  * Direct port of upstream lm-detector's `shared/shared-detector.ts` (`shared-detector-v1`).
  *
- * Upstream scores three answers through one ranker and one verifier and fuses them:
+ * Upstream scores the answers through one ranker and calibrates the ranking:
  *
- *   ranking = 0.5 · z(mean of per-answer LDA projections over the 53 models)
+ *   ranking = 0.5 · z(mean of per-answer LDA projections over the candidate models)
  *           + 0.25 · z(median over answers of the negative kNN distance)
  *           + 0.25 · z(mean of the centroid baseline)
  *
- * and, when exactly three answers are usable, a verifier re-scores the same candidates
- * from a projected density comparison. The calibrated probability is a softmax over the
- * *ranking* with a single fitted temperature [tau]; the verifier only picks the
- * `verification_top` label and never reorders the candidates.
+ * and, with exactly three usable answers, the calibrated probability is a softmax over
+ * that ranking with a single fitted temperature [tau].
+ *
+ * Upstream used to run a second scorer — a logistic "verifier" that re-scored the same
+ * candidates and was used only to flag whether its own best candidate agreed with the
+ * ranking — and it was removed from the artifact (upstream `d53d3f5b`, 58 models). It
+ * never reordered candidates nor changed a probability, so dropping it changes nothing
+ * but the (now gone) agreement caveat. A package in the older format still carries the
+ * block; [FingerprintBank] steps over it rather than scoring with it.
  *
  * A port like this fails quietly — a swapped coefficient still yields a plausible
  * ranking — so every constant here is the one upstream uses, and the golden-vector
@@ -29,7 +33,7 @@ import kotlin.math.sqrt
  * "the package parsed and carries a sane tau".
  */
 
-/** Feature standardisation for one block (`head_params` / `full_params` / verifier). */
+/** Feature standardisation for one block (`head_params` / `full_params`). */
 internal class FeatureParams(val mean: DoubleArray, val scale: DoubleArray)
 
 /** A centroid feature bank: standardisation, the nuisance basis, and per-model centroids. */
@@ -38,35 +42,6 @@ internal class FeatureBank(
     val scale: DoubleArray,
     val nuisanceBasis: Array<DoubleArray>,
     val centroids: Array<DoubleArray>,
-)
-
-/** One quadratic form `constant - ½·δᵀ P δ`. */
-internal class Gaussian(val precision: Array<DoubleArray>, val constant: Double)
-
-/** Per-candidate gaussians the verifier compares a batch against. */
-internal class VerifierCandidate(
-    val mean: DoubleArray,
-    val sameJoint: Gaussian,
-    val alternativeJoint: Gaussian,
-    val sameSingle: Gaussian,
-    val alternativeSingle: Gaussian,
-)
-
-/** The verifier's projection, densities and 6 → 1 logistic head. */
-internal class VerifierWeights(
-    val preprocessing: Array<FeatureParams>,
-    val unitScale: Double,
-    val origin: DoubleArray,
-    val basis: Array<DoubleArray>,
-    val mu: DoubleArray,
-    val newJoint: Gaussian,
-    val candidates: List<VerifierCandidate>,
-    val references: List<QuantizedReferences>,
-    val activeFeatures: IntArray,
-    val mean: DoubleArray,
-    val scale: DoubleArray,
-    val weights: DoubleArray,
-    val bias: Double,
 )
 
 /** Everything the shared detector needs, parsed from the package. */
@@ -80,7 +55,6 @@ internal class DetectorWeights(
     /** `environment_centroids[environment][model]`, 74 values each. */
     val environments: Array<Array<DoubleArray>>,
     val references: List<QuantizedReferences>,
-    val verifier: VerifierWeights,
     val tau: Double,
 )
 
@@ -90,15 +64,6 @@ internal class Ranked(
     val blocks: List<Array<DoubleArray>>,
     val transformed: List<DoubleArray>,
 )
-
-/** Verifier output: the ranking and the per-candidate logits. */
-internal class Verified(
-    val ranking: DoubleArray,
-    val scores: DoubleArray,
-)
-
-/** Calibrated probabilities, or the uncalibrated verifier sigmoids. */
-internal class Calibration(val values: DoubleArray, val calibrated: Boolean)
 
 internal object SharedScoring {
 
@@ -138,79 +103,15 @@ internal object SharedScoring {
     }
 
     /**
-     * The verifier, which only runs on three complete answers.
+     * Closed-set probabilities from `softmax(tau · ranking)`, or null when the package
+     * carries no usable temperature.
      *
-     * It projects each answer into an 8-dimensional space, compares the 24-dimensional
-     * batch against per-candidate gaussians, and feeds six features into a logistic
-     * head. The output re-labels the candidates but does not reorder them.
+     * Upstream's `calibrateRanking` returns null there (`probability_status: 'unavailable'`)
+     * rather than inventing a number, and so does this: the caller then reports no
+     * probability at all and the panel shows no percentage.
      */
-    fun score(numbers: List<IntArray>, weights: DetectorWeights): Verified {
-        require(numbers.size == 3) { "共享核验器需要三条完整回答" }
-        val ranked = rank(numbers, weights)
-        val verifier = weights.verifier
-        val modelCount = weights.ldaWeights.size
-        require(modelCount >= 2) { "检测包至少需要两个候选模型才能计算检验分数" }
-        require(verifier.candidates.size == modelCount && verifier.references.size == modelCount) {
-            "检测包核验器与候选模型数量不一致"
-        }
-
-        // The verifier standardises the raw blocks with its own preprocessing, which is a
-        // different standardisation than the ranker's `full_params`; reusing the ranker's
-        // transformed vector here shifts every logit by ~1e-3.
-        val vx = ranked.blocks.map { transform(it, verifier.preprocessing) }
-        val projected = vx.map { x ->
-            DoubleArray(verifier.mu.size) { j ->
-                var total = 0.0
-                for (i in x.indices) total += (x[i] - verifier.origin[i]) * verifier.basis[i][j]
-                total / verifier.unitScale
-            }
-        }
-        val flat = DoubleArray(projected.size * verifier.mu.size) {
-            projected[it / verifier.mu.size][it % verifier.mu.size]
-        }
-        val newDensity = gaussian(flat, verifier.mu, verifier.newJoint)
-
-        // Per candidate, the distance from each answer to that candidate's own references.
-        val dense = verifier.references.indices.map { reference ->
-            vx.map { nearest(it, verifier.references[reference]) }
-        }
-
-        val scores = DoubleArray(modelCount) { index ->
-            val candidate = verifier.candidates[index]
-            val same = gaussian(flat, candidate.mean, candidate.sameJoint)
-            val alternative = gaussian(flat, candidate.mean, candidate.alternativeJoint)
-            val gains = projected.map { row ->
-                alternative - gaussian(row, candidate.mean, candidate.alternativeSingle) -
-                    same + gaussian(row, candidate.mean, candidate.sameSingle)
-            }
-            val features = doubleArrayOf(
-                ln(1.0 + median(dense[index])),
-                same / 24.0,
-                (same - newDensity) / 24.0,
-                mean(gains) / 16.0,
-                (gains.max() - gains.min()) / 16.0,
-                ranked.ranking[index] - maxOfOthers(ranked.ranking, index),
-            )
-            val head = verifier
-            var total = head.bias
-            for (j in head.activeFeatures.indices) {
-                val feature = features[head.activeFeatures[j]]
-                total += (feature - head.mean[j]) / head.scale[j] * head.weights[j]
-            }
-            total
-        }
-        require(scores.all { it.isFinite() }) { "核验计算产生无效数值，请刷新后重试" }
-        return Verified(ranked.ranking, scores)
-    }
-
-    /**
-     * Temperature softmax over the ranking, or the verifier's own sigmoids when the
-     * package carries no usable temperature.
-     */
-    fun calibrate(ranking: DoubleArray, scores: DoubleArray, tau: Double): Calibration {
-        if (!tau.isFinite() || tau < 0.001 || tau > 1000.0) {
-            return Calibration(DoubleArray(scores.size) { sigmoid(scores[it]) }, calibrated = false)
-        }
+    fun calibrate(ranking: DoubleArray, tau: Double): DoubleArray? {
+        if (!tau.isFinite() || tau < 0.001 || tau > 1000.0) return null
         val logits = DoubleArray(ranking.size) { tau * ranking[it] }
         val maximum = logits.max()
         var total = 0.0
@@ -219,16 +120,7 @@ internal object SharedScoring {
             total += value
             value
         }
-        return Calibration(DoubleArray(weights.size) { weights[it] / total }, calibrated = true)
-    }
-
-    /** Highest value among the other entries; upstream's ranking-margin feature. */
-    private fun maxOfOthers(values: DoubleArray, index: Int): Double {
-        var best = Double.NEGATIVE_INFINITY
-        for (i in values.indices) {
-            if (i != index && values[i] > best) best = values[i]
-        }
-        return best
+        return DoubleArray(weights.size) { weights[it] / total }
     }
 
     /** Concatenates the standardised, unit-normalised blocks with their fixed weights. */
@@ -296,19 +188,6 @@ internal object SharedScoring {
         var total = 0.0
         for (index in 0 until take) total += distances[index]
         return total / take
-    }
-
-    /**
-     * `constant - ½·δᵀ P δ`, with `mu` cycled: the batch is longer than the mean vector,
-     * and upstream indexes it modulo the mean's length.
-     */
-    private fun gaussian(x: DoubleArray, mu: DoubleArray, gaussian: Gaussian): Double {
-        val delta = DoubleArray(x.size) { x[it] - mu[it % mu.size] }
-        var quadratic = 0.0
-        for (row in gaussian.precision.indices) {
-            quadratic += delta[row] * dot(gaussian.precision[row], delta)
-        }
-        return gaussian.constant - 0.5 * quadratic
     }
 
     private fun centered(values: DoubleArray, bank: FeatureBank): DoubleArray =

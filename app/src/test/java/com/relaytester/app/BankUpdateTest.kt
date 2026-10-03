@@ -35,7 +35,7 @@ class BankUpdateTest {
         val patched = bankWithBuiltAt(patchStamp)
         val manifest = BankManifestParser.parse(manifestJson(patched, builtAt = patchStamp))
 
-        assertEquals(2, manifest.formatVersion)
+        assertEquals(3, manifest.formatVersion)
         assertEquals(patchStamp, manifest.builtAt)
         assertEquals(shippedBankModelCount(), manifest.modelCount)
         assertEquals(patched.size.toLong(), manifest.sizeBytes)
@@ -45,12 +45,25 @@ class BankUpdateTest {
     }
 
     @Test
-    fun `a manifest from another format version is refused`() {
-        val failure = runCatching {
-            BankManifestParser.parse(manifestJson(fixtureBankBytes(), formatVersion = 1))
-        }.exceptionOrNull()
+    fun `a manifest from an older or unknown format version is refused`() {
+        for (version in listOf(1, 4, 99)) {
+            val failure = runCatching {
+                BankManifestParser.parse(manifestJson(fixtureBankBytes(), formatVersion = version))
+            }.exceptionOrNull()
 
-        assertTrue(failure is BankUpdateException)
+            assertTrue("格式版本 $version 未被拒绝", failure is BankUpdateException)
+        }
+    }
+
+    @Test
+    fun `the previous package format is still installable`() {
+        // Two shapes are live while the fleet upgrades: an app that knows both must not
+        // refuse the older manifest, or every republish would force an app update.
+        val manifest = BankManifestParser.parse(manifestJson(fixtureBankBytes(), formatVersion = 2))
+
+        assertEquals(2, manifest.formatVersion)
+        assertEquals(BankManifestParser.MIN_SUPPORTED_FORMAT, 2)
+        assertEquals(BankManifestParser.MAX_SUPPORTED_FORMAT, 3)
     }
 
     @Test

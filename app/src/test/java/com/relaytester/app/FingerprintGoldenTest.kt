@@ -115,16 +115,6 @@ class FingerprintGoldenTest {
                     actual.rankingScore,
                     SCORE_TOLERANCE,
                 )
-                if (entry.isNull("verificationScore")) {
-                    assertNull("$name / $model：上游没有检验分数，本实现不得给出", actual.verificationScore)
-                } else {
-                    assertEquals(
-                        "$name / $model：检验分数偏离上游",
-                        entry.getDouble("verificationScore"),
-                        actual.verificationScore ?: Double.NaN,
-                        SCORE_TOLERANCE,
-                    )
-                }
                 if (entry.isNull("probability")) {
                     assertNull("$name / $model：上游没有置信度，本实现不得给出", actual.probability)
                 } else {
@@ -140,7 +130,7 @@ class FingerprintGoldenTest {
     }
 
     @Test
-    fun `scoring path, calibration status and verifier verdict match`() {
+    fun `scoring path and calibration status match`() {
         val cases = golden()
         for (index in 0 until cases.length()) {
             val case = cases.getJSONObject(index)
@@ -161,14 +151,8 @@ class FingerprintGoldenTest {
             }
             assertEquals("$name：置信度状态不一致", expectedStatus, analysis.probabilityStatus)
             if (full) {
-                assertEquals(
-                    "$name：核验第一候选不一致",
-                    expected.optString("verificationTop"),
-                    analysis.verificationTopModelId,
-                )
-                assertNotNull("$name：完整路径必须给出检验分数", analysis.candidates.first().verificationScore)
+                assertNotNull("$name：完整路径必须给出置信度", analysis.candidates.first().probability)
             } else {
-                assertNull("$name：部分样本路径不应给出检验分数", analysis.verificationTopModelId)
                 assertNull("$name：部分样本路径不应给出置信度", analysis.candidates.first().probability)
             }
         }
@@ -189,6 +173,27 @@ class FingerprintGoldenTest {
     }
 
     @Test
+    fun `an unusable temperature gives ordering but no probability`() {
+        // Upstream's calibrateRanking returns null when its gate does not hold, and the
+        // panel then shows no percentage at all. With the hash binding collapsed (see the
+        // file header of SharedScoring), the only remaining input that can make the
+        // calibration unusable is tau itself, so both ends of its accepted range are
+        // pinned here: a package with a silly temperature must not produce a number.
+        for (tau in listOf(0.0, -1.0, 1.0e9)) {
+            val patched = FingerprintBank.fromPackageBytes(bankWithTau(tau))
+            val case = golden().getJSONObject(0)
+            val analysis = patched.analyze(answers(case), expectedCounts(case))
+
+            assertEquals("tau=$tau：置信度状态", ProbabilityStatus.UNAVAILABLE, analysis.probabilityStatus)
+            assertNull("tau=$tau：不得给出置信度", analysis.candidates.first().probability)
+            assertTrue("tau=$tau：仍必须给出候选排序", analysis.candidates.isNotEmpty())
+        }
+        // And the shipped fixture's own temperature is inside the range.
+        val analysis = bank.analyze(answers(golden().getJSONObject(0)), expectedCounts(golden().getJSONObject(0)))
+        assertEquals(ProbabilityStatus.REFERENCE_CALIBRATED, analysis.probabilityStatus)
+    }
+
+    @Test
     fun `a two-answer round ranks but refuses to claim a probability`() {
         val case = golden().getJSONObject(0)
         val analysis = bank.analyze(answers(case).take(2), expectedCounts(case).take(2))
@@ -197,7 +202,6 @@ class FingerprintGoldenTest {
         assertEquals(ProbabilityStatus.UNAVAILABLE, analysis.probabilityStatus)
         assertEquals(2, analysis.usableAnswers)
         assertNull(analysis.candidates.first().probability)
-        assertNull(analysis.verifierAgrees)
         assertTrue("部分样本仍必须给出完整候选排序", analysis.candidates.isNotEmpty())
     }
 
@@ -310,13 +314,12 @@ class FingerprintGoldenTest {
 
     private companion object {
         /**
-         * The package quantises every dense float to 1e-6 and the two reference tensors
-         * to 16 bits per row, and the score vector is a chain of z-scores and unit
+         * The package quantises every dense float to 1e-6 and the reference tensors to
+         * 16 bits per row, and the score vector is a chain of z-scores and unit
          * normalisations over those values, so accumulated error is orders of magnitude
          * above the quantisation step. The measured worst deviation on this fixture is
-         * 2.5e-5 in a ranking score, 3.9e-5 in a verifier logit and 1.2e-5 in a
-         * probability; 1e-4 is still far tighter than the gap between any two distinct
-         * models (the closest verifier margin on these vectors is 0.96).
+         * 2.5e-5 in a ranking score and 1.2e-5 in a probability; 1e-4 is still far
+         * tighter than the gap between any two distinct models on these vectors.
          */
         const val SCORE_TOLERANCE = 1.0e-4
         const val PROBABILITY_TOLERANCE = 1.0e-4

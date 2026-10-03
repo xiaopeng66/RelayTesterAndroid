@@ -41,8 +41,12 @@ PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_BANK = os.path.join(PROJECT, "build/lm-fingerprint/lite-bank.bin")
 GRADLE = os.path.join(PROJECT, "app/build.gradle.kts")
 TOKEN_FILES = ["E:/AI/Zcode/tmp/.ghtoken"]
-MAGIC = b"LMFPA002"
-FORMAT_VERSION = 2
+MAGIC_LENGTH = 8
+# The manifest's formatVersion is read off the package's own magic rather than being a
+# constant here: two shapes are live while the fleet upgrades (format 2 still carries
+# upstream's removed verifier block, format 3 does not), and a publish that hardcoded
+# the number could advertise the wrong one and have the app reject a valid package.
+FORMAT_BY_MAGIC = {b"LMFPA002": 2, b"LMFPA003": 3}
 
 RELEASE_BODY = """指纹检测包的发布源，供「指纹检测」面板的「检查更新」按钮读取。
 
@@ -73,9 +77,10 @@ def sha256(data):
 
 def read_header(blob):
     """Read the asset's own header so the manifest cannot drift from the file."""
-    if blob[: len(MAGIC)] != MAGIC:
-        raise SystemExit(f"不是指纹库资产（magic={blob[:8]!r}）")
-    offset = len(MAGIC)
+    magic = blob[:MAGIC_LENGTH]
+    if magic not in FORMAT_BY_MAGIC:
+        raise SystemExit(f"不是指纹库资产（magic={magic!r}）")
+    offset = MAGIC_LENGTH
 
     def u32():
         nonlocal offset
@@ -91,6 +96,7 @@ def read_header(blob):
         return value
 
     return {
+        "format_version": FORMAT_BY_MAGIC[magic],
         "source_reference_sha256": text(),
         "built_at": text(),
         "reference_sha256": text(),
@@ -111,7 +117,7 @@ def app_version_code():
 def build_manifest(bank_bytes):
     header = read_header(bank_bytes)
     return {
-        "formatVersion": FORMAT_VERSION,
+        "formatVersion": header["format_version"],
         "builtAt": header["built_at"],
         "referenceSha256": header["reference_sha256"],
         "modelCount": header["model_count"],

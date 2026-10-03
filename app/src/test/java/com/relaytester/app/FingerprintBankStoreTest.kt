@@ -11,6 +11,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -280,7 +281,7 @@ class FingerprintBankStoreTest {
     @Test
     fun `a declared string longer than the file is rejected`() {
         val files = MemoryBankFileSystem(installed = null)
-        val bytes = "LMFPA002".toByteArray() + byteArrayOf(0x10, 0, 0, 0)
+        val bytes = "LMFPA003".toByteArray() + byteArrayOf(0x10, 0, 0, 0)
 
         val result = files.store().install(bytes)
 
@@ -321,16 +322,56 @@ class FingerprintBankStoreTest {
     }
 
     @Test
-    fun `a verifier reference of another width is rejected before installation`() {
-        for (width in listOf(425, 433)) {
-            val bytes = bankWithVerifierReferenceColumns(width)
-            val error = runCatching { FingerprintBank.fromPackageBytes(bytes) }.exceptionOrNull()
-            assertTrue("宽度 $width 未被拒绝", error is IllegalArgumentException)
-            assertTrue("拒绝原因：${error?.message}", error?.message.orEmpty().contains("核验器参考维度"))
+    fun `a legacy package truncated inside its verifier block is rejected`() {
+        // The legacy shape carries a verifier block the app no longer scores, so the skip
+        // steps over it by length. A truncated one must still be refused rather than
+        // walked off the end of: the skip goes through the same capacity check every other
+        // read does, so no fraction of the file can desynchronise into a valid package.
+        val legacy = BankFixtures.legacyPackageBytes()
+        for (fraction in listOf(0.5, 0.6, 0.75, 0.9)) {
+            val cut = legacy.copyOf((legacy.size * fraction).toInt())
+            val error = runCatching { FingerprintBank.fromPackageBytes(cut) }.exceptionOrNull()
+            assertTrue(
+                "截断到 ${(fraction * 100).toInt()}% 的旧格式包未被拒绝",
+                error is IllegalArgumentException,
+            )
             val files = MemoryBankFileSystem(installed = null)
-            assertTrue(files.store().install(bytes) is BankInstallResult.Rejected)
+            assertTrue(files.store().install(cut) is BankInstallResult.Rejected)
             assertNull(files.installed)
         }
+        // The whole file is accepted, so the loop above is not just proving the fixture
+        // is unreadable in the first place.
+        assertEquals(6, FingerprintBank.fromPackageBytes(legacy).modelCount)
+    }
+
+    @Test
+    fun `a reference tensor in an unsupported code width is rejected`() {
+        // The reference tensor's `[bits][columns][models]` header is read from the file, so
+        // a package claiming a width other than the two that exist has to be refused. Both
+        // readers are pinned: the current one builds the tensor, the legacy verifier skip
+        // only steps over it, and a guessed stride in either would desynchronise the rest
+        // of the package instead of failing here.
+        for (bits in listOf(0, 3, 32)) {
+            val buildError = assertThrows(IllegalArgumentException::class.java) {
+                BankReader(referenceTensorHeader(bits)).quantizedReferences()
+            }
+            val skipError = assertThrows(IllegalArgumentException::class.java) {
+                BankReader(referenceTensorHeader(bits)).skipQuantizedReferences()
+            }
+            assertTrue("位宽 $bits 的构读未被拒绝：${buildError.message}", buildError.message.orEmpty().contains("位宽"))
+            assertTrue("位宽 $bits 的跳读未被拒绝：${skipError.message}", skipError.message.orEmpty().contains("位宽"))
+        }
+    }
+
+    /** Enough of `[bits][columns][models]` for either reader to reach the width check. */
+    private fun referenceTensorHeader(bits: Int): ByteArray {
+        val bytes = ByteArray(64)
+        for (index in 0 until 4) {
+            bytes[index] = ((bits ushr (index * 8)) and 0xFF).toByte()
+            bytes[4 + index] = ((4 ushr (index * 8)) and 0xFF).toByte()
+            bytes[8 + index] = 1.toByte()
+        }
+        return bytes
     }
 
     @Test
@@ -408,7 +449,7 @@ class FingerprintBankStoreTest {
         // Upstream expresses this as a hash binding; here it is structural.
         val files = MemoryBankFileSystem(installed = null)
         val reader = BankReader(fixtureBankBytes())
-        reader.expectMagic("LMFPA002")
+        reader.expectMagic("LMFPA003")
         reader.string() // source reference digest
         reader.string() // build stamp
         reader.string() // reference digest
@@ -436,7 +477,7 @@ class FingerprintBankStoreTest {
 
         fun text(value: String) = u32(value.length) + value.toByteArray(Charsets.UTF_8)
 
-        return "LMFPA002".toByteArray() +
+        return "LMFPA003".toByteArray() +
             text("a") + text("2026-09-30T00:00:00+00:00") + text("b") + u32(modelCount)
     }
 }

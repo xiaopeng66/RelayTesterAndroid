@@ -10,15 +10,15 @@
 - 版权：Copyright (c) 2026 xqy2006
 - 许可：MIT License
 - 使用范围：
-  - `tools/build_fingerprint_asset.py` + `tools/update_fingerprint_package.py` —— 把上游发布的 `data/shared_detector.json`、`data/unified_bank.json` 构建成端侧二进制检测包（`LMFPA002`）并发布的脚本。
-  - 检测包本体不随本应用分发，而是作为发布资产（`bank` 预发布）单独提供，由用户在应用内下载；其中包含上游数据的 Hellinger 特征均值/尺度、LDA 权重、质心与干扰子空间、序数块统计、每模型参考矩阵、核验器张量与温度参数。
+  - `tools/build_fingerprint_asset.py` + `tools/update_fingerprint_package.py` —— 把上游发布的 `data/shared_detector.json`、`data/unified_bank.json` 构建成端侧二进制检测包（现行 `LMFPA003`，并保留读取早期 `LMFPA002` 的能力）并发布的脚本。
+  - 检测包本体不随本应用分发，而是作为发布资产（`bank` 预发布）单独提供，由用户在应用内下载；其中包含上游数据的 Hellinger 特征均值/尺度、LDA 权重、质心与干扰子空间、序数块统计、每模型参考矩阵与温度参数。
   - `core/fingerprint/`（`FingerprintBank.kt`、`SharedScoring.kt`、`NumberFeatures.kt`、`ChallengeGenerator.kt`、`FingerprintTypes.kt`）—— 对上游 `shared/fingerprint-core.js`、`shared-detector.ts`、`challenge-browser.js` 的 Kotlin 移植。
   - `app/src/test/resources/fingerprint-golden.json` + `tools/make_fingerprint_golden.ts` —— 用上游自己的 `analyzeSharedOutputs`（`shared-detector.ts`）生成的测试向量与其生成脚本。
 
 ### 相对上游的修改（MIT 允许，此处如实声明）
 
-1. **算法完全对齐上游**：排序器 `0.5·z(LDA) + 0.25·z(kNN距离) + 0.25·z(质心基线)`、均只用前 128 个整数算 LDA、按回答取中位数/均值、核验器的 6→1 逻辑头与温度 softmax，均与上游 `shared-detector-v1` 一致。移植的正确性由"上游自己跑出来的黄金向量"对拍（最差偏差：排名 2.5e-5、检验 3.9e-5、置信度 1.2e-5；120 个候选对 0 反序）。
-2. **参数定点量化**：稠密浮点以 `SCALE = 1_000_000` 量化为 int32；两个参考张量按行 16 位量化 + 每行一个 float32 尺度（这是包体积的主要来源，8 位可省一半但会重排约 0.05% 的近邻候选对）。
+1. **算法完全对齐上游**：排序器 `0.5·z(LDA) + 0.25·z(kNN距离) + 0.25·z(质心基线)`、均只用前 128 个整数算 LDA、按回答取中位数/均值、温度 softmax，均与上游 `shared-detector-v1` 一致。上游于 2026-10-03（`d53d3f5b`）移除了它自己的核验器（仅供提示「排名与核验是否一致」，不参与排序与置信度），本应用随之删除该段；早期 `LMFPA002` 格式仍可读取，其核验器段按长度跳过、不参与打分。移植的正确性由"上游自己跑出来的黄金向量"对拍（最差偏差：排名 2.5e-5、置信度 1.2e-5；120 个候选对 0 反序）。
+2. **参数定点量化**：稠密浮点以 `SCALE = 1_000_000` 量化为 int32；参考张量按行 16 位量化 + 每行一个 float32 尺度（这是包体积的主要来源，8 位可省一半但会重排约 0.05% 的近邻候选对）。
 3. **置信度绑定的处理**：上游用四个哈希把温度参数绑到拟合时的制品上；本应用的检测包本身就是那个绑定的产物，因此这一层退化为"包能解析且温度在 [0.001, 1000] 内"。已在 `SharedScoring.kt` 文件头注明。
 4. **警告词不翻译**：挑战提示词的措辞保持上游原文（中/英/日/韩/法五种）。参考库的干扰子空间正是在这些提示词环境下拟合的，改写措辞会偏离其标定前提。
 

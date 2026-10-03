@@ -3,7 +3,7 @@ package com.relaytester.app.core.fingerprint
 /**
  * Parses the packed detection package and scores a round of answers with it.
  *
- * The package is ~3.5 MB and parses in a few tens of milliseconds, so it is parsed once
+ * The package is 2–4 MB and parses in a few tens of milliseconds, so it is parsed once
  * per process rather than per detection. Which copy gets parsed — the installed one or
  * nothing — is [FingerprintBankStore]'s decision, not this class's.
  *
@@ -30,10 +30,10 @@ class FingerprintBank private constructor(
      * [expectedCounts] is the requested integer count per answer; an answer is only used
      * when it carries at least max(80, 55% of the request), matching upstream.
      *
-     * Three usable answers take the full path: ranking, verifier logits and a calibrated
-     * probability. One or two take the partial path, which returns a ranking and no
-     * probability — upstream deliberately refuses to put a percentage on a sample that
-     * the verifier was never fitted for.
+     * Three usable answers take the full path: ranking plus a calibrated probability. One
+     * or two take the partial path, which returns a ranking and no probability — upstream
+     * refuses to put a closed-set percentage on a sample the calibration was never fitted
+     * for.
      */
     fun analyze(answerTexts: List<String>, expectedCounts: List<Int>): FingerprintAnalysis {
         require(answerTexts.isNotEmpty()) { "至少需要一条回答" }
@@ -52,18 +52,8 @@ class FingerprintBank private constructor(
         }
 
         val complete = usable.size == 3 && answerTexts.size == 3
-        val ranking: DoubleArray
-        val verification: DoubleArray?
-        if (complete) {
-            val verified = SharedScoring.score(usable, weights)
-            ranking = verified.ranking
-            verification = verified.scores
-        } else {
-            ranking = SharedScoring.rank(usable, weights).ranking
-            verification = null
-        }
-
-        val calibration = verification?.let { SharedScoring.calibrate(ranking, it, weights.tau) }
+        val ranking = SharedScoring.rank(usable, weights).ranking
+        val probabilities = if (complete) SharedScoring.calibrate(ranking, weights.tau) else null
         val order = ranking.indices.sortedByDescending { ranking[it] }
 
         val candidates = order.map { index ->
@@ -73,16 +63,11 @@ class FingerprintBank private constructor(
                 family = families[index],
                 familyName = familyNames[index],
                 rankingScore = ranking[index],
-                verificationScore = verification?.get(index),
-                probability = calibration?.takeIf { it.calibrated }?.values?.get(index),
+                probability = probabilities?.get(index),
             )
         }
 
         val winner = order.first()
-        val verificationTop = verification?.let { scores ->
-            // First maximum, matching upstream's indexOf(max) so a tie keeps the lower index.
-            scores.indices.maxByOrNull { scores[it] }
-        }
         return FingerprintAnalysis(
             candidates = candidates,
             // Upstream reports the winning family but no family probability on this path.
@@ -94,13 +79,11 @@ class FingerprintBank private constructor(
             referenceBuiltAt = referenceBuiltAt,
             answerCount = usable.size,
             scoring = if (complete) FingerprintScoring.FULL else FingerprintScoring.PARTIAL,
-            probabilityStatus = when {
-                calibration == null -> ProbabilityStatus.UNAVAILABLE
-                calibration.calibrated -> ProbabilityStatus.REFERENCE_CALIBRATED
-                else -> ProbabilityStatus.UNAVAILABLE
+            probabilityStatus = if (probabilities != null) {
+                ProbabilityStatus.REFERENCE_CALIBRATED
+            } else {
+                ProbabilityStatus.UNAVAILABLE
             },
-            verificationTopModelId = verificationTop?.let { modelIds[it] },
-            verifierAgrees = verificationTop?.let { it == winner },
         )
     }
 
@@ -121,7 +104,17 @@ class FingerprintBank private constructor(
         /** Upstream accepts an answer at 55% of the requested integer count. */
         const val VALIDITY_RATIO = 0.55
 
-        private const val MAGIC = "LMFPA002"
+        private const val MAGIC = "LMFPA003"
+
+        /**
+         * The format published before upstream dropped its verifier scorer.
+         *
+         * A device that has not re-downloaded its package still holds one of these, and
+         * because the package is sequential the block has to be stepped over exactly (see
+         * [skipVerifier]). Nothing is scored from it: the verifier only ever chose the
+         * (now removed) "ranking and verification agree" caveat.
+         */
+        private const val LEGACY_MAGIC = "LMFPA002"
 
         /** Width of the ordered-block half of the feature vector upstream's detector emits. */
         private const val ORDERED_DIMENSION = 74
@@ -136,7 +129,10 @@ class FingerprintBank private constructor(
          */
         fun fromPackageBytes(bytes: ByteArray): FingerprintBank {
             val reader = BankReader(bytes)
-            reader.expectMagic(MAGIC)
+            val magic = reader.magic()
+            if (magic != MAGIC && magic != LEGACY_MAGIC) throw IllegalArgumentException("指纹检测包格式不匹配")
+            reader.expectMagic(magic)
+            val legacyVerifier = magic == LEGACY_MAGIC
             reader.string() // source reference digest, informational
             val builtAt = reader.string()
             reader.string() // reference digest
@@ -181,40 +177,7 @@ class FingerprintBank private constructor(
 
             val references = reader.quantizedReferences()
 
-            val verifierPreprocessing = readParams(reader, "核验器")
-            val unitScale = reader.float64()
-            val origin = reader.floats(reader.u32())
-            val basisRows = reader.u32()
-            val basisColumns = reader.u32()
-            val basis = reader.matrix(basisRows, basisColumns)
-            val mu = reader.floats(reader.u32())
-            val newJoint = readGaussian(reader)
-
-            val candidateCount = reader.u32()
-            reader.requireCapacity(candidateCount, 16)
-            val candidates = ArrayList<VerifierCandidate>(candidateCount)
-            repeat(candidateCount) {
-                val mean = reader.floats(reader.u32())
-                candidates.add(
-                    VerifierCandidate(
-                        mean = mean,
-                        sameJoint = readGaussian(reader),
-                        alternativeJoint = readGaussian(reader),
-                        sameSingle = readGaussian(reader),
-                        alternativeSingle = readGaussian(reader),
-                    ),
-                )
-            }
-            val verifierReferences = reader.quantizedReferences()
-
-            val activeCount = reader.u32()
-            reader.u32() // the same count again; the builder writes it twice
-            val active = reader.int32(activeCount)
-            val headSize = reader.u32()
-            val headMean = reader.floats(headSize)
-            val headScale = reader.floats(headSize)
-            val headWeights = reader.floats(headSize)
-            val headBias = reader.float64()
+            if (legacyVerifier) skipVerifier(reader)
 
             // Every count above came out of the file, so a file that stops early or
             // carries trailing junk is rejected here instead of scoring nonsense later.
@@ -229,21 +192,6 @@ class FingerprintBank private constructor(
                 ordered = ordered,
                 environments = environments,
                 references = references,
-                verifier = VerifierWeights(
-                    preprocessing = verifierPreprocessing,
-                    unitScale = unitScale,
-                    origin = origin,
-                    basis = basis,
-                    mu = mu,
-                    newJoint = newJoint,
-                    candidates = candidates,
-                    references = verifierReferences,
-                    activeFeatures = active,
-                    mean = headMean,
-                    scale = headScale,
-                    weights = headWeights,
-                    bias = headBias,
-                ),
                 tau = tau,
             )
             validate(ids, weights, modelCount)
@@ -258,6 +206,53 @@ class FingerprintBank private constructor(
                 minimumValidNumbers = minimumValid,
                 weights = weights,
             )
+        }
+
+        /**
+         * Steps over the verifier block of a legacy package, reading nothing into memory.
+         *
+         * The field order is the one the old reader consumed, field for field; the arrays
+         * are skipped rather than built because nothing downstream uses them any more.
+         * Every skip is capacity-checked, so a truncated legacy package still fails here
+         * instead of being accepted with a misaligned tail.
+         */
+        private fun skipVerifier(reader: BankReader) {
+            val blocks = reader.u32()
+            reader.requireCapacity(blocks, 16)
+            repeat(blocks) {
+                val size = reader.u32()
+                reader.skip(size, 4) // mean
+                reader.skip(size, 4) // scale
+            }
+            reader.skip(1, 8) // unit scale
+            reader.skipFloats() // origin
+            reader.skipMatrix() // projection basis
+            reader.skipFloats() // mu
+            skipGaussian(reader) // new_joint
+
+            val candidates = reader.u32()
+            reader.requireCapacity(candidates, 16)
+            repeat(candidates) {
+                reader.skipFloats() // per-candidate mean
+                repeat(4) { skipGaussian(reader) } // same/alternative, joint/single
+            }
+            reader.skipQuantizedReferences() // the verifier's own kNN references
+
+            val active = reader.u32()
+            reader.u32() // the same count again; the old builder wrote it twice
+            reader.skip(active, 4)
+            // One length prefix covers all three head vectors, as the old writer emitted it.
+            val head = reader.u32()
+            reader.skip(head, 4) // mean
+            reader.skip(head, 4) // scale
+            reader.skip(head, 4) // weights
+            reader.skip(1, 8) // bias
+        }
+
+        /** One `constant - ½·δᵀ P δ` form: a squared matrix and a float64 constant. */
+        private fun skipGaussian(reader: BankReader) {
+            reader.skipMatrix()
+            reader.skip(1, 8)
         }
 
         /**
@@ -309,36 +304,6 @@ class FingerprintBank private constructor(
             require(weights.references.all { it.columns == FEATURE_DIMENSION }) {
                 "指纹检测包的 kNN 参考维度不是 $FEATURE_DIMENSION"
             }
-            val verifier = weights.verifier
-            require(verifier.preprocessing.size == 2) {
-                "指纹检测包的核验器标准化块数量不正确"
-            }
-            // The verifier re-standardises the raw blocks itself, so its two blocks have to
-            // match the same two widths the ranker uses.
-            require(verifier.preprocessing[0].mean.size == NumberFeatures.DIMENSION &&
-                verifier.preprocessing[1].mean.size == ORDERED_DIMENSION) {
-                "指纹检测包的核验器标准化维度不正确"
-            }
-            require(verifier.basis.size == FEATURE_DIMENSION && verifier.origin.size == FEATURE_DIMENSION) {
-                "指纹检测包的核验器投影维度不是 $FEATURE_DIMENSION"
-            }
-            require(verifier.basis.all { it.size == verifier.mu.size }) {
-                "指纹检测包的核验器投影基与均值维度不一致"
-            }
-            require(verifier.candidates.size == modelCount && verifier.references.size == modelCount) {
-                "指纹检测包的核验器与模型数量不一致"
-            }
-            require(verifier.references.all { it.columns == FEATURE_DIMENSION }) {
-                "指纹检测包的核验器参考维度不是 $FEATURE_DIMENSION"
-            }
-            require(verifier.activeFeatures.size == verifier.mean.size &&
-                verifier.mean.size == verifier.scale.size &&
-                verifier.scale.size == verifier.weights.size) {
-                "指纹检测包的核验器损失函数长度不一致"
-            }
-            require(verifier.activeFeatures.all { it in 0 until VERIFIER_FEATURES }) {
-                "指纹检测包的核验器特征下标越界"
-            }
             require(ids.distinct().size == modelCount) { "指纹检测包的模型 id 有重复" }
         }
 
@@ -365,12 +330,6 @@ class FingerprintBank private constructor(
             val centroidCount = reader.u32()
             val centroids = reader.matrix(centroidCount, size)
             return FeatureBank(mean, scale, basis, centroids)
-        }
-
-        private fun readGaussian(reader: BankReader): Gaussian {
-            val rows = reader.u32()
-            val columns = reader.u32()
-            return Gaussian(reader.matrix(rows, columns), reader.float64())
         }
 
         /**
@@ -400,8 +359,5 @@ class FingerprintBank private constructor(
                 "指纹检测包的$what 干扰基维度不是 $dimension"
             }
         }
-
-        /** The number of features upstream's verifier logistic head consumes. */
-        private const val VERIFIER_FEATURES = 6
     }
 }

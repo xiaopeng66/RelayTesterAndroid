@@ -3,21 +3,25 @@
 
 Reads the upstream artifacts and writes one binary file the Android app loads
 directly. The package carries everything upstream's `shared-detector-v1` scoring
-needs, so the app can reproduce its ranking, its verifier scores and its calibrated
-probability without any upstream code at runtime:
+needs, so the app can reproduce its ranking and its calibrated probability without
+any upstream code at runtime:
 
   * the LDA head (head_params + lda_weights + lda_bias)
   * the centroid/"baseline" feature bank (hellinger + ordered blocks)
   * the kNN reference matrix per model (ranker.references)
-  * the verifier: preprocessing, projection basis, per-candidate gaussians,
-    its own reference matrix and the 6 -> 1 logistic head
-  * the confidence calibration scalar (tau)
+  * the confidence calibration scalar (`calibration.tau`)
 
-Encoding follows the file the app already shipped: every dense block is int32
-fixed point at 1e-6, which was measured to move a per-model score by at most 3.6e-5
-and to change no ordering. The two big reference tensors (835,692 + 545,688 values,
-all within +-0.6) are stored as int8 with one float32 scale per row: that is where
-the package would otherwise be 5.5 MB of the ~6 MB total.
+Format `LMFPA003`. Upstream used to ship a second scorer — a logistic "verifier" whose
+only job was to say whether its own best candidate agreed with the ranking — and it is
+gone from `shared-detector-v1` as of upstream `d53d3f5b` (58 models, probability from
+`softmax(tau · ranking)`). `LMFPA002` is the same package with that verifier block still
+in the middle; the app reads both (see `FingerprintBank`), so a device that has not
+re-downloaded the package keeps working.
+
+Encoding: every dense block is int32 fixed point at 1e-6, which was measured to move a
+per-model score by at most 3.6e-5 and to change no ordering. The reference tensor (one
+matrix per model, values within +-0.6) is stored as int8/int16 with one float32 scale per
+row: that is where the package would otherwise be most of its size.
 
 Usage:
     python tools/build_fingerprint_asset.py <data-dir> <output-file>
@@ -31,25 +35,24 @@ https://github.com/Ikaleio/lm-detector/tree/main/data
 
 --models N (or --pick a,b,c) restricts the package to a subset of the models. That is
 how the unit-test fixture is built: a small package that still exercises every code
-path (including the verifier, whose ranking-margin feature needs at least two
-candidates). The emitted JSON files carry the *unquantized* subset, so the golden
-vectors generated from them measure the real cost of quantization.
+path (the family roll-up needs at least two families to mean anything). The emitted JSON
+files carry the *unquantized* subset, so the golden vectors generated from them measure
+the real cost of quantization.
 """
 import json
 import struct
 import sys
 from pathlib import Path
 
-MAGIC = b"LMFPA002"
+MAGIC = b"LMFPA003"
 SCALE = 1_000_000.0
 INT8_MAX = 127
 INT16_MAX = 32767
 
 # 16 bits is the default because it makes the package indistinguishable from the
-# full-precision artifact: on all 55 golden cases (53 real model answer sets plus two
-# synthetic ones) the ranking scores move by at most 4.5e-5 and no candidate changes
-# place. 8 bits halves the package to 2.1 MB but reorders near-tied candidates
-# (38 of 75,790 pairs, 0.05%), which is visible in the panel's top-8 list.
+# full-precision artifact: on all golden cases the ranking scores move by at most 4.5e-5
+# and no candidate changes place. 8 bits halves the package but reorders near-tied
+# candidates (38 of 75,790 pairs, 0.05%), which is visible in the panel's top-8 list.
 DEFAULT_REFERENCE_BITS = 16
 
 
@@ -169,9 +172,9 @@ def subset_models(detector, bank, ids):
     """Restrict every per-model array to `ids`, in the order given.
 
     Used to build the unit-test fixture: a package small enough to commit that still
-    runs the whole algorithm (the verifier needs at least two candidates for its
-    ranking-margin feature, and the panel's family roll-up needs at least two
-    families to mean anything).
+    runs the whole algorithm (the panel's family roll-up needs at least two families to
+    mean anything). A `verifier` block, if the artifact still carries one, is subset the
+    same way so the emitted detector JSON stays self-consistent.
     """
     order = detector["model_ids"]
     positions = []
@@ -203,10 +206,11 @@ def subset_models(detector, bank, ids):
                                pick(block) for block in
                                bank_block["ordered_blocks"]["environment_centroids"]]},
     }
-    verifier = dict(detector["verifier"])
-    verifier["references"] = pick(verifier["references"])
-    verifier["candidates"] = pick(verifier["candidates"])
-    detector["verifier"] = verifier
+    if isinstance(detector.get("verifier"), dict):
+        verifier = dict(detector["verifier"])
+        verifier["references"] = pick(verifier["references"])
+        verifier["candidates"] = pick(verifier["candidates"])
+        detector["verifier"] = verifier
     if isinstance(detector.get("calibration"), dict):
         calibration = dict(detector["calibration"])
         binding = dict(calibration.get("binding") or {})
@@ -292,7 +296,10 @@ def main():
     full = ranker["full_params"]
     if len(head) != 2 or len(full) != 2:
         raise SystemExit("head_params and full_params must each have two feature blocks")
-    verifier = detector["verifier"]
+    # Upstream dropped its verifier scorer (see the module docstring). Older artifacts
+    # still carry one, and the app can still read a package that has it, but there is
+    # nothing here to write from it any more: the ranking and the calibrated probability
+    # never depended on it.
     calibration = detector.get("calibration") or {}
     tau = calibration.get("tau")
     if not isinstance(tau, (int, float)):
@@ -352,37 +359,6 @@ def main():
     # kNN references: one matrix per candidate model
     w.quantized_references(ranker["references"], ref_bits)
 
-    # verifier: projection, shared joint, per-candidate gaussians, own references, head
-    w.u32(len(verifier["preprocessing"]))
-    for block in verifier["preprocessing"]:
-        w.u32(len(block["mean"]))
-        w.i32(quantize(block["mean"]))
-        w.i32(quantize(block["scale"]))
-    w.f64([verifier["unit_scale"]])
-    w.u32(len(verifier["origin"]))
-    w.i32(quantize(verifier["origin"]))
-    w.matrix(verifier["basis"])
-    w.u32(len(verifier["mu"]))
-    w.i32(quantize(verifier["mu"]))
-    w.gaussian(verifier["new_joint"])
-    w.u32(len(verifier["candidates"]))
-    for candidate in verifier["candidates"]:
-        w.u32(len(candidate["mean"]))
-        w.i32(quantize(candidate["mean"]))
-        for key in ("same_joint", "alternative_joint", "same_single", "alternative_single"):
-            w.gaussian(candidate[key])
-    w.quantized_references(verifier["references"], ref_bits)
-    model_head = verifier["model"]
-    active = [int(f) for f in model_head["active_features"]]
-    w.u32(len(active))
-    w.u32(len(active))
-    w.i32(active)
-    w.u32(len(model_head["mean"]))
-    w.i32(quantize(model_head["mean"]))
-    w.i32(quantize(model_head["scale"]))
-    w.i32(quantize(model_head["weights"]))
-    w.f64([model_head["bias"]])
-
     blob = w.blob()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(blob)
@@ -416,7 +392,6 @@ def main():
     print(f"  models          : {len(model_ids)}")
     print(f"  lda_weights     : {len(lda_weights)}x{len(lda_weights[0])}")
     print(f"  knn references  : {sum(len(r) for r in ranker['references'])}x{len(ranker['references'][0][0])}")
-    print(f"  verifier refs   : {sum(len(r) for r in verifier['references'])}x{len(verifier['references'][0][0])}")
     print(f"  hellinger dims  : {len(h['feature_mean'])}")
     print(f"  ordered dims    : {len(o['feature_mean'])}")
     print(f"  environments    : {len(env)}")

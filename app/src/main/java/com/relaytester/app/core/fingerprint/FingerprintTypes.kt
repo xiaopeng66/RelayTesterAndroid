@@ -6,10 +6,10 @@ package com.relaytester.app.core.fingerprint
  *
  * Every dense scalar block is an int32 at [SCALE]. The value was chosen from a sweep
  * over the published reference answers: rounding to 1e-6 moves the per-model score
- * vector by at most 3.6e-5 and changes no ordering. The two reference tensors (1948
- * ranker rows and 1272 verifier rows of 429 values) are quantized per row instead:
- * as int32 they alone would be 5.5 MB, and 8-bit codes reorder near-tied candidates
- * (measured: 38 of 75,790 pairs), so the package ships them at 16 bits.
+ * vector by at most 3.6e-5 and changes no ordering. The reference tensor (one row set
+ * per model, 429 values each) is quantized per row instead: as int32 it alone would be
+ * most of the package, and 8-bit codes reorder near-tied candidates (measured: 38 of
+ * 75,790 pairs), so the package ships them at 16 bits.
  */
 internal class BankReader(private val bytes: ByteArray) {
     private var offset = 0
@@ -116,6 +116,70 @@ internal class BankReader(private val bytes: ByteArray) {
     }
 
     /**
+     * The file's magic, without consuming it.
+     *
+     * Two package formats are live at once (the current one and the pre-verifier-removal
+     * one, which the app still has to be able to step over), and which one this is decides
+     * what follows the references. Nothing is interpreted before the caller has checked
+     * the value against the formats it knows.
+     */
+    fun magic(): String {
+        requireCapacity(MAGIC_LENGTH, 1)
+        return String(bytes, 0, MAGIC_LENGTH, Charsets.US_ASCII)
+    }
+
+    /**
+     * Consumes [elements] values of [bytesEach] bytes each, building nothing.
+     *
+     * Used only to step over a legacy package's verifier block: those arrays are no longer
+     * scored, so they are read for their lengths and skipped. Every call still goes
+     * through [requireCapacity], so a truncated legacy package is rejected exactly as it
+     * was when the block was parsed into objects.
+     */
+    fun skip(elements: Int, bytesEach: Int) {
+        requireCapacity(elements, bytesEach)
+        offset += elements * bytesEach
+    }
+
+    /** Reads a length-prefixed fixed-point block and discards it. */
+    fun skipFloats() {
+        skip(u32(), 4)
+    }
+
+    /** Reads a row-major matrix's shape and discards its body. */
+    fun skipMatrix() {
+        val rows = u32()
+        val columns = u32()
+        // The product is computed in Long: two large counts multiplied as Int can wrap
+        // into a small positive number and walk straight past the capacity check.
+        requireCapacity(columns, 4)
+        val payload = rows.toLong() * columns.toLong()
+        require(payload <= Int.MAX_VALUE) { "指纹检测包数组过大" }
+        skip(payload.toInt(), 4)
+    }
+
+    /** Discards one `[bits][columns][models]` reference tensor, in the same order read. */
+    fun skipQuantizedReferences() {
+        val bits = u32()
+        if (bits != 8 && bits != 16) {
+            throw IllegalArgumentException("指纹检测包参考张量位宽不受支持（$bits）")
+        }
+        val columns = u32()
+        val models = u32()
+        requireCapacity(models, 8)
+        requireCapacity(columns, 1)
+        val width = if (bits == 16) 2 else 1
+        repeat(models) {
+            val rows = u32()
+            requireCapacity(rows, 4)
+            skip(rows, 4)
+            val payload = rows.toLong() * columns.toLong() * width
+            require(payload <= Int.MAX_VALUE) { "指纹检测包参考张量过大" }
+            skip(payload.toInt(), 1)
+        }
+    }
+
+    /**
      * One quantized reference tensor: `[bits][columns][models]`, then per model
      * `[rows][float32 scales][packed codes]`.
      *
@@ -156,6 +220,9 @@ internal class BankReader(private val bytes: ByteArray) {
 
     companion object {
         const val SCALE = 1_000_000.0
+
+        /** Every supported package starts with eight ASCII bytes of format tag. */
+        const val MAGIC_LENGTH = 8
     }
 }
 
@@ -214,7 +281,7 @@ internal class QuantizedReferences(
     }
 }
 
-/** One candidate model with its resolved ranking scores. */
+/** One candidate model with its resolved ranking score. */
 data class FingerprintCandidate(
     val modelId: String,
     val displayName: String,
@@ -222,18 +289,16 @@ data class FingerprintCandidate(
     val familyName: String,
     /** Weighted ranker score; the candidate order follows this value. */
     val rankingScore: Double,
-    /** Verifier logit, or null on the partial path (fewer than three answers). */
-    val verificationScore: Double?,
     /** Share of the calibrated softmax mass, or null when the ranking is partial. */
     val probability: Double?,
 )
 
 /** Which of upstream's two scoring paths produced an analysis. */
 enum class FingerprintScoring {
-    /** Three usable answers: ranker + verifier + calibrated probability. */
+    /** Three usable answers: ranking plus a calibrated closed-set probability. */
     FULL,
 
-    /** One or two usable answers: ranking only, no verifier score and no probability. */
+    /** One or two usable answers: ranking only, no probability. */
     PARTIAL,
 }
 
@@ -259,10 +324,6 @@ data class FingerprintAnalysis(
     val answerCount: Int,
     val scoring: FingerprintScoring,
     val probabilityStatus: ProbabilityStatus,
-    /** Model the verifier scored highest, or null on the partial path. */
-    val verificationTopModelId: String?,
-    /** True when the verifier's best candidate is also the ranking's best. */
-    val verifierAgrees: Boolean?,
 ) {
     val prediction: FingerprintCandidate? get() = candidates.firstOrNull()
 }

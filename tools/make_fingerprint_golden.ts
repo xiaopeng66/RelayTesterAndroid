@@ -6,6 +6,10 @@
 // upstream. The Kotlin test then has to reproduce `ranking`, `scores`, the
 // calibrated probability and the candidate order from the packed package.
 //
+// Upstream dropped its second (verifier) scorer in `d53d3f5b`, so the artifact carries
+// no verifier scores to compare against and none are recorded here: the golden pins the
+// ranking, the calibrated probability and the order, which is what the app implements.
+//
 // The detector JSON passed in must be the *unquantized* subset (what
 // `build_fingerprint_asset.py --emit-detector-json` writes), while the package the
 // app reads is quantized. So the assertions in the Kotlin test double as the
@@ -123,16 +127,13 @@ const golden = cases.map((testCase) => {
       predictionName: analysis.prediction_name ?? null,
       familyPrediction: analysis.family_prediction ?? null,
       rankingScore: analysis.ranking_score ?? null,
-      verificationTop: analysis.verification_top ?? null,
       // Candidate order is by ranking, which is what the panel displays.
       order: results.map((r: any) => r.model),
       candidateScores: results.map((r: any) => ({
         model: r.model,
         rankingScore: round(r.score),
-        verificationScore: r.verification_score == null ? null : round(r.verification_score),
         probability: r.probability == null ? null : round(r.probability),
       })),
-      verifierFeatures: results.map((r: any) => (r.verification_features ?? []).map(round)),
     },
   }
 })

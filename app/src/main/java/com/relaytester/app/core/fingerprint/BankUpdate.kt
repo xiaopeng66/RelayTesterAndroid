@@ -38,10 +38,23 @@ data class BankManifest(
     val minAppVersionCode: Long,
 )
 
-/** Reads the published manifest; every failure is a [BankUpdateException]. */
+/**
+ * Reads the published manifest; every failure is a [BankUpdateException].
+ */
 object BankManifestParser {
-    /** Bumped when the packed package changes shape; an app that predates it must not install it. */
-    const val SUPPORTED_FORMAT = 2
+    /**
+     * Package shapes this app can install, oldest first.
+     *
+     * Two are live while the fleet upgrades: format 2 is the pre-verifier-removal package
+     * and format 3 dropped that block. A manifest may advertise either, and both are
+     * installable — the app detects the actual shape from the file's magic, so accepting
+     * the older manifest only avoids making a fleet-wide upgrade out of a republish. An
+     * app older than this build sees `minAppVersionCode` and offers the app update instead.
+     */
+    const val MIN_SUPPORTED_FORMAT = 2
+
+    /** Newest package shape this app understands. */
+    const val MAX_SUPPORTED_FORMAT = 3
 
     fun parse(text: String): BankManifest {
         val root = try {
@@ -50,7 +63,7 @@ object BankManifestParser {
             throw BankUpdateException("更新清单无法解析")
         }
         val formatVersion = root.optInt("formatVersion", -1)
-        if (formatVersion != SUPPORTED_FORMAT) {
+        if (formatVersion < MIN_SUPPORTED_FORMAT || formatVersion > MAX_SUPPORTED_FORMAT) {
             throw BankUpdateException("更新清单的格式版本 $formatVersion 不受支持")
         }
         val builtAt = root.string("builtAt", "构建时间")

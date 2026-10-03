@@ -36,7 +36,11 @@ android {
         // 10504 turns the question area into one three-column block per model and queues a
         // single-question retry behind the question already on the wire when the panel is
         // set to 逐题发送.
-        versionCode = 10_504
+        // 10505 swaps the result row's two action cells (the copy takes the cell that was
+        // the fingerprint's, aligned to the 可用 pill's text centre), centres the challenge
+        // cell's retry, gives the 有效 n/3 counter a fixed slot, and reads both the current
+        // detection-package format and the previous one.
+        versionCode = 10_505
         versionName = "1.5.0"
         ndk {
             abiFilters += "arm64-v8a"

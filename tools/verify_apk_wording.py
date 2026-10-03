@@ -37,6 +37,9 @@ FINAL = [
     "筛选模型",
     "清空筛选",
     "选择模型",
+    # 10505: the update manifest gained a format gate, so a manifest whose package format
+    # this build cannot score is refused with this exact sentence.
+    "更新清单的格式版本",
 ]
 
 # Only strings that this round retired everywhere. A word that still has a legitimate
@@ -55,6 +58,9 @@ RETIRED = [
     "重试本题",
     "选择要重跑这一题的模型：",
     "全部重试（",
+    # 10505: upstream dropped its verifier scorer, so the caveat it fed is gone with it.
+    # Nothing else in the app prints it, so it must not survive in a build.
+    "排名与核验的第一候选不一致，请谨慎。",
 ]
 
 

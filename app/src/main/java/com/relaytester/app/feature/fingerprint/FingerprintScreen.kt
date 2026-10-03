@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -72,11 +73,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -1120,6 +1123,22 @@ private fun ModelRow(
 @Composable
 private fun BatchResultList(results: List<ModelFingerprintResult>) {
     val settled = settledModelCount(results)
+    // 「有效 n/n」与右边那个百分比各占一个定宽槽位，两处都是这次修的同一个毛病：
+    // 百分比原来只在有值时渲染，于是模型名的 weight(1f) 会把这个 Row 的右缘推到不同的
+    // 位置，「有效 3/3」（有百分比）与「有效 1/3」（没有）就落在两个 x 上。槽位宽度按
+    // 最宽的取值实排一次（「有效 8/8」「100%」），起点/终点因此对所有行一致，2.0× 字号
+    // 也不会把字裁掉；宽度用 widthIn(min = …) 兜底，万一将来出现更长的取值只是把名字
+    // 挤窄一点，而不是裁字。
+    val countStyle = MaterialTheme.typography.labelSmall
+    val scoreStyle = MaterialTheme.typography.titleSmall
+    val textMeasurer = rememberTextMeasurer()
+    val density = LocalDensity.current
+    val countSlot = remember(textMeasurer, countStyle, density) {
+        with(density) { textMeasurer.measure("有效 8/8", countStyle).size.width.toDp() }
+    }
+    val scoreSlot = remember(textMeasurer, scoreStyle, density) {
+        with(density) { textMeasurer.measure("100%", scoreStyle).size.width.toDp() }
+    }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text("检测结果", style = MaterialTheme.typography.titleMedium)
         Text(
@@ -1171,20 +1190,26 @@ private fun BatchResultList(results: List<ModelFingerprintResult>) {
                                 )
                                 // 有效回答 n/n 原来挤在下面那句候选说明的括号里，跟模型名
                                 // 无关的一堆字混在一起。挪到模型名右边并换成对比色，一行
-                                // 就看出「哪个模型·吃了几条」。
+                                // 就看出「哪个模型·吃了几条」；定宽槽位保证每个 n/n 都在
+                                // 同一个 x 上（用户明确要求 0/3…3/3 统一）。
                                 if (row.status == ModelDetectionStatus.DONE) {
-                                    Text(
-                                        "有效 ${row.usableAnswers}/${row.submittedAnswers}",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = when {
-                                            row.usableAnswers < 3 -> MaterialTheme.colorScheme.error
-                                            row.usableAnswers == row.submittedAnswers ->
-                                                MaterialTheme.colorScheme.primary
-                                            else -> MaterialTheme.colorScheme.tertiary
-                                        },
-                                        maxLines = 1,
-                                        softWrap = false,
-                                    )
+                                    Box(
+                                        modifier = Modifier.widthIn(min = countSlot),
+                                        contentAlignment = Alignment.CenterStart,
+                                    ) {
+                                        Text(
+                                            "有效 ${row.usableAnswers}/${row.submittedAnswers}",
+                                            style = countStyle,
+                                            color = when {
+                                                row.usableAnswers < 3 -> MaterialTheme.colorScheme.error
+                                                row.usableAnswers == row.submittedAnswers ->
+                                                    MaterialTheme.colorScheme.primary
+                                                else -> MaterialTheme.colorScheme.tertiary
+                                            },
+                                            maxLines = 1,
+                                            softWrap = false,
+                                        )
+                                    }
                                 }
                             }
                             Text(
@@ -1207,11 +1232,20 @@ private fun BatchResultList(results: List<ModelFingerprintResult>) {
                             )
                         }
                         if (row.status == ModelDetectionStatus.DONE) {
-                            row.probability?.let { probability ->
-                                Text(
-                                    "${(probability * 100).toInt()}%",
-                                    style = MaterialTheme.typography.titleSmall,
-                                )
+                            // 槽位常在：没有百分比的行也占住这块宽度，「有效 n/n」才不会
+                            // 因此往右挪。
+                            Box(
+                                modifier = Modifier.widthIn(min = scoreSlot),
+                                contentAlignment = Alignment.CenterEnd,
+                            ) {
+                                row.probability?.let { probability ->
+                                    Text(
+                                        "${(probability * 100).toInt()}%",
+                                        style = scoreStyle,
+                                        maxLines = 1,
+                                        softWrap = false,
+                                    )
+                                }
                             }
                             Icon(
                                 if (expanded) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore,
@@ -1262,6 +1296,19 @@ private val MODEL_ROW_HEIGHT = 48.dp
  * block read as one row rather than three ragged strips.
  */
 private val CHALLENGE_CELL_MIN_HEIGHT = 104.dp
+
+/**
+ * Touch strip for a failing cell's 「重试」.
+ *
+ * The strip spans the whole cell and keeps the 48 dp touch height Material 3 would have
+ * given the button anyway; what changed is the drawn button inside it. The old control was
+ * a `TextButton`: device measurement (10504) had uiautomator report its clickable node at
+ * 58 × 48 dp starting at the cell's own left edge, with an 11 sp label in the middle of it
+ * — a loose left-aligned word with blank above, below and to its right, which is what the
+ * user saw. The chip is centred and 24 dp tall, so the blank is gone while the strip's own
+ * target (whole cell wide, 48 dp tall) is larger than the old button's.
+ */
+private val CHALLENGE_RETRY_TOUCH_HEIGHT = 48.dp
 
 /**
  * How far the model-list button is lifted off the text field's bottom edge.
@@ -1588,8 +1635,38 @@ private fun ChallengeCell(
                 )
             }
             if (retryable) {
-                TextButton(onClick = onRetry) {
-                    Text("重试", style = MaterialTheme.typography.labelSmall)
+                // 一枚居中的小芯片，住在一整格宽、48dp 高的触控条里。原来用 M3 的
+                // TextButton：它把 11sp 的「重试」放进一个 58×48dp 的盒子，还按 Column
+                // 的默认 Start 对齐贴着格子左缘 —— 于是看起来是一段悬在左边的小字，
+                // 上下各空 19dp（设备实测：可点节点 58×48dp 从格子左缘起）。现在看得见
+                // 的按钮只有 24dp 高且水平居中，触控面反而更大（整格宽 × 48dp）。
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(CHALLENGE_RETRY_TOUCH_HEIGHT)
+                        // 不要涟漪：默认涟漪会在这条整格宽的透明条上铺一层矩形高光，
+                        // 像凭空多出一个框（与应用里「详情」等安静动作一致）。
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null,
+                            role = Role.Button,
+                            onClick = onRetry,
+                        ),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Surface(
+                        shape = MaterialTheme.shapes.small,
+                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
+                    ) {
+                        Text(
+                            "重试",
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            maxLines = 1,
+                            softWrap = false,
+                        )
+                    }
                 }
             }
         }
@@ -1753,7 +1830,6 @@ private fun DetectionResultCard(analysis: com.relaytester.app.core.fingerprint.F
         usableAnswers = analysis.usableAnswers,
         submittedAnswers = analysis.submittedAnswers,
         calibrated = analysis.candidates.firstOrNull()?.probability != null,
-        verifierDisagrees = analysis.verifierAgrees == false,
     )
 }
 
@@ -1773,7 +1849,6 @@ private fun ModelEvaluationCard(row: ModelFingerprintResult) {
         usableAnswers = row.usableAnswers,
         submittedAnswers = row.submittedAnswers,
         calibrated = row.candidates.firstOrNull()?.probability != null,
-        verifierDisagrees = row.verifierAgrees == false,
     )
 }
 
@@ -1791,7 +1866,6 @@ private fun EvaluationCard(
     usableAnswers: Int,
     submittedAnswers: Int,
     calibrated: Boolean,
-    verifierDisagrees: Boolean,
 ) {
     OutlinedCard(
         colors = CardDefaults.outlinedCardColors(
@@ -1813,7 +1887,7 @@ private fun EvaluationCard(
             Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                 Column {
                     Text("有效回答", style = MaterialTheme.typography.labelSmall)
-                    // 少于 3 条就没有检验分数（红）；全部采用（绿）与部分采用（青）分开，
+                    // 少于 3 条就没有置信度（红）；全部采用（绿）与部分采用（青）分开，
                     // 与挑战行、状态词共用同一套语义色。
                     val usableColor = when {
                         usableAnswers < 3 -> MaterialTheme.colorScheme.error
@@ -1846,13 +1920,6 @@ private fun EvaluationCard(
                     },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            if (verifierDisagrees) {
-                Text(
-                    "排名与核验的第一候选不一致，请谨慎。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error,
                 )
             }
             HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))

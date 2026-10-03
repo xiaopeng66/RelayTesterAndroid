@@ -116,8 +116,6 @@ data class ModelFingerprintResult(
      * renders, so the two views agree by construction.
      */
     val candidates: List<FingerprintCandidate> = emptyList(),
-    /** False when the verifier disagreed with the ranking's winner (see the card's caveat). */
-    val verifierAgrees: Boolean? = null,
 )
 
 @Immutable
@@ -1144,7 +1142,6 @@ class FingerprintViewModel(
                 // candidate list the single-model card shows, instead of telling the user
                 // less for testing more models.
                 candidates = analysis?.candidates.orEmpty(),
-                verifierAgrees = analysis?.verifierAgrees,
             )
         }
         // The one funnel every finished model passes through — the batch loop and the
