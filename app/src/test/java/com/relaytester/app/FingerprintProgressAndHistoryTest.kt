@@ -13,7 +13,6 @@ import com.relaytester.app.feature.fingerprint.ChallengeState
 import com.relaytester.app.feature.fingerprint.FingerprintViewModel
 import com.relaytester.app.feature.fingerprint.ModelDetectionStatus
 import com.relaytester.app.feature.fingerprint.ModelFingerprintResult
-import com.relaytester.app.feature.fingerprint.activeModelPosition
 import com.relaytester.app.feature.fingerprint.historyOutcome
 import com.relaytester.app.feature.fingerprint.roundQuestionsDone
 import com.relaytester.app.feature.fingerprint.roundQuestionsTotal
@@ -29,7 +28,6 @@ import kotlinx.coroutines.test.setMain
 import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -173,27 +171,6 @@ class FingerprintProgressAndHistoryTest {
     fun `an empty round does not divide by zero`() {
         assertEquals(0, roundQuestionsTotal(emptyList(), emptyList()))
         assertEquals(0, roundQuestionsDone(emptyList(), emptyList()))
-    }
-
-    // ---- which model is being tested --------------------------------------
-
-    @Test
-    fun `the active model's place comes from the result rows`() {
-        val results = rows(
-            ModelDetectionStatus.DONE,
-            ModelDetectionStatus.RUNNING,
-            ModelDetectionStatus.PENDING,
-        ).toMutableList().also { it[2] = ModelFingerprintResult("third") }
-
-        assertEquals(1, activeModelPosition(results, "model-0"))
-        assertEquals(2, activeModelPosition(results, "model-1"))
-        assertEquals(3, activeModelPosition(results, "third"))
-    }
-
-    @Test
-    fun `a model outside the round has no place`() {
-        assertNull(activeModelPosition(rows(ModelDetectionStatus.RUNNING), "not-in-this-round"))
-        assertNull(activeModelPosition(rows(ModelDetectionStatus.RUNNING), null))
     }
 
     // ---- the live integer count -------------------------------------------

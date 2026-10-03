@@ -25,7 +25,11 @@ FINAL = [
     "查看支持的模型",
     "检查更新",
     "删除已安装的检测包",
-    "重试本题",
+    "排队中",
+    "接收中",
+    "每个模型一组三栏",
+    "开跑后每个模型各占一组三栏",
+    " · 需要 ",
     "收起候选",
     "展开候选",
     "检测包支持的模型",
@@ -37,7 +41,8 @@ FINAL = [
 
 # Only strings that this round retired everywhere. A word that still has a legitimate
 # use elsewhere (「先拉取模型列表，再添加来源」「禁止测试：只拉模型…」) does not belong
-# here: the check must not fail on wording that is still correct.
+# here: the check must not fail on wording that is still correct. The same rule keeps
+# 「 · 需要 」 in FINAL rather than here — the manual card still prints it.
 RETIRED = [
     "该供应商还没有已拉取的模型",
     "仅建议用于本机或内网自建站点",
@@ -45,6 +50,11 @@ RETIRED = [
     "App 版本代码",
     "原始额度",
     "继续会替换当前全部配置",
+    # 10504: the retry affordance moved into each question column, so the per-question
+    # button and the model chooser it opened are gone from the panel.
+    "重试本题",
+    "选择要重跑这一题的模型：",
+    "全部重试（",
 ]
 
 

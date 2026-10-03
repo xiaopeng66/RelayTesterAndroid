@@ -553,6 +553,9 @@ class FingerprintViewModelTest {
         // 正在接收＝入口必须让位：补发在飞时这一题不再算「可重试」，否则按钮会在
         // 请求已发出的情况下继续显示「重试本题」。
         assertTrue("补发在飞时这一题要从入口里消失", 0 !in subject.uiState.value.retryableModels.keys)
+        // 排队标记只属于「等闸门」那一段：闸门是空的，所以请求已经上线，标记必须已经收掉，
+        // 否则格子会在整个接收期间谎称自己还在排队。
+        assertTrue("上线之后不该再显示排队中", subject.uiState.value.queuedRetries.isEmpty())
 
         subject.retryChallenge(0)
         // 显式点名（多模型时「全部重试」走的就是这条路）也要被挡住：入口虽然已经撤下，
@@ -567,12 +570,12 @@ class FingerprintViewModelTest {
     }
 
     @Test
-    fun `a rejected question is retryable before its own model finishes the others`() {
+    fun `with one question on the wire a serial retry queues behind it`() {
         val api = FirstSlotFailsThenParksApi(goldenCase().answers)
         val subject = readyApiViewModelFor(SingleSupplierStore(testSupplier()), api).apply {
             updateParallel(false)
         }
-        val prompt0 = subject.uiState.value.progress[0].challenge.prompt
+        val prompts = subject.uiState.value.progress.map { it.challenge.prompt }
 
         subject.runApiDetection()
         runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.parked.await() } }
@@ -586,9 +589,13 @@ class FingerprintViewModelTest {
         assertEquals(listOf("test-model"), mid.retryableModels[0])
 
         subject.retryChallenge(0)
-        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.retried.await() } }
-        assertEquals("补发的是第 1 题", 2, api.prompts.count { it == prompt0 })
-        assertTrue("整轮没结束也照发", subject.uiState.value.isRunning)
+        runBlocking { delay(200) }
+
+        // 逐题发送时这条重试排到当前那一题之后（用户要求）：第 2 题还在飞，它就不许上线，
+        // 而且必须如实说「排队中」，不能拿 REQUESTING 假装已经在接收。
+        assertEquals("等待期间标成排队", setOf("test-model" to 0), subject.uiState.value.queuedRetries)
+        assertEquals("当前那一题没回来之前不许抢跑", prompts.take(2), api.prompts.toList())
+        assertTrue("整轮仍在跑", subject.uiState.value.isRunning)
         // 这一轮仍然持有这个模型的结果行：补发不该把它翻成「已出结果」，否则整轮进度
         // 会往回跳，而且这一行会被两个写者同时改。
         assertEquals(
@@ -599,15 +606,69 @@ class FingerprintViewModelTest {
 
         api.release()
         runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { subject.awaitIdle() } }
+
+        // 闸门一放开，排队的那条抢在整轮下一题之前上线——「插在当前那一题之后」的全部
+        // 含义就在这个顺序里：第 3 题排在它后面，而不是它排在整轮后面。
+        assertEquals("重试插在第 2 题之后、第 3 题之前", prompts.take(2) + prompts[0] + prompts[2], api.prompts.toList())
         val done = subject.uiState.value
         assertTrue(done.progress.all { it.state == ChallengeState.RECEIVED })
         assertEquals(ModelDetectionStatus.DONE, done.batchResults.single().status)
         assertEquals(3, done.batchResults.single().usableAnswers)
         assertEquals("全部答出来后入口清空", emptyMap<Int, List<String>>(), done.retryableModels)
+        assertTrue("排队标记必须随请求上线一起收掉", done.queuedRetries.isEmpty())
     }
 
     @Test
-    fun `a failed model is retryable while the rest of the batch is still running`() {
+    fun `with the parallel switch on a retry goes out beside the round`() {
+        val api = FirstSlotFailsThenParksApi(goldenCase().answers)
+        val subject = readyApiViewModelFor(SingleSupplierStore(testSupplier()), api).apply {
+            updateParallel(true)
+        }
+        val prompt0 = subject.uiState.value.progress[0].challenge.prompt
+
+        subject.runApiDetection()
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.parked.await() } }
+        assertEquals("并行：第 1 题已失败、第 2 题在接收", setOf(0), subject.uiState.value.retryableModels.keys)
+
+        subject.retryChallenge(0)
+        runBlocking { delay(200) }
+
+        // 并行模式没有闸门：入口一出现、点下去就上线，与逐题发送的排队形成对照。
+        // 两条路径各有一条测试钉住，闸门被误用到并行分支上时这里会红。
+        assertEquals("补发已经发出", 2, api.prompts.count { it == prompt0 })
+        assertTrue("并行模式不该出现排队标记", subject.uiState.value.queuedRetries.isEmpty())
+        assertTrue("整轮仍在跑", subject.uiState.value.isRunning)
+
+        api.release()
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { subject.awaitIdle() } }
+        assertEquals(ModelDetectionStatus.DONE, subject.uiState.value.batchResults.single().status)
+    }
+
+    @Test
+    fun `every model keeps its own three slots once the round moves on`() {
+        val api = FakeCompletionApi(goldenCase().answers)
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            api,
+            models = listOf("m-one", "m-two"),
+        ).apply { updateParallel(false) }
+
+        subject.runApiDetection()
+        runBlocking { subject.awaitIdle() }
+
+        // 面板按模型分块，所以每个模型的三格都必须留在 UI 状态里；progress 是屏幕级单
+        // 列表，整轮跑完只剩最后一个模型的答案，单独看它会把前面的模型画成一片空白。
+        val slots = subject.uiState.value.modelSlots
+        assertEquals("两个模型各留一组三栏", setOf("m-one", "m-two"), slots.keys)
+        for (model in listOf("m-one", "m-two")) {
+            val answers = slots.getValue(model)
+            assertEquals("$model 的三格都在", 3, answers.size)
+            assertTrue("$model 的三格都是有效回答", answers.all { it.state == ChallengeState.RECEIVED })
+        }
+    }
+
+    @Test
+    fun `a failed model's retry queues behind the healthy model's in-flight question`() {
         val api = FirstFailsThenParksApi(goldenCase().answers, failingModel = "broken")
         val subject = readyApiViewModelFor(
             SingleSupplierStore(testSupplier()),
@@ -627,18 +688,29 @@ class FingerprintViewModelTest {
         assertEquals("失败的模型落定即可重试", setOf(0, 1, 2), mid.retryableModels.keys)
         assertEquals("仍在接收的模型不许出现在入口里", List(3) { listOf("broken") }, mid.retryableModels.values.toList())
 
+        val brokenBefore = api.models.count { it == "broken" }
         subject.retryChallenge(0)
-        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.retried.await() } }
+        runBlocking { delay(200) }
 
-        // 请求真的在整批运行中被发出去了，不是被「等整批结束」挡下。
-        assertTrue("整批运行中也要能补发这一题", subject.uiState.value.isRunning)
+        // 逐题发送时补发同样排在当前那一题之后：slow 还在飞，broken 的第 4 次请求就不该出现。
+        assertEquals("失败模型的补发同样排队", setOf("broken" to 0), subject.uiState.value.queuedRetries)
+        assertEquals("slow 那一题还在飞，补发不许抢跑", brokenBefore, api.models.count { it == "broken" })
 
         api.release()
         runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { subject.awaitIdle() } }
+
+        // 到达顺序就是「插在当前那一题之后」的证据：slow 的第 1 题 → broken 的补发 →
+        // slow 剩下两题。若补发被压到整批之后，broken 的第 4 次会排在最末尾。
+        assertEquals(
+            "补发插在 slow 第 1 题之后、第 2 题之前",
+            listOf("broken", "broken", "broken", "slow", "broken", "slow", "slow"),
+            api.models.toList(),
+        )
         // 这一题的补发又失败了（这个假上游对 broken 一失败到底），所以入口仍在，
         // 这正是「失败就可重试」的另一面：只要还有结论可捞，按钮就不该消失。
         assertEquals(setOf(0, 1, 2), subject.uiState.value.retryableModels.keys)
         assertEquals(ModelDetectionStatus.FAILED, subject.uiState.value.batchResults.first().status)
+        assertTrue("排队标记随请求上线收掉", subject.uiState.value.queuedRetries.isEmpty())
     }
 
     @Test

@@ -8,11 +8,14 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -1251,6 +1254,16 @@ private fun BatchResultList(results: List<ModelFingerprintResult>) {
 private val MODEL_ROW_HEIGHT = 48.dp
 
 /**
+ * Floor for one question column.
+ *
+ * A third of the panel is about 121 dp wide, and the tallest cell is the failing one
+ * (state line + count + two lines of reason + the retry button). The floor is what keeps
+ * the ordinary cell from collapsing to its two short lines, so the three columns in a
+ * block read as one row rather than three ragged strips.
+ */
+private val CHALLENGE_CELL_MIN_HEIGHT = 104.dp
+
+/**
  * How far the model-list button is lifted off the text field's bottom edge.
  *
  * An outlined text field's layout box is 8 dp taller than the box it draws: with a
@@ -1285,18 +1298,19 @@ private fun ChallengeList(
     // In manual mode nothing sets RECEIVED until analysis runs, so count pastes that
     // already clear the threshold; otherwise the header reads 0/3 while three usable
     // answers sit in the fields.
-    val received = if (manual) {
-        state.progress.count {
-            it.parsedNumbers >= minimumNumbersFor(it.challenge.expectedCount, state.minimumValidNumbers)
-        }
-    } else {
-        state.progress.count { it.state == ChallengeState.RECEIVED }
+    val received = state.progress.count {
+        it.parsedNumbers >= minimumNumbersFor(it.challenge.expectedCount, state.minimumValidNumbers)
     }
     // The bar tracks the whole round, not the current model's three questions: it used
     // to reset to empty at every model change, so a three-model run looked like it kept
     // restarting from nothing.
     val roundSize = roundQuestionsTotal(state.batchResults, state.progress)
     val roundDone = roundQuestionsDone(state.batchResults, state.progress)
+    val copyPrompt: (Int) -> Unit = { index ->
+        state.progress.getOrNull(index)?.let { entry ->
+            copyToClipboard(context, entry.challenge.prompt, "已复制题目 ${index + 1} 的提示词")
+        }
+    }
 
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(
@@ -1306,20 +1320,12 @@ private fun ChallengeList(
             Column(modifier = Modifier.weight(1f)) {
                 Text("三道题目", style = MaterialTheme.typography.titleMedium)
                 Text(
-                    buildString {
-                        if (state.activeModel != null) {
-                            val position = activeModelPosition(state.batchResults, state.activeModel)
-                            append("第 ")
-                            if (position != null) {
-                                append("$position/${state.batchResults.size} ")
-                            } else {
-                                append("?/${state.batchResults.size} ")
-                            }
-                            append("个模型 · ")
-                            append(state.activeModel)
-                            append(" · ")
-                        }
-                        append("已收到 $received/${state.progress.size} 条有效回答")
+                    if (manual) {
+                        "已收到 $received/${state.progress.size} 条有效回答"
+                    } else if (state.batchResults.isEmpty()) {
+                        "开跑后每个模型各占一组三栏"
+                    } else {
+                        "每个模型一组三栏 · 失败的格子自己带「重试」"
                     },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1341,88 +1347,133 @@ private fun ChallengeList(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        // The queue itself, so the order is readable without scrolling to the result
-        // list: a batch used to show only "正在检测 2/3" and the user had to count rows
-        // to know which models were still ahead.
-        if (state.batchResults.size > 1) {
-            BatchQueue(state.batchResults)
-        }
-        state.progress.forEachIndexed { index, entry ->
-            ChallengeCard(
-                index = index,
-                entry = entry,
-                manual = state.mode == DetectionMode.MANUAL,
-                enabled = !state.isRunning,
-                minimumNumbers = minimumNumbersFor(entry.challenge.expectedCount, state.minimumValidNumbers),
-                onCopy = {
-                    copyToClipboard(
-                        context,
-                        entry.challenge.prompt,
-                        "已复制题目 ${index + 1} 的提示词",
-                    )
-                },
-                onAnswerChange = { onManualAnswerChange(index, it) },
-                onRetry = { models -> onRetryChallenge(index, models) },
-                // 哪几个模型这一题还没跑完：由视图模型按**本轮所有模型**的缓存派生，不能看
-                // progress——它最后只留最后一个模型的回答，前面失败的模型会因此丢掉入口。
-                // 列表为空＝这一题还没有定论（仍在接收，或整轮还在跑它），按钮就不出现。
-                retryableModels = state.retryableModels[index].orEmpty(),
+        if (manual) {
+            // 手动模式仍是竖向的长卡片：每栏只有约 121dp，放不下提示词全文和粘贴框，
+            // 而且手动粘贴没有「模型」可言，按模型分块无从谈起。
+            state.progress.forEachIndexed { index, entry ->
+                ManualChallengeCard(
+                    index = index,
+                    entry = entry,
+                    enabled = !state.isRunning,
+                    minimumNumbers = minimumNumbersFor(entry.challenge.expectedCount, state.minimumValidNumbers),
+                    onCopy = { copyPrompt(index) },
+                    onAnswerChange = { onManualAnswerChange(index, it) },
+                )
+            }
+        } else if (state.batchResults.isEmpty()) {
+            // 还没开跑：也给一组三栏，题目照旧可以先复制走。
+            ChallengeBlock(
+                ordinal = null,
+                model = null,
+                status = null,
+                slots = state.progress,
+                retryableIndexes = emptySet(),
+                queuedIndexes = emptySet(),
+                onCopy = copyPrompt,
+                onRetry = {},
             )
+        } else {
+            state.batchResults.forEachIndexed { position, row ->
+                ChallengeBlock(
+                    ordinal = position + 1,
+                    model = row.model,
+                    status = row.status,
+                    slots = slotsFor(state, row.model),
+                    // 这一题的失败模型里包含本块的模型，这一格才长出重试入口；点它就是补发
+                    // 这一格，所以不再需要「重试哪个模型」的选择弹窗。
+                    retryableIndexes = state.retryableModels
+                        .filterValues { models -> models.contains(row.model) }
+                        .keys,
+                    queuedIndexes = state.queuedRetries
+                        .filter { it.first == row.model }
+                        .map { it.second }
+                        .toSet(),
+                    onCopy = copyPrompt,
+                    onRetry = { index -> onRetryChallenge(index, listOf(row.model)) },
+                )
+            }
         }
     }
 }
 
 /**
- * The ticked models in the order the round will visit them, each with its state.
+ * The three slots to draw for [model].
  *
- * One line, horizontally scrollable when the names are long: the point is that the
- * sequence and what is left are visible at once, which the numbered result rows cannot
- * do while a round is still running.
+ * The model being asked right now reads the screen-wide [FingerprintUiState.progress]:
+ * that is the list the streaming counter is published into, so its cell counts integers
+ * live. Every other model reads its own entry in [FingerprintUiState.modelSlots], which is
+ * the cache that keeps all of them. A model whose round has not started has no entry yet,
+ * so its cells are the template's untouched placeholders.
+ */
+private fun slotsFor(state: FingerprintUiState, model: String): List<ChallengeProgress> {
+    if (state.isRunning && state.activeModel == model) return state.progress
+    return state.modelSlots[model] ?: state.progress.map { ChallengeProgress(it.challenge) }
+}
+
+/**
+ * One model's questions: a header (which model, how far it has got) and three columns.
+ *
+ * The panel used to show a single set of three cards for whichever model was being asked,
+ * so a batch's earlier models vanished from the question area the moment the next one
+ * started and the run could only be followed one model at a time. One block per model puts
+ * the whole round on screen at once.
+ *
+ * With no model attached (nothing has run yet) it still renders the three columns without
+ * a header, so the prompts stay readable and copyable before a round.
  */
 @Composable
-private fun BatchQueue(results: List<ModelFingerprintResult>) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        results.forEachIndexed { index, row ->
-            val current = row.status == ModelDetectionStatus.RUNNING
-            Surface(
-                shape = MaterialTheme.shapes.small,
-                color = when (row.status) {
-                    ModelDetectionStatus.DONE -> Color(0xFFDCFCE7)
-                    ModelDetectionStatus.FAILED -> MaterialTheme.colorScheme.errorContainer
-                    ModelDetectionStatus.RUNNING -> MaterialTheme.colorScheme.primaryContainer
-                    ModelDetectionStatus.PENDING -> MaterialTheme.colorScheme.surfaceVariant
-                },
-            ) {
+private fun ChallengeBlock(
+    ordinal: Int?,
+    model: String?,
+    status: ModelDetectionStatus?,
+    slots: List<ChallengeProgress>,
+    retryableIndexes: Set<Int>,
+    queuedIndexes: Set<Int>,
+    onCopy: (Int) -> Unit,
+    onRetry: (Int) -> Unit,
+) {
+    OutlinedCard {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            if (model != null && status != null) {
                 Row(
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
-                        "${index + 1}",
-                        style = MaterialTheme.typography.labelSmall,
+                        "$ordinal",
+                        style = MaterialTheme.typography.labelLarge,
                         fontWeight = FontWeight.Bold,
                     )
                     Text(
-                        row.model,
-                        style = MaterialTheme.typography.labelSmall,
+                        model,
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.labelLarge,
                         maxLines = 1,
                         softWrap = false,
+                        overflow = TextOverflow.Ellipsis,
                     )
-                    Text(
-                        when (row.status) {
-                            ModelDetectionStatus.DONE -> "✓"
-                            ModelDetectionStatus.FAILED -> "×"
-                            ModelDetectionStatus.RUNNING -> "…"
-                            ModelDetectionStatus.PENDING -> "待"
-                        },
-                        style = MaterialTheme.typography.labelSmall,
+                    ModelStatusChip(status)
+                }
+            }
+            // 三格等高：失败格多一行错误文本和重试按钮时，同组另外两格跟着一起长，
+            // 横向的三栏才不会参差不齐。
+            Row(
+                modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                slots.forEachIndexed { index, entry ->
+                    ChallengeCell(
+                        index = index,
+                        entry = entry,
+                        retryable = index in retryableIndexes,
+                        queued = index in queuedIndexes,
+                        onCopy = { onCopy(index) },
+                        onRetry = { onRetry(index) },
+                        modifier = Modifier.weight(1f).fillMaxHeight(),
                     )
                 }
             }
@@ -1430,17 +1481,136 @@ private fun BatchQueue(results: List<ModelFingerprintResult>) {
     }
 }
 
+/** Which model this is and how far its round has got, as the block's own one-word badge. */
 @Composable
-private fun ChallengeCard(
+private fun ModelStatusChip(status: ModelDetectionStatus) {
+    val text = when (status) {
+        ModelDetectionStatus.DONE -> "已出结果"
+        ModelDetectionStatus.FAILED -> "失败"
+        ModelDetectionStatus.RUNNING -> "正在检测"
+        ModelDetectionStatus.PENDING -> "等待检测"
+    }
+    Surface(
+        shape = MaterialTheme.shapes.small,
+        color = when (status) {
+            ModelDetectionStatus.DONE -> Color(0xFFDCFCE7)
+            ModelDetectionStatus.FAILED -> MaterialTheme.colorScheme.errorContainer
+            ModelDetectionStatus.RUNNING -> MaterialTheme.colorScheme.primaryContainer
+            ModelDetectionStatus.PENDING -> MaterialTheme.colorScheme.surfaceVariant
+        },
+    ) {
+        Text(
+            text,
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+            style = MaterialTheme.typography.labelSmall,
+        )
+    }
+}
+
+/**
+ * One question of one model, in a column about a third of the panel wide.
+ *
+ * The card shrinks to a column by dropping what the wide card could afford: the title
+ * carries only the question number, the status line is the compact wording, and the
+ * expected count moves to its own small line. The copy button keeps its documented
+ * behaviour — it is not gated on [enabled] anywhere, because copying the prompt while the
+ * request is in flight is exactly when the user wants it.
+ */
+@Composable
+private fun ChallengeCell(
     index: Int,
     entry: ChallengeProgress,
-    manual: Boolean,
+    retryable: Boolean,
+    queued: Boolean,
+    onCopy: () -> Unit,
+    onRetry: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    OutlinedCard(modifier = modifier.heightIn(min = CHALLENGE_CELL_MIN_HEIGHT)) {
+        Column(
+            modifier = Modifier.fillMaxSize().padding(8.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "题目 ${index + 1}",
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.labelLarge,
+                    maxLines = 1,
+                    softWrap = false,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                QuietIconButton(onClick = onCopy, modifier = Modifier.size(36.dp)) {
+                    Icon(
+                        Icons.Outlined.ContentCopy,
+                        contentDescription = "复制题目 ${index + 1} 的提示词",
+                        modifier = Modifier.size(15.dp),
+                    )
+                }
+            }
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(6.dp)
+                        .background(
+                            stateColor(entry.state),
+                            androidx.compose.foundation.shape.CircleShape,
+                        ),
+                )
+                Text(
+                    // 逐题发送时的等待与「已经在接收」不是一回事，不能混为一谈。
+                    if (queued) "排队中" else compactStateLabel(entry),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (queued) MaterialTheme.colorScheme.onSurfaceVariant else stateColor(entry.state),
+                    maxLines = 1,
+                    softWrap = false,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            Text(
+                "需 ${entry.challenge.expectedCount} 个整数",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Ellipsis,
+            )
+            entry.error?.let { error ->
+                Text(
+                    error,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.error,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (retryable) {
+                TextButton(onClick = onRetry) {
+                    Text("重试", style = MaterialTheme.typography.labelSmall)
+                }
+            }
+        }
+    }
+}
+
+/**
+ * One question in manual mode: the prompt in full, and a box to paste the answer into.
+ *
+ * Manual mode keeps the wide vertical card the API round no longer uses: a third of the
+ * panel cannot hold the prompt or a paste box, and with nothing but pasted text there is
+ * no per-model grid to draw.
+ */
+@Composable
+private fun ManualChallengeCard(
+    index: Int,
+    entry: ChallengeProgress,
     enabled: Boolean,
     minimumNumbers: Int,
     onCopy: () -> Unit,
     onAnswerChange: (String) -> Unit,
-    onRetry: (List<String>) -> Unit,
-    retryableModels: List<String>,
 ) {
     OutlinedCard {
         Column(
@@ -1489,126 +1659,42 @@ private fun ChallengeCard(
             entry.error?.let { error ->
                 Text(error, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
             }
-            // 断掉的这一轮从这里接着跑：题目没拿到有效回答、结果行却还在，就值得单独重试
-            // 这一题；没有这个入口，一次中断就只能把整轮从头再来。
-            //
-            // 出现的时机＝这一题**有了定论**（某个模型已结算而它这一格不是有效回答），不再
-            // 等整轮跑完：所以按钮不带 enabled，落定就能点，正在接收时它根本不渲染。
-            if (!manual && retryableModels.isNotEmpty()) {
-                var choosing by rememberSaveable { mutableStateOf(false) }
-                Text(
-                    if (retryableModels.size == 1) {
-                        "这一题 ${retryableModels.first()} 没有有效回答"
-                    } else {
-                        "这一题有 ${retryableModels.size} 个模型没有有效回答"
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                OutlinedButton(
-                    onClick = {
-                        // 一个模型直接重试它；多个才需要问「重试哪个」，因为用户明确要求
-                        // 只补有问题的那个模型，而不是从头再跑。
-                        if (retryableModels.size == 1) onRetry(retryableModels) else choosing = true
-                    },
-                ) { Text("重试本题") }
-                if (choosing) {
-                    RetryModelDialog(
-                        models = retryableModels,
-                        onPick = { model ->
-                            choosing = false
-                            onRetry(listOf(model))
-                        },
-                        onRetryAll = {
-                            choosing = false
-                            onRetry(retryableModels)
-                        },
-                        onDismiss = { choosing = false },
-                    )
-                }
-            }
 
-            if (manual) {
-                Text(
-                    "提示词全文",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Text(
-                    entry.challenge.prompt,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                OutlinedTextField(
-                    value = entry.answer,
-                    onValueChange = onAnswerChange,
-                    modifier = Modifier.fillMaxWidth().heightIn(min = 96.dp),
-                    enabled = enabled,
-                    label = { Text("粘贴模型回答") },
-                    placeholder = { Text("粘贴完整数字序列") },
-                    supportingText = {
-                        if (entry.answer.isBlank()) {
-                            Text("需要至少 $minimumNumbers 个整数")
-                        } else if (entry.parsedNumbers >= minimumNumbers) {
-                            Text(
-                                "已识别 ${entry.parsedNumbers} 个整数，可用于检测",
-                                color = Color(0xFF15803D),
-                            )
-                        } else {
-                            Text(
-                                "只识别到 ${entry.parsedNumbers} 个整数，还差 ${minimumNumbers - entry.parsedNumbers} 个",
-                                color = Color(0xFFB91C1C),
-                            )
-                        }
-                    },
-                )
-            }
+            Text(
+                "提示词全文",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                entry.challenge.prompt,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            OutlinedTextField(
+                value = entry.answer,
+                onValueChange = onAnswerChange,
+                modifier = Modifier.fillMaxWidth().heightIn(min = 96.dp),
+                enabled = enabled,
+                label = { Text("粘贴模型回答") },
+                placeholder = { Text("粘贴完整数字序列") },
+                supportingText = {
+                    if (entry.answer.isBlank()) {
+                        Text("需要至少 $minimumNumbers 个整数")
+                    } else if (entry.parsedNumbers >= minimumNumbers) {
+                        Text(
+                            "已识别 ${entry.parsedNumbers} 个整数，可用于检测",
+                            color = Color(0xFF15803D),
+                        )
+                    } else {
+                        Text(
+                            "只识别到 ${entry.parsedNumbers} 个整数，还差 ${minimumNumbers - entry.parsedNumbers} 个",
+                            color = Color(0xFFB91C1C),
+                        )
+                    }
+                },
+            )
         }
     }
-}
-
-/**
- * Picks which failed model a single-question retry should re-ask.
- *
- * Only shown when more than one model lacks an answer for the question: with several
- * failures the panel must not silently restart from the first model, and it must not
- * re-ask the models that already answered — the user chooses. "全部重试" is offered
- * last so the common case (one bad model) is the shortest path.
- */
-@Composable
-private fun RetryModelDialog(
-    models: List<String>,
-    onPick: (String) -> Unit,
-    onRetryAll: () -> Unit,
-    onDismiss: () -> Unit,
-) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("重试本题") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(
-                    "选择要重跑这一题的模型：",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                models.forEach { model ->
-                    TextButton(
-                        onClick = { onPick(model) },
-                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-                    ) {
-                        Text(model, modifier = Modifier.fillMaxWidth(), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = onRetryAll) { Text("全部重试（${models.size} 个）") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("取消") }
-        },
-    )
 }
 
 /**
@@ -1632,6 +1718,22 @@ internal fun stateLabel(entry: ChallengeProgress): String = when (entry.state) {
             "正在接收…"
         }
     ChallengeState.RECEIVED -> "已接收 ${entry.parsedNumbers} 个有效数字"
+    ChallengeState.REJECTED -> "未采用"
+}
+
+/**
+ * The same states, in the width a third of the panel can carry.
+ *
+ * Measured against the real column rather than guessed: at 1080px/420dpi the three
+ * columns leave roughly 121dp each, and the long wording above ("正在接收… 已收到 166
+ * 个整数") wraps there and pushes the count out of the cell. The wording stays a prefix of
+ * the long form so a screenshot of either reads the same way.
+ */
+internal fun compactStateLabel(entry: ChallengeProgress): String = when (entry.state) {
+    ChallengeState.PENDING -> "等待发送"
+    ChallengeState.REQUESTING ->
+        if (entry.receivedNumbers > 0) "接收中 ${entry.receivedNumbers}" else "接收中…"
+    ChallengeState.RECEIVED -> "已接收 ${entry.parsedNumbers}"
     ChallengeState.REJECTED -> "未采用"
 }
 
