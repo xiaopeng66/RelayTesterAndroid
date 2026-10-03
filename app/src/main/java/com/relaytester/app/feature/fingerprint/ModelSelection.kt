@@ -49,10 +49,59 @@ internal fun unmatchedKeyword(models: List<String>, keyword: String): String? {
  * How many rows have reached a verdict.
  *
  * A failure is a result too: the row prints its reason right below this counter, so
- * counting only successes would show "已出结果 1/3" while three settled rows sit on
+ * counting only successes would show "已出结果 1/3" while three settled rows on
  * screen. Queued and in-flight rows are the ones still missing an outcome.
  */
 internal fun settledModelCount(results: List<ModelFingerprintResult>): Int =
     results.count {
         it.status == ModelDetectionStatus.DONE || it.status == ModelDetectionStatus.FAILED
     }
+
+/**
+ * How far the whole round has got, in questions.
+ *
+ * A batch runs several models against the same three questions, and the progress bar
+ * used to count only the questions on screen — so it filled up and snapped back to
+ * empty at every model change, which read as the round restarting. The round's real
+ * size is `models x questions`: a settled model contributes all of its questions, and
+ * the model being tested contributes the questions that have stopped being PENDING.
+ *
+ * The active contribution is counted only while a row is actually RUNNING. When the
+ * last model settles, the progress list still holds its answers, and counting those on
+ * top of the settled total would push the bar past the end of the round. An in-flight
+ * question is never credited: it has started but produced no verdict, so counting it
+ * would make the bar jump ahead of the answers that are still arriving.
+ */
+internal fun roundQuestionsDone(
+    results: List<ModelFingerprintResult>,
+    progress: List<ChallengeProgress>,
+): Int {
+    if (progress.isEmpty()) return 0
+    val settled = settledModelCount(results)
+    val running = results.any { it.status == ModelDetectionStatus.RUNNING }
+    val activeAnswers = if (running) {
+        progress.count { it.state != ChallengeState.PENDING && it.state != ChallengeState.REQUESTING }
+    } else {
+        0
+    }
+    return settled * progress.size + activeAnswers
+}
+
+/** Total questions in the round: every ticked model times the questions in one round. */
+internal fun roundQuestionsTotal(
+    results: List<ModelFingerprintResult>,
+    progress: List<ChallengeProgress>,
+): Int = results.size * progress.size
+
+/**
+ * The 1-based place of [activeModel] in this round, or null when it is not one of them.
+ *
+ * Derived from the result rows rather than from the ticked list: the rows are what the
+ * round actually runs, and during a single-question retry [FingerprintUiState.selectedModels]
+ * can already have moved on while the round continues against its own model set.
+ */
+internal fun activeModelPosition(
+    results: List<ModelFingerprintResult>,
+    activeModel: String?,
+): Int? = activeModel
+    ?.let { active -> results.indexOfFirst { it.model == active }.takeIf { it >= 0 }?.plus(1) }

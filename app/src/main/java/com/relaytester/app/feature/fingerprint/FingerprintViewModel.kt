@@ -9,6 +9,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.CreationExtras
 import com.relaytester.app.core.fingerprint.AnswerDiagnostic
 import com.relaytester.app.core.fingerprint.AndroidBankFileSystem
+import com.relaytester.app.core.fingerprint.AndroidHistoryFileSystem
 import com.relaytester.app.core.fingerprint.BankDiscardResult
 import com.relaytester.app.core.fingerprint.BankInstallResult
 import com.relaytester.app.core.fingerprint.BankLoadResult
@@ -17,12 +18,15 @@ import com.relaytester.app.core.fingerprint.BankSource
 import com.relaytester.app.core.fingerprint.BankUpdateCheck
 import com.relaytester.app.core.fingerprint.BankUpdateClient
 import com.relaytester.app.core.fingerprint.ChallengeGenerator
+import com.relaytester.app.core.fingerprint.DetectionHistoryEntry
 import com.relaytester.app.core.fingerprint.FingerprintAnalysis
 import com.relaytester.app.core.fingerprint.FingerprintBank
 import com.relaytester.app.core.fingerprint.FingerprintBankStore
 import com.relaytester.app.core.fingerprint.FingerprintCandidate
 import com.relaytester.app.core.fingerprint.FingerprintChallenge
+import com.relaytester.app.core.fingerprint.FingerprintHistoryStore
 import com.relaytester.app.core.fingerprint.LoadedBank
+import com.relaytester.app.core.fingerprint.NumberFeatures
 import com.relaytester.app.core.fingerprint.OkHttpBankFetcher
 import com.relaytester.app.core.fingerprint.minimumNumbersFor
 import com.relaytester.app.core.model.ApiResult
@@ -59,6 +63,15 @@ data class ChallengeProgress(
     val answer: String = "",
     val parsedNumbers: Int = 0,
     val error: String? = null,
+    /**
+     * Integers seen in the text that has arrived so far, while [state] is [ChallengeState.REQUESTING].
+     *
+     * A challenge asks for a long list and the answer arrives over a minute or more, so
+     * the panel counts what the stream has already delivered instead of showing a bare
+     * "正在接收…". Zero when nothing countable has arrived yet, which is the normal state
+     * for the first seconds of a request.
+     */
+    val receivedNumbers: Int = 0,
 )
 
 /** Which answer source the panel is driving. */
@@ -178,6 +191,13 @@ data class FingerprintUiState(
     val activeModel: String? = null,
     val message: String? = null,
     val isMessageError: Boolean = false,
+    /**
+     * Past detections, newest first, most recent [FingerprintHistoryStore.MAX_ENTRIES].
+     *
+     * Loaded with the panel rather than on demand: the history dialog is one tap away
+     * and a dialog that opens empty and fills in a moment later reads as broken.
+     */
+    val history: List<DetectionHistoryEntry> = emptyList(),
 ) {
     /** True when the pending round covers several models, so its output reads as a list. */
     val isBatch: Boolean get() = selectedModels.size > 1
@@ -217,6 +237,8 @@ class FingerprintViewModel(
     private val bankUpdateClient: BankUpdateClient,
     /** Installed version code, read by the factory from the package manager. */
     private val appVersionCode: Long = 0L,
+    /** Past detections, capped on write; null in tests that do not exercise it. */
+    private val historyStore: FingerprintHistoryStore? = null,
     private val skipRestore: Boolean = false,
     /** Overridden by tests so a round can be observed without racing real threads. */
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
@@ -342,6 +364,9 @@ class FingerprintViewModel(
     /** A check, a download or a rollback; one at a time, tracked so tests can join it. */
     private var bankUpdateJob: Job? = null
 
+    /** A history read or write, tracked so tests can join it. */
+    private var historyJob: Job? = null
+
     /**
      * Suspends until anything the view model started has settled.
      *
@@ -353,6 +378,7 @@ class FingerprintViewModel(
         refreshJob?.join()
         runJob?.join()
         bankUpdateJob?.join()
+        historyJob?.join()
     }
 
     /**
@@ -383,11 +409,25 @@ class FingerprintViewModel(
                 val result = withContext(ioDispatcher) { bankStore.load() }
                 loadedBank = result.loaded
                 _uiState.update { it.withBank(result) }
+                loadHistory()
                 replayPendingEntryCheck()
             }
         } else {
             loadJob = viewModelScope.launch { load() }
         }
+    }
+
+    /**
+     * Reads the stored history into the panel.
+     *
+     * Called on both startup paths, and again after each write: the panel's copy is a
+     * snapshot, and letting it drift from the file would make the dialog show a record
+     * the user cannot find anywhere else, or miss the one just written.
+     */
+    private suspend fun loadHistory() {
+        val store = historyStore ?: return
+        val entries = withContext(ioDispatcher) { runCatching { store.load() }.getOrDefault(emptyList()) }
+        _uiState.update { it.copy(history = entries) }
     }
 
     private suspend fun load() {
@@ -423,6 +463,7 @@ class FingerprintViewModel(
             }
             pendingPrefill = null
             refreshProgress()
+            loadHistory()
             replayPendingEntryCheck()
         }.onFailure { error ->
             _uiState.update {
@@ -906,6 +947,57 @@ class FingerprintViewModel(
                 verifierAgrees = analysis?.verifierAgrees,
             )
         }
+        // The one funnel every finished model passes through — the batch loop and the
+        // single-question retry both land here — so a record cannot be missed by a new
+        // caller, and a cancelled round (which never reaches this) is not recorded.
+        appendHistory(model)
+    }
+
+    /**
+     * Files the model's current row in the history.
+     *
+     * Written off the UI thread: it is a small file, but the caller is a coroutine that
+     * may be holding the panel's run and a blocking write there would show up as a
+     * stutter between models. A failure is swallowed on purpose — the detection it
+     * describes already succeeded, and losing a history row must not fail it.
+     */
+    private fun appendHistory(model: String) {
+        val store = historyStore ?: return
+        val row = _uiState.value.batchResults.firstOrNull { it.model == model } ?: return
+        val entry = DetectionHistoryEntry(
+            finishedAt = System.currentTimeMillis(),
+            supplierName = roundCredentials?.first?.name.orEmpty(),
+            model = row.model,
+            candidateName = row.candidateName,
+            familyName = row.familyName,
+            probability = row.probability,
+            usableAnswers = row.usableAnswers,
+            submittedAnswers = row.submittedAnswers,
+            error = row.error,
+        )
+        historyJob = viewModelScope.launch {
+            withContext(ioDispatcher) {
+                runCatching { store.append(listOf(entry)) }
+                    .onSuccess { written ->
+                        if (written) {
+                            _uiState.update { it.copy(history = store.load()) }
+                        }
+                    }
+            }
+        }
+    }
+
+    /** Empties the history after the user confirms it. */
+    fun clearHistory() {
+        val store = historyStore ?: return
+        historyJob = viewModelScope.launch {
+            val cleared = withContext(ioDispatcher) { runCatching { store.clear() }.getOrDefault(false) }
+            if (cleared) {
+                _uiState.update { it.copy(history = emptyList()) }
+            } else {
+                showMessage("历史记录清空失败", isError = true)
+            }
+        }
     }
 
     /**
@@ -940,16 +1032,35 @@ class FingerprintViewModel(
         /** The whole round's slots, so a finished answer is cached in its own place. */
         slots: List<FingerprintChallenge>,
     ): ChallengeProgress {
-        updateProgress(index) { it.copy(state = ChallengeState.REQUESTING, answer = "", error = null) }
+        updateProgress(index) {
+            it.copy(
+                state = ChallengeState.REQUESTING,
+                answer = "",
+                error = null,
+                receivedNumbers = 0,
+            )
+        }
         val result = try {
-            relayApi.completeText(
+            relayApi.completeTextStreaming(
                 profile = supplier,
                 apiKey = apiKey,
                 model = model,
                 prompt = challenge.prompt,
                 maxTokens = CHALLENGE_MAX_TOKENS,
                 timeoutSeconds = CHALLENGE_TIMEOUT_SECONDS,
-            )
+            ) { partial ->
+                // Only the count is published, and only when it grew: re-counting the
+                // same text would republish identical state several times a second and
+                // recompose the whole card for nothing.
+                val numbers = NumberFeatures.parseNumbers(partial).size
+                updateProgress(index) { entry ->
+                    if (entry.state != ChallengeState.REQUESTING || numbers <= entry.receivedNumbers) {
+                        entry
+                    } else {
+                        entry.copy(receivedNumbers = numbers)
+                    }
+                }
+            }
         } catch (error: CancellationException) {
             // A cancelled round is not a failed answer.
             throw error
@@ -968,8 +1079,7 @@ class FingerprintViewModel(
         }
         val progress = when (result) {
             is ApiResult.Success -> {
-                val numbers = com.relaytester.app.core.fingerprint.NumberFeatures
-                    .parseNumbers(result.value).size
+                val numbers = NumberFeatures.parseNumbers(result.value).size
                 val minimum = challengeFloor(challenge.expectedCount)
                 if (numbers < minimum) {
                     ChallengeProgress(
@@ -1476,6 +1586,7 @@ class FingerprintViewModel(
                     bankStore = FingerprintBankStore(AndroidBankFileSystem(applicationContext)),
                     bankUpdateClient = BankUpdateClient(fetcher = OkHttpBankFetcher()),
                     appVersionCode = installedVersionCode(applicationContext),
+                    historyStore = FingerprintHistoryStore(AndroidHistoryFileSystem(applicationContext)),
                 ) as T
             }
         }

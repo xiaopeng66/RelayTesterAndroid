@@ -1855,6 +1855,59 @@ private class FakeCompletionApi(
         }
         return ApiResult.Success(answers[index % answers.size])
     }
+
+    /**
+     * The round's streaming entry point, routed to the same fake answer.
+     *
+     * The view model always calls the streaming method, so a fake that only knew
+     * [completeText] would leave these tests talking to the real network. Delegating
+     * keeps this fake's answers, ordering and concurrency accounting unchanged; the
+     * live-count behaviour itself is covered by [StreamingCompletionApi].
+     */
+    override suspend fun completeTextStreaming(
+        profile: SupplierProfile,
+        apiKey: String,
+        model: String,
+        prompt: String,
+        maxTokens: Int,
+        timeoutSeconds: Int,
+        onProgress: suspend (String) -> Unit,
+    ): ApiResult<String> = completeText(profile, apiKey, model, prompt, maxTokens, timeoutSeconds)
+}
+
+/**
+ * Streams one answer in pieces, so the panel's live integer count can be observed.
+ *
+ * Emits [chunks] through the progress callback with a suspension between them, then
+ * returns their concatenation. The suspension is load bearing: without it the panel
+ * would see every chunk and the final answer in the same frame, and a state that only
+ * ever held the end result would look identical to one that counted along the way.
+ */
+private class StreamingCompletionApi(
+    private val chunks: List<String>,
+    private val holdMs: Long = 5,
+) : RelayApi() {
+    /** Every partial text the view model saw, in order. */
+    val reported = Collections.synchronizedList(mutableListOf<String>())
+
+    override suspend fun completeTextStreaming(
+        profile: SupplierProfile,
+        apiKey: String,
+        model: String,
+        prompt: String,
+        maxTokens: Int,
+        timeoutSeconds: Int,
+        onProgress: suspend (String) -> Unit,
+    ): ApiResult<String> {
+        val accumulated = StringBuilder()
+        for (chunk in chunks) {
+            withContext(Dispatchers.Default) { delay(holdMs) }
+            accumulated.append(chunk)
+            reported += accumulated.toString()
+            onProgress(accumulated.toString())
+        }
+        return ApiResult.Success(accumulated.toString())
+    }
 }
 
 /**
@@ -1896,6 +1949,17 @@ private class GatedCompletionApi(
         }
         return ApiResult.Success(answers[position % answers.size])
     }
+
+    /** Routed to the gated [completeText], so the parked request is the streaming one too. */
+    override suspend fun completeTextStreaming(
+        profile: SupplierProfile,
+        apiKey: String,
+        model: String,
+        prompt: String,
+        maxTokens: Int,
+        timeoutSeconds: Int,
+        onProgress: suspend (String) -> Unit,
+    ): ApiResult<String> = completeText(profile, apiKey, model, prompt, maxTokens, timeoutSeconds)
 }
 
 /**
@@ -1910,6 +1974,16 @@ private class ThrowingCompletionApi(private val boom: Throwable) : RelayApi() {
         prompt: String,
         maxTokens: Int,
         timeoutSeconds: Int,
+    ): ApiResult<String> = throw boom
+
+    override suspend fun completeTextStreaming(
+        profile: SupplierProfile,
+        apiKey: String,
+        model: String,
+        prompt: String,
+        maxTokens: Int,
+        timeoutSeconds: Int,
+        onProgress: suspend (String) -> Unit,
     ): ApiResult<String> = throw boom
 }
 

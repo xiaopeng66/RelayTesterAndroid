@@ -27,8 +27,10 @@ android {
         // 1.4.0 was rebuilt with the model picker on board, so it carries the newest code
         // at a code above the retired 1.4.1/1.4.2 builds (10303 / 10304): installing it
         // over either of those is an upgrade, and the release line stays a single 1.4.0.
-        // 1.5.0 keeps one public release; its rebuild code must still upgrade 10500.
-        versionCode = 10_501
+        // 1.5.0 keeps one public release; every rebuild code must still upgrade 10500.
+        // 10502 adds the detection history, the round progress display, the copy button
+        // and the parallel-switch fixes on top of 10501.
+        versionCode = 10_502
         versionName = "1.5.0"
         ndk {
             abiFilters += "arm64-v8a"
