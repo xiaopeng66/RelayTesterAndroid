@@ -92,16 +92,3 @@ internal fun roundQuestionsTotal(
     results: List<ModelFingerprintResult>,
     progress: List<ChallengeProgress>,
 ): Int = results.size * progress.size
-
-/**
- * The 1-based place of [activeModel] in this round, or null when it is not one of them.
- *
- * Derived from the result rows rather than from the ticked list: the rows are what the
- * round actually runs, and during a single-question retry [FingerprintUiState.selectedModels]
- * can already have moved on while the round continues against its own model set.
- */
-internal fun activeModelPosition(
-    results: List<ModelFingerprintResult>,
-    activeModel: String?,
-): Int? = activeModel
-    ?.let { active -> results.indexOfFirst { it.model == active }.takeIf { it >= 0 }?.plus(1) }

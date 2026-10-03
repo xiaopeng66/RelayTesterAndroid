@@ -33,7 +33,10 @@ android {
         // 10503 adds the swapped result-row actions, the unified expand panel (evaluation
         // card then candidate list), the usable-answer counter beside the model name and
         // the per-model single-question retry.
-        versionCode = 10_503
+        // 10504 turns the question area into one three-column block per model and queues a
+        // single-question retry behind the question already on the wire when the panel is
+        // set to 逐题发送.
+        versionCode = 10_504
         versionName = "1.5.0"
         ndk {
             abiFilters += "arm64-v8a"

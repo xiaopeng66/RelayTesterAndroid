@@ -46,6 +46,8 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /** Lifecycle of a single challenge inside a detection round. */
@@ -179,7 +181,24 @@ data class FingerprintUiState(
     val mode: DetectionMode = DetectionMode.API,
     val useParallel: Boolean = true,
     val isRunning: Boolean = false,
+    /**
+     * The questions on screen, in one screen-wide list.
+     *
+     * This is the manual mode's answer sheet and the source of the round's challenge
+     * template; during an API round it holds the model currently being asked, because each
+     * model resets it. Anything that has to speak about every model at once reads
+     * [modelSlots] instead.
+     */
     val progress: List<ChallengeProgress> = emptyList(),
+    /**
+     * Every model's three slots, by model, in the round's own order.
+     *
+     * Published so the panel can draw one block per model — a multi-model run has to show
+     * each model's progress at once to be readable, and [progress] can only ever describe
+     * one of them. Filled from the same cache the retry path re-scores from, so the grid
+     * and the retry agree by construction.
+     */
+    val modelSlots: Map<String, List<ChallengeProgress>> = emptyMap(),
     /**
      * Questions with something to re-ask, mapped to the models that failed them.
      *
@@ -189,6 +208,14 @@ data class FingerprintUiState(
      * answer for a slot; a slot still being requested never appears here.
      */
     val retryableModels: Map<Int, List<String>> = emptyMap(),
+    /**
+     * Slots whose retry is waiting for the serial gate, as (model, question).
+     *
+     * Queued is not the same as requested: with 逐题发送 on, the re-ask cannot go on the
+     * wire until the question the round is already asking comes back, and a cell that said
+     * "正在接收" through that wait would be lying. Cleared the moment the gate is entered.
+     */
+    val queuedRetries: Set<Pair<String, Int>> = emptySet(),
     /** Floor from the reference bank; the panel previews pastes against it. */
     val minimumValidNumbers: Int = 80,
     val analysis: FingerprintAnalysis? = null,
@@ -296,9 +323,42 @@ class FingerprintViewModel(
      * Kept apart from [runJob] on purpose: a retry must be able to run **alongside** a
      * round — the failed model has already settled, so its slot can be re-asked while the
      * round works through the next one — and cancelling the round must not kill a retry
-     * the user explicitly asked for. A new round, on the other hand, waits for these.
+     * the user explicitly asked for. With 逐题发送 on, "alongside" means queued behind
+     * whatever single request is on the wire, not beside it (see [serialGate]). A new
+     * round, on the other hand, waits for these.
      */
     private val retryJobs = mutableMapOf<Pair<String, Int>, Job>()
+
+    /**
+     * The one-at-a-time gate the panel uses when it is set to 逐题发送.
+     *
+     * That switch exists for providers that cannot take concurrent requests, so a
+     * single-question retry must not slip in beside the question the round is already
+     * asking. A fair (FIFO) mutex gives exactly the order the panel promises: the retry
+     * waits for the in-flight question, then goes ahead of the round's next one, which is
+     * what "排到当前那一题之后" means. With the parallel switch on nothing takes the gate,
+     * so both the round's questions and any retry go out at once.
+     */
+    private val serialGate = Mutex()
+
+    /** Runs [block] behind the serial gate unless the panel is sending in parallel. */
+    private suspend fun <T> serialized(block: suspend () -> T): T =
+        if (_uiState.value.useParallel) block() else serialGate.withLock { block() }
+
+    /**
+     * Publishes whether a slot's retry is still waiting for the gate.
+     *
+     * The slot itself already reads REQUESTING from the moment the retry is queued — that
+     * placeholder is what stops the entry from being offered twice — so the wait has to be
+     * carried separately or the cell could not tell queued from receiving.
+     */
+    private fun markRetryQueued(model: String, index: Int, queued: Boolean) {
+        _uiState.update { state ->
+            val key = model to index
+            val next = if (queued) state.queuedRetries + key else state.queuedRetries - key
+            if (next == state.queuedRetries) state else state.copy(queuedRetries = next)
+        }
+    }
 
     /**
      * Every model's answers from the last round, by model.
@@ -331,9 +391,10 @@ class FingerprintViewModel(
         setRoundAnswers(roundAnswers + (model to slots))
     }
 
-    /** Publishes the answers and the retry entries they imply in one write. */
+    /** Publishes the answers, the panel's per-model view of them, and the retry entries. */
     private fun setRoundAnswers(next: Map<String, List<ChallengeProgress>>) {
         roundAnswers = next
+        _uiState.update { it.copy(modelSlots = next) }
         publishRetryable()
     }
 
@@ -797,13 +858,17 @@ class FingerprintViewModel(
      * round to continue — a supplier and key in hand, and a result row to put the verdict
      * on — only the chosen models' slot is requested again, and each is re-scored from its
      * own answers, so the panel converges on a result instead of starting over. The models
-     * come from the caller: one failed model retries directly, several open the chooser,
-     * and a healthy model is never re-asked for a question it already answered.
+     * come from the caller: every failed cell carries its own model, so the re-ask lands on
+     * exactly the models the user pointed at and never on one that already answered.
      *
      * A running round does not block this any more: the failed model has already settled,
      * so its slot can be re-asked while the round works on the next one. What is still
      * refused is a round that is *dying* — cancelled, with cleanup in flight — because its
      * last writes would land on top of the retry's.
+     *
+     * When it actually goes on the wire depends on the send mode: with 逐题发送 on it is
+     * queued behind whichever question the round is already asking (see [serialGate]), and
+     * with the parallel switch on it goes out immediately beside the round.
      *
      * With nothing to continue (manual mode, or before the first round) a fresh prompt is
      * the whole retry, which is what this button has always meant there.
@@ -833,7 +898,12 @@ class FingerprintViewModel(
                 retrySlot(index, model, challenge, template, credentials)
             }
             retryJobs[model to index] = job
-            job.invokeOnCompletion { retryJobs.remove(model to index) }
+            job.invokeOnCompletion {
+                retryJobs.remove(model to index)
+                // A job cancelled while it was still waiting for the gate never reaches the
+                // clearing inside retrySlot, and a stale 排队中 would outlive its request.
+                markRetryQueued(model, index, queued = false)
+            }
         }
     }
 
@@ -860,14 +930,20 @@ class FingerprintViewModel(
         // A REQUESTING slot in the cache withdraws the retry entry for as long as this
         // re-ask runs, so the button cannot be double-fired into two parallel requests.
         cacheAnswer(model, index, template, ChallengeProgress(challenge, state = ChallengeState.REQUESTING))
-        val answered = requestChallenge(
-            index = index,
-            supplier = credentials.first,
-            apiKey = credentials.second,
-            model = model,
-            challenge = challenge,
-            slots = template,
-        )
+        // 逐题发送时这条重试要等当前那一题发完才能上线路（见 serialGate）；等待期间格子靠这个
+        // 标记显示「排队中」，不然它会拿 REQUESTING 假装已经在接收。
+        markRetryQueued(model, index, queued = !_uiState.value.useParallel)
+        val answered = serialized {
+            markRetryQueued(model, index, queued = false)
+            requestChallenge(
+                index = index,
+                supplier = credentials.first,
+                apiKey = credentials.second,
+                model = model,
+                challenge = challenge,
+                slots = template,
+            )
+        }
         // The other slots keep that model's own answers; a model whose round never got
         // that far is filled with the placeholder slots the retry is about to score, so
         // the re-scoring never mixes two editors' answers.
@@ -1033,8 +1109,10 @@ class FingerprintViewModel(
                 }.awaitAll()
             }
         } else {
+            // 逐题发送：整轮的每一题也走闸门，于是排队中的重试恰好插在当前那一题之后、
+            // 下一题之前——并行开关打开时闸门不参与，这里与并发分支等价。
             challenges.indices.map { index ->
-                requestChallenge(index, supplier, apiKey, model, challenges[index], challenges)
+                serialized { requestChallenge(index, supplier, apiKey, model, challenges[index], challenges) }
             }
         }
     }
