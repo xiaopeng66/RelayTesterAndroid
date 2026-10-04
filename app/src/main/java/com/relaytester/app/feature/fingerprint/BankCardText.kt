@@ -3,6 +3,10 @@ package com.relaytester.app.feature.fingerprint
 import com.relaytester.app.core.fingerprint.BankSource
 import com.relaytester.app.core.update.formatByteSize
 import com.relaytester.app.ui.components.UpdateCheckOutcome
+import java.time.OffsetDateTime
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.time.format.DateTimeParseException
 
 /** The badge next to "检测包": where the copy in use came from. */
 internal fun bankSourceLabel(source: BankSource): String = when (source) {
@@ -11,13 +15,49 @@ internal fun bankSourceLabel(source: BankSource): String = when (source) {
     BankSource.INSTALLED_UNREADABLE -> "已安装但无法读取"
 }
 
+/**
+ * The publisher's build stamp, shortened to something a reader can scan.
+ *
+ * The stamp arrives as a full ISO-8601 instant with fractional seconds and an offset
+ * (`2026-10-03T07:40:28.536363+00:00`) and used to be printed verbatim, which read like a
+ * serial number rather than a date. It is converted to the reader's zone and printed as
+ * `2026-10-03 15:40` — the same convention the check row above it uses ("今天 14:32"), so the
+ * two timestamps on this card agree about what time it is.
+ *
+ * [zone] is a parameter so a test can pin the reader's zone. A stamp that does not parse is
+ * never blanked or guessed at: the fractional part and the offset are trimmed and the rest is
+ * shown as it came, because a wrong-looking stamp the publisher actually wrote beats an
+ * invented one.
+ */
+internal fun formatBankBuiltAt(builtAt: String, zone: ZoneId = ZoneId.systemDefault()): String {
+    val raw = builtAt.trim()
+    if (raw.isEmpty()) return "未知"
+    return try {
+        OffsetDateTime.parse(raw).atZoneSameInstant(zone).format(BUILT_AT_FORMAT)
+    } catch (error: DateTimeParseException) {
+        raw.substringBefore('.').substringBefore('+').trimEnd('Z').replace('T', ' ')
+    }
+}
+
+private val BUILT_AT_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
+
 /** The "可更新到" line for a package the publisher has released. */
-internal fun bankUpdateOffer(builtAt: String, modelCount: Int, sizeBytes: Long): String =
-    "可更新到：构建于 ${builtAt.ifBlank { "未知" }} · $modelCount 个模型 · ${formatBankSize(sizeBytes)}"
+internal fun bankUpdateOffer(
+    builtAt: String,
+    modelCount: Int,
+    sizeBytes: Long,
+    zone: ZoneId = ZoneId.systemDefault(),
+): String =
+    "可更新到：构建于 ${formatBankBuiltAt(builtAt, zone)} · $modelCount 个模型 · ${formatBankSize(sizeBytes)}"
 
 /** What the card says about the package actually in use. */
-internal fun bankSummaryLine(builtAt: String, modelCount: Int, sizeBytes: Long): String =
-    "构建于 ${builtAt.ifBlank { "未知" }} · $modelCount 个模型 · ${formatBankSize(sizeBytes)}"
+internal fun bankSummaryLine(
+    builtAt: String,
+    modelCount: Int,
+    sizeBytes: Long,
+    zone: ZoneId = ZoneId.systemDefault(),
+): String =
+    "构建于 ${formatBankBuiltAt(builtAt, zone)} · $modelCount 个模型 · ${formatBankSize(sizeBytes)}"
 
 /**
  * The card's status sentence, which is the same question the badge answers: is there a
@@ -32,10 +72,11 @@ internal fun bankStateLine(
     builtAt: String,
     modelCount: Int,
     sizeBytes: Long,
+    zone: ZoneId = ZoneId.systemDefault(),
 ): String = when (source) {
     BankSource.NOT_PROVISIONED -> "尚未安装检测包，检测功能暂不可用。"
     BankSource.INSTALLED_UNREADABLE -> "当前检测包无法读取，检测功能暂不可用。"
-    BankSource.INSTALLED -> bankSummaryLine(builtAt, modelCount, sizeBytes)
+    BankSource.INSTALLED -> bankSummaryLine(builtAt, modelCount, sizeBytes, zone)
 }
 
 /**

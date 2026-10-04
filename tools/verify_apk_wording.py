@@ -15,8 +15,6 @@ import zipfile
 # the retired wording must be gone. Both directions are checked so a half-applied edit
 # or a stale build cannot pass.
 FINAL = [
-    "检测离线；取清单与装包才联网。",
-    "让模型凭第一反应写约 300 个 1–355 整数，再与检测包比对。",
     "暂无模型；可在「模型测试」拉取，或直接输入模型名。",
     "明文 HTTP：密钥与内容不加密，仅限本机/内网。",
     "供应商配置",
@@ -24,11 +22,13 @@ FINAL = [
     "并行发送三题",
     "查看支持的模型",
     "检查更新",
-    "删除已安装的检测包",
+    # The two-column package row's right half. It is also a substring of two error
+    # sentences that stay ("无法删除检测包备份"), so this proves the wording exists rather
+    # than which widget prints it; that the button is the row's right half is measured on
+    # the device.
+    "删除检测包",
     "排队中",
     "接收中",
-    "每个模型一组三栏",
-    "开跑后每个模型各占一组三栏",
     " · 需要 ",
     "收起候选",
     "展开候选",
@@ -43,23 +43,28 @@ FINAL = [
     "线上检测包需要更新版本的 App 才能使用（需要版本代码 ≥ ",
     "线上检测包需要更新版本的 App 才能使用。",
     # The update surface: the header entry (both states of its description, since the dot
-    # is the only part that changes), the way into it from the package card, and the two
-    # switches with the sentence that says when each one fires.
+    # is the only part that changes), the dialog's title, and the two switches. The launch
+    # check's own sentence is gone (the switch now fires at launch and every six hours
+    # while the app stays open), so no wording for it survives here.
     "关于与更新",
     "关于与更新，有新版本",
     "去更新软件",
     "自动检查软件更新",
-    "打开 App 时自动检查，最多每 6 小时一次",
     "自动检查检测包更新",
-    "打开本面板时自动检查一次",
-    "两个更新渠道各自独立，可分别关闭自动检查。",
-    "自动检查检测包更新的开关在「指纹检测」面板的检测包卡片里。",
+    # The dialog's one outbound link, added this round.
+    "github.com/xiaopeng66/RelayTesterAndroid",
 ]
 
 # Only strings that this round retired everywhere. A word that still has a legitimate
 # use elsewhere (「先拉取模型列表，再添加来源」「禁止测试：只拉模型…」) does not belong
 # here: the check must not fail on wording that is still correct. The same rule keeps
 # 「 · 需要 」 in FINAL rather than here — the manual card still prints it.
+#
+# A label that no longer exists on its own but survives inside a sentence that stays is
+# in neither list: the old package-row button read "删除已安装的检测包", and that string is
+# still a substring of "无法删除已安装的检测包", which is a different message the app must
+# keep printing. Substring matching cannot tell the two apart, so the row itself is
+# verified on the device instead of pretended here.
 RETIRED = [
     "该供应商还没有已拉取的模型",
     "仅建议用于本机或内网自建站点",
@@ -79,6 +84,25 @@ RETIRED = [
     # (「更新清单的格式版本 3 不受支持」). It now says which app version to reach instead,
     # so the technical sentence must not come back.
     "更新清单的格式版本",
+    # 10600: the panel and the dialog were cut back to the wording that changes. Each entry
+    # below was deleted from every source file, which is what makes it safe to demand its
+    # absence — checked with a repository-wide grep before it was added, not assumed.
+    "让模型凭第一反应写约 300 个 1–355 整数，再与检测包比对。",
+    "多模型仍逐个检测",
+    "每个模型一组三栏",
+    "开跑后每个模型各占一组三栏",
+    "还没有记录；每测完一个模型就留一条。",
+    "需先下载一次检测包；之后检测完全离线。",
+    "检测离线；取清单与装包才联网。",
+    "打开本面板时自动检查一次",
+    "打开 App 时自动检查，最多每 6 小时一次",
+    "两个更新渠道各自独立，可分别关闭自动检查。",
+    "自动检查检测包更新的开关在「指纹检测」面板的检测包卡片里。",
+    "多个词用英文半角逗号 , 表示 OR",
+    "拉取所有供应商的模型并按关键词筛选",
+    "并发/限速/重试",
+    "数据来自站点 API，不是本地估算",
+    "最近一次 API 查询结果",
 ]
 
 

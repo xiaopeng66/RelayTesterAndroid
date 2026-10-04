@@ -562,6 +562,19 @@ private val RESULT_ACTION_SLOT = 40.dp
 private val RESULT_PILL_INSET = 8.dp
 
 /**
+ * How far the 检索 button is lifted off the text field's bottom edge.
+ *
+ * An outlined text field's layout box is 8 dp taller than the box it draws: the top 8 dp stay
+ * clear of the border for the floating label (device measurement at 420 dpi: layout box 64 dp,
+ * drawn border 56 dp, both ending on the same bottom edge). A 48 dp button centred against the
+ * whole layout box therefore floats its centre 4 dp above the border's centre — the "button
+ * looks a bit high" this fixes; bottom-aligning the two boxes alone would instead put it 4 dp
+ * *below* that centre. So: align the bottoms, then lift by half of what the button does not
+ * fill, (56 − 48) / 2. Same construction as the fingerprint panel's model-list button.
+ */
+private val MODEL_SEARCH_BUTTON_INSET = 4.dp
+
+/**
  * How far the copy icon has to move so its centre lands on the pill's **text** centre.
  *
  * The rail's last cell is [slotWidth] wide and sits flush with the content's right edge, so
@@ -1217,7 +1230,7 @@ private fun TestSettingsCard(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 Column(modifier = Modifier.weight(1f)) {
-                    SectionTitle("测试参数", "并发/限速/重试")
+                    SectionTitle("测试参数")
                 }
                 OutlinedButton(
                     onClick = onOpenModelCatalog,
@@ -1264,11 +1277,6 @@ private fun TestSettingsCard(
                         Text(
                             "快捷筛选",
                             style = MaterialTheme.typography.labelLarge,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                Text(
-                    "多个词用英文半角逗号 , 表示 OR",
-                            style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
@@ -2265,6 +2273,11 @@ private fun SecurityNote() {
 }
 
 @Composable
+private fun SectionTitle(title: String) {
+    Text(title, style = MaterialTheme.typography.titleMedium)
+}
+
+@Composable
 private fun SectionTitle(title: String, subtitle: String) {
     SectionTitle(title, buildAnnotatedString { append(subtitle) })
 }
@@ -2611,19 +2624,18 @@ private fun ModelCatalogDialog(
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text("跨供应商检索", style = MaterialTheme.typography.titleSmall)
-                                    Text(
-                                        "拉取所有供应商的模型并按关键词筛选",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
                                 }
                                 if (state.isCatalogSearching) {
                                     CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
                                 }
                             }
+                            // 贴底对齐，再让出 MODEL_SEARCH_BUTTON_INSET：OutlinedTextField 的
+                            // 布局盒是 64dp，画出来的边框只占下面 56dp（顶端 8dp 留给浮动
+                            // 标签），按布局盒居中会让按钮看起来偏高。1.0× 与 2.0× 字号下都用
+                            // uiautomator 量过节点与可见边框。
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically,
+                                verticalAlignment = Alignment.Bottom,
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                             ) {
                                 OutlinedTextField(
@@ -2644,7 +2656,9 @@ private fun ModelCatalogDialog(
                                     },
                                     enabled = editingEnabled && !state.isCatalogSearching && catalogSearchKeyword.isNotBlank(),
                                     contentPadding = PaddingValues(horizontal = 12.dp),
-                                    modifier = Modifier.heightIn(min = 48.dp),
+                                    modifier = Modifier
+                                        .padding(bottom = MODEL_SEARCH_BUTTON_INSET)
+                                        .heightIn(min = 48.dp),
                                 ) {
                                     Icon(Icons.Outlined.Search, contentDescription = null, modifier = Modifier.size(18.dp))
                                     Spacer(Modifier.width(4.dp))
@@ -3081,9 +3095,18 @@ private fun ModelCatalogEntryCard(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
+            // 四个动作按钮：无涟漪（按下态的高光被读成「选中」）、盒子 44dp→40dp、间距 2dp、
+            // 图标仍是 20dp——用户要求把这一组往右收紧但不要放大图标。整组因此从 4×44=176dp
+            // 收到 4×40+3×2=166dp。40dp 低于 48dp 的无障碍建议触控尺寸，这是刻意的取舍：
+            // 图标尺寸与读屏文案都不动。
+            //
+            // 禁用态的颜色要自己补：IconButton 会按自己的颜色表画 38% 的主色，
+            // QuietIconButton 只是一个可点的盒子，不替内容做这个决定。
+            val disabledIconTint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(2.dp),
             ) {
                 Text(
                     entry.name,
@@ -3093,10 +3116,11 @@ private fun ModelCatalogEntryCard(
                     softWrap = false,
                     overflow = TextOverflow.Ellipsis,
                 )
-                IconButton(
+                val refreshEnabled = editingEnabled && !isRefreshing
+                QuietIconButton(
                     onClick = onRefresh,
-                    enabled = editingEnabled && !isRefreshing,
-                    modifier = Modifier.size(44.dp),
+                    enabled = refreshEnabled,
+                    modifier = Modifier.size(40.dp),
                 ) {
                     if (isRefreshing) {
                         CircularProgressIndicator(
@@ -3108,25 +3132,46 @@ private fun ModelCatalogEntryCard(
                             Icons.Outlined.Sync,
                             contentDescription = "拉取更新 ${entry.name} 的模型来源",
                             modifier = Modifier.size(20.dp),
+                            tint = if (refreshEnabled) Color.Unspecified else disabledIconTint,
                         )
                     }
                 }
-                IconButton(onClick = onEdit, enabled = editingEnabled, modifier = Modifier.size(44.dp)) {
-                    Icon(Icons.Outlined.Edit, contentDescription = "编辑模型来源", modifier = Modifier.size(20.dp))
+                QuietIconButton(
+                    onClick = onEdit,
+                    enabled = editingEnabled,
+                    modifier = Modifier.size(40.dp),
+                ) {
+                    Icon(
+                        Icons.Outlined.Edit,
+                        contentDescription = "编辑模型来源",
+                        modifier = Modifier.size(20.dp),
+                        tint = if (editingEnabled) Color.Unspecified else disabledIconTint,
+                    )
                 }
-                IconButton(
+                val testEnabled = testingEnabled || isTesting
+                QuietIconButton(
                     onClick = if (isTesting) onCancel else onRun,
-                    enabled = testingEnabled || isTesting,
-                    modifier = Modifier.size(44.dp),
+                    enabled = testEnabled,
+                    modifier = Modifier.size(40.dp),
                 ) {
                     Icon(
                         if (isTesting) Icons.Outlined.StopCircle else Icons.Outlined.PlayArrow,
                         contentDescription = if (isTesting) "取消测试 ${entry.name}" else "测试 ${entry.name}",
                         modifier = Modifier.size(20.dp),
+                        tint = if (testEnabled) Color.Unspecified else disabledIconTint,
                     )
                 }
-                IconButton(onClick = onDelete, enabled = editingEnabled, modifier = Modifier.size(44.dp)) {
-                    Icon(Icons.Outlined.DeleteOutline, contentDescription = "删除模型来源配置", modifier = Modifier.size(20.dp))
+                QuietIconButton(
+                    onClick = onDelete,
+                    enabled = editingEnabled,
+                    modifier = Modifier.size(40.dp),
+                ) {
+                    Icon(
+                        Icons.Outlined.DeleteOutline,
+                        contentDescription = "删除模型来源配置",
+                        modifier = Modifier.size(20.dp),
+                        tint = if (editingEnabled) Color.Unspecified else disabledIconTint,
+                    )
                 }
             }
             Row(

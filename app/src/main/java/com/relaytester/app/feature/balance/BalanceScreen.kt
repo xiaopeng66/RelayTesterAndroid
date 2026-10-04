@@ -909,11 +909,6 @@ private fun BalanceResultCard(
             ) {
                 Column {
                     Text("当前供应商查询详情", style = MaterialTheme.typography.titleMedium)
-                    Text(
-                        if (snapshot == null) "数据来自站点 API，不是本地估算" else "最近一次 API 查询结果",
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        style = MaterialTheme.typography.bodySmall,
-                    )
                 }
                 if (isQuerying) CircularProgressIndicator(modifier = Modifier.size(28.dp))
             }

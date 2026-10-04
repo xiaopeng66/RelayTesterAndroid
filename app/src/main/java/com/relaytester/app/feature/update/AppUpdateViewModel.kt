@@ -20,6 +20,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -40,6 +42,15 @@ data class InstalledAppVersion(
 data class AppUpdateUiState(
     val installed: InstalledAppVersion,
     val isChecking: Boolean = false,
+    /**
+     * True while the check in flight is the automatic one.
+     *
+     * The two surfaces draw different things for the two kinds: an automatic check owns the
+     * status row ("正在检查更新…" plus its spinner, the only trace such a check leaves), while
+     * the one the user asked for spins on the button alone — two spinners at once read as two
+     * problems, and "上次检查：…" tells the user more than a second "正在检查…" would.
+     */
+    val isCheckingQuietly: Boolean = false,
     /** True while the offered build is downloading, or waiting on the installer. */
     val isDownloading: Boolean = false,
     val downloadProgress: DownloadProgress? = null,
@@ -81,6 +92,13 @@ class AppUpdateViewModel(
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     /** Overridden by tests so the throttle and the timestamps are values, not the clock. */
     private val clock: () -> Long = System::currentTimeMillis,
+    /**
+     * How often the app checks on its own while it stays open.
+     *
+     * Injected so a test can drive the periodic check with virtual time instead of waiting
+     * six hours; production always uses the stored preference's window.
+     */
+    private val checkIntervalMillis: Long = UpdatePreferencesState.APP_CHECK_INTERVAL_MILLIS,
 ) : ViewModel() {
     private val _uiState = MutableStateFlow(AppUpdateUiState(installed = installed))
     val uiState = _uiState
@@ -88,12 +106,28 @@ class AppUpdateViewModel(
     private var checkJob: Job? = null
     private var downloadJob: Job? = null
     private var preferenceJob: Job? = null
+    private var timerJob: Job? = null
+
+    /**
+     * When this process last finished a check.
+     *
+     * The loop's wake time is computed from the later of this and the stored timestamp: the
+     * stored one is what survives a restart, and this one is what makes the loop safe when
+     * that write did not land — see [ensureAutoCheckTimer].
+     */
+    private var lastCheckAtMillis = 0L
 
     /** Suspends until everything this view model started has settled; used by tests. */
     internal suspend fun awaitIdle() {
         checkJob?.join()
         downloadJob?.join()
         preferenceJob?.join()
+    }
+
+    override fun onCleared() {
+        // The timer is the only thing here that would otherwise outlive the activity.
+        timerJob?.cancel()
+        super.onCleared()
     }
 
     /**
@@ -103,16 +137,28 @@ class AppUpdateViewModel(
      * reads a *stored* timestamp: without that, every launch would be "the first check in
      * a while" and closing the app twice would be two requests.
      *
+     * Starting the periodic check is part of coming up, not of this check succeeding: an app
+     * launched with the switch off, or inside the window, still has to be watching for the
+     * moment the window passes. It is started second for the reason in the body.
+     *
      * @return true when a check was actually started.
      */
     suspend fun checkOnLaunch(): Boolean {
+        // The check runs before the timer starts, never beside it: both read the same stored
+        // timestamp, and a timer that started first would see the stale one too and race this
+        // check for the same request. Started last, its first wake is a whole window away
+        // because this check just wrote the timestamp it computes from.
+        val started = runLaunchCheck()
+        ensureAutoCheckTimer()
+        return started
+    }
+
+    private suspend fun runLaunchCheck(): Boolean {
         val stored = withContext(ioDispatcher) { preferences.read() }
         _uiState.update { it.copy(autoCheckApp = stored.autoCheckApp) }
         if (!stored.autoCheckApp) return false
         val since = clock() - stored.lastAppCheckAt
-        if (stored.lastAppCheckAt > 0 &&
-            since < UpdatePreferencesState.APP_CHECK_INTERVAL_MILLIS
-        ) {
+        if (stored.lastAppCheckAt > 0 && since < checkIntervalMillis) {
             return false
         }
         if (busy()) return false
@@ -122,14 +168,73 @@ class AppUpdateViewModel(
         return true
     }
 
+    /**
+     * The check the app runs by itself while it stays open.
+     *
+     * One loop for the activity-scoped view model, and each wake waits until the next check
+     * is *due* — the remaining time computed from the stored timestamp — rather than a fixed
+     * period. That is what keeps a manual check and this one from stacking: if the user
+     * checked two hours ago, this wakes in four, because the timestamp the manual check wrote
+     * is also the one this reads.
+     *
+     * A wake that finds something else in flight steps back for a whole window instead of
+     * retrying: the only way to make progress here is to wait, and retrying in a tight loop
+     * would be a busy-wait on a disk read.
+     */
+    private fun ensureAutoCheckTimer() {
+        if (timerJob?.isActive == true) return
+        timerJob = viewModelScope.launch {
+            while (true) {
+                val stored = withContext(ioDispatcher) { preferences.read() }
+                if (!stored.autoCheckApp) {
+                    // Still wakes on schedule while the switch is off, so turning it back on
+                    // does not inherit a wait that started before it was turned off.
+                    delay(checkIntervalMillis)
+                    continue
+                }
+                // `max` of the stored stamp and this process's own: the stored one is what
+                // survives a restart, and the in-memory one is what keeps the loop honest if
+                // that write never landed. Without it a lost write would make every wake
+                // compute "due six hours ago" and re-check in a tight cycle — a request storm
+                // instead of a six-hourly check.
+                val reference = maxOf(stored.lastAppCheckAt, lastCheckAtMillis)
+                val dueAt = if (reference > 0) reference + checkIntervalMillis else 0L
+                // The floor is the second half of that guard: whatever the timestamps say, a
+                // wake never re-checks within [MIN_WAKE_MILLIS]. It is two orders of magnitude
+                // below the window, so it cannot delay a legitimate check in a way anyone
+                // could notice, and it turns "some path computed a due time in the past" from
+                // a busy loop into a bounded, visible mistake.
+                delay((dueAt - clock()).coerceIn(MIN_WAKE_MILLIS, checkIntervalMillis))
+                if (busy()) {
+                    delay(checkIntervalMillis)
+                    continue
+                }
+                checkJob = viewModelScope.launch { check(silent = true) }
+                checkJob?.join()
+            }
+        }
+    }
+
     /** The button: both the news and the "已是最新" are reported. */
     fun checkNow() {
-        if (busy()) return
-        checkJob = viewModelScope.launch { check(silent = false) }
+        val state = _uiState.value
+        // Already the user's own check: a second press while it runs is what the disabled
+        // button already prevents, and starting another would split one wait in two.
+        if (state.isChecking && !state.isCheckingQuietly) return
+        if (state.isDownloading) return
+        // The automatic check stands down rather than the button waiting behind it: it owes
+        // nothing the requested check will not also compute, and the user should not wait on
+        // a request they did not make. Joined before the new one starts, because the old
+        // job's cleanup clears the very flags the new one is about to set.
+        val quiet = if (state.isCheckingQuietly) checkJob else null
+        checkJob = viewModelScope.launch {
+            quiet?.cancelAndJoin()
+            check(silent = false)
+        }
     }
 
     private suspend fun check(silent: Boolean) {
-        _uiState.update { it.copy(isChecking = true) }
+        _uiState.update { it.copy(isChecking = true, isCheckingQuietly = silent) }
         try {
             applyCheckResult(client.check(installed.versionCode, installed.packageName), silent)
         } catch (error: CancellationException) {
@@ -139,10 +244,12 @@ class AppUpdateViewModel(
             _uiState.update { it.copy(checkedAtMillis = clock(), checkFailed = true) }
             showMessage(error.message ?: "检查更新失败", isError = true)
         } finally {
-            _uiState.update { it.copy(isChecking = false) }
+            _uiState.update { it.copy(isChecking = false, isCheckingQuietly = false) }
         }
         // Recorded for every outcome: the throttle is about how often the endpoint is
-        // asked, not about how the last answer went.
+        // asked, not about how the last answer went. The in-memory copy is written first, so
+        // a failing write cannot leave the timer thinking this check never happened.
+        lastCheckAtMillis = clock()
         withContext(ioDispatcher) { preferences.setLastAppCheckAt(clock()) }
     }
 
@@ -237,6 +344,15 @@ class AppUpdateViewModel(
     }
 
     companion object {
+        /**
+         * The shortest gap between two wakes of the periodic check.
+         *
+         * Far below the six-hour window, so it never delays a check anyone was waiting for;
+         * its job is to bound the damage if some path ever computes a due time in the past —
+         * without it that is a tight loop against the feed rather than a slow one.
+         */
+        private const val MIN_WAKE_MILLIS = 60_000L
+
         /**
          * The running build, read from the package manager.
          *

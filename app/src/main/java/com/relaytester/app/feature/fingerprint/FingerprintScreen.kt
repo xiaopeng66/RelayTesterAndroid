@@ -32,7 +32,6 @@ import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.ExpandLess
 import androidx.compose.material.icons.outlined.ExpandMore
-import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material3.AlertDialog
@@ -229,8 +228,6 @@ private fun FingerprintContent(
         ),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        item { IntentNote() }
-
         item {
             OutlinedCard {
                 Column(
@@ -279,11 +276,6 @@ private fun FingerprintContent(
                                     // 名字挂在开关上，标题就不再单独播报一遍，否则读屏会把
                                     // 同一句话念两次（标题一次、开关一次）。
                                     modifier = Modifier.clearAndSetSemantics {},
-                                )
-                                Text(
-                                    "多模型仍逐个检测",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
                             }
                             // 只有开关本身可切换：整行可点会带来两件用户不想要的事——点标题也
@@ -413,15 +405,15 @@ private fun HistoryCard(
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.Medium,
                     )
-                    Text(
-                        if (entries.isEmpty()) {
-                            "还没有记录；每测完一个模型就留一条。"
-                        } else {
-                            "最近 ${entries.size} 条（最多保留 ${FingerprintHistoryStore.MAX_ENTRIES} 条）"
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+                    // 空的时候不再解释这张卡是干什么的（用户要求去掉说明），留下的
+                    // 一行是条数，会随检测变化。
+                    if (entries.isNotEmpty()) {
+                        Text(
+                            "最近 ${entries.size} 条（最多保留 ${FingerprintHistoryStore.MAX_ENTRIES} 条）",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
             }
             OutlinedButton(
@@ -560,9 +552,10 @@ private fun ReferenceBankCard(
 ) {
     val context = LocalContext.current
     val busy = state.isCheckingBankUpdate || state.isInstallingBank || state.isRunning
-    // Both checks speak here. The entry check used to be invisible: it set a flag no
-    // composable read, so a silent check in flight looked exactly like nothing happening.
-    val isCheckingBank = state.isCheckingBankUpdate || state.isCheckingBankInBackground
+    // 只有静默检查占用状态行：状态行是它唯一的迹象（这个标志以前没人读，一次静默检查看
+    // 起来就像什么都没发生）。用户自己点的那次，进度只画在按钮上——两处同时转圈很难看，
+    // 而状态行里「上次检查：…」比「正在检查更新…」信息更多，不该被顶掉。
+    val isCheckingQuietly = state.isCheckingBankInBackground
     // Fixed for as long as the timestamp it describes: "今天 14:32" only changes when
     // midnight passes, and re-reading the clock on every recomposition buys nothing.
     val nowMillis = remember(state.bankCheckedAtMillis) { System.currentTimeMillis() }
@@ -613,12 +606,12 @@ private fun ReferenceBankCard(
 
             UpdateStatusRow(
                 text = updateCheckLine(
-                    isChecking = isCheckingBank,
+                    isChecking = isCheckingQuietly,
                     checkedAtMillis = state.bankCheckedAtMillis,
                     outcome = bankCheckOutcome(state),
                     nowMillis = nowMillis,
                 ),
-                isChecking = isCheckingBank,
+                isChecking = isCheckingQuietly,
             )
 
             state.bankDownloadProgress?.let { progress ->
@@ -659,14 +652,6 @@ private fun ReferenceBankCard(
                 }
             }
 
-            if (state.bankSource == BankSource.NOT_PROVISIONED) {
-                Text(
-                    "需先下载一次检测包；之后检测完全离线。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-
             state.bankProblem?.let { problem ->
                 Text(
                     problem,
@@ -675,6 +660,8 @@ private fun ReferenceBankCard(
                 )
             }
 
+            // 「检查更新」与「删除检测包」并排两栏（等宽），「下载/更新检测包」是这张卡上
+            // 唯一的主操作，单独占一行。三个标签都短到半栏放得下，且一律单行不换行。
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -692,40 +679,55 @@ private fun ReferenceBankCard(
                         )
                         Spacer(Modifier.width(8.dp))
                     }
-                    Text("检查更新", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(
+                        "检查更新",
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                 }
-                if (state.availableBankUpdate != null) {
-                    Button(
-                        onClick = onInstallBankUpdate,
+                if (state.bankSource != BankSource.NOT_PROVISIONED) {
+                    // 文字按钮而不是第二个实心框：删除是破坏性操作，同高不同重，位置对
+                    // 齐、视觉上仍明显是次要动作。
+                    TextButton(
+                        onClick = onRemovePackage,
                         enabled = !busy,
                         modifier = Modifier.weight(1f).heightIn(min = 48.dp),
                     ) {
-                        if (state.isInstallingBank) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(16.dp),
-                                strokeWidth = 2.dp,
-                            )
-                            Spacer(Modifier.width(8.dp))
-                        }
                         Text(
-                            if (state.bankSource == BankSource.NOT_PROVISIONED) {
-                                "下载检测包"
-                            } else {
-                                "更新检测包"
-                            },
+                            "删除检测包",
                             maxLines = 1,
+                            softWrap = false,
                             overflow = TextOverflow.Ellipsis,
                         )
                     }
                 }
             }
 
-            if (state.bankSource != BankSource.NOT_PROVISIONED) {
-                TextButton(
-                    onClick = onRemovePackage,
+            if (state.availableBankUpdate != null) {
+                Button(
+                    onClick = onInstallBankUpdate,
                     enabled = !busy,
-                    modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
-                ) { Text("删除已安装的检测包") }
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                ) {
+                    if (state.isInstallingBank) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                        )
+                        Spacer(Modifier.width(8.dp))
+                    }
+                    Text(
+                        if (state.bankSource == BankSource.NOT_PROVISIONED) {
+                            "下载检测包"
+                        } else {
+                            "更新检测包"
+                        },
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
 
             SupportedModelsButton(models = state.bankModels)
@@ -744,11 +746,6 @@ private fun ReferenceBankCard(
                         // 名字挂在开关上，标题就不再单独播报一遍，否则读屏会把同一句话念两次。
                         modifier = Modifier.clearAndSetSemantics {},
                     )
-                    Text(
-                        "打开本面板时自动检查一次",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
                 }
                 // 与「并行发送三题」同一个做法：只有开关本身可切换（整行可点会让点标题也翻
                 // 状态），并按用户反馈把涟漪关掉——按下态的圆钮高光看着像已经选中。
@@ -761,11 +758,6 @@ private fun ReferenceBankCard(
                 }
             }
 
-            Text(
-                "检测离线；取清单与装包才联网。",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
             // MIT 要求署名，这一行不是解释文案，压缩轮里保留原文。
             Text(
                 "参考数据由 lm-detector (MIT) 提供。",
@@ -906,32 +898,6 @@ private fun SelectionChip(
             )
         },
     )
-}
-
-@Composable
-private fun IntentNote() {
-    OutlinedCard(
-        colors = CardDefaults.outlinedCardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant,
-        ),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(12.dp),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Icon(
-                Icons.Outlined.Info,
-                contentDescription = null,
-                modifier = Modifier.size(18.dp),
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Text(
-                "让模型凭第一反应写约 300 个 1–355 整数，再与检测包比对。",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-    }
 }
 
 /**
@@ -1457,17 +1423,15 @@ private fun ChallengeList(
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text("三道题目", style = MaterialTheme.typography.titleMedium)
-                Text(
-                    if (manual) {
-                        "已收到 $received/${state.progress.size} 条有效回答"
-                    } else if (state.batchResults.isEmpty()) {
-                        "开跑后每个模型各占一组三栏"
-                    } else {
-                        "每个模型一组三栏 · 失败的格子自己带「重试」"
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                // 只留会变的那一行：手动模式收到几条有效回答是进度，不是说明；API 模式
+                // 的版面解释已按用户要求去掉。
+                if (manual) {
+                    Text(
+                        "已收到 $received/${state.progress.size} 条有效回答",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
             IconButton(onClick = onRegenerate, enabled = !state.isRunning) {
                 Icon(Icons.Outlined.Refresh, contentDescription = "重新生成题目")

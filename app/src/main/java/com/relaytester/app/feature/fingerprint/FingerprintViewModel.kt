@@ -1682,7 +1682,7 @@ class FingerprintViewModel(
                 }
                 if (!silent) {
                     showMessage(
-                        "发现新的检测包：构建于 ${check.manifest.builtAt}，" +
+                        "发现新的检测包：构建于 ${formatBankBuiltAt(check.manifest.builtAt)}，" +
                             "${check.manifest.modelCount} 个模型",
                         isError = false,
                     )

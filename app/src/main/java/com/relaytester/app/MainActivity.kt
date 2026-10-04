@@ -71,10 +71,6 @@ private fun RelayTesterApp() {
             ?: AppDestination.MODEL_TEST
         val appUpdateState by appUpdateViewModel.uiState.collectAsStateWithLifecycle()
         val updateSnackbarHostState = remember { SnackbarHostState() }
-        // Collected, not read once: the update page shows the detection package's check and
-        // download as they happen, and a snapshot taken when the dialog opened would leave
-        // that section frozen on exactly the state the user opened it to watch.
-        val fingerprintState by fingerprintViewModel.uiState.collectAsStateWithLifecycle()
         // The launch check: throttled inside the view model, and it stays off when the
         // switch is off. Keyed on nothing, so it runs once per activity, not per tab switch.
         LaunchedEffect(Unit) { appUpdateViewModel.checkOnLaunch() }
@@ -126,14 +122,10 @@ private fun RelayTesterApp() {
         }
 
         if (showUpdates) {
-            // Opening the page counts as asking, and the throttle still applies: at most one
-            // request per six hours, and none at all while the switch is off.
-            LaunchedEffect(Unit) { appUpdateViewModel.checkOnLaunch() }
+            // 打开这一页不再单独触发一次检查：查的时机是「打开 App 一次」加常驻的 6 小时
+            // 定时器（都在视图模型里），多一个入口只会多一次与手动检查抢同一个作业的机会。
             UpdateDialog(
                 appViewModel = appUpdateViewModel,
-                bankState = fingerprintState,
-                onCheckBankUpdate = fingerprintViewModel::checkBankUpdate,
-                onInstallBankUpdate = fingerprintViewModel::installBankUpdate,
                 onDismiss = { showUpdates = false },
             )
         }

@@ -22,6 +22,7 @@ import com.relaytester.app.feature.fingerprint.ChallengeState
 import com.relaytester.app.feature.fingerprint.DetectionMode
 import com.relaytester.app.feature.fingerprint.FingerprintViewModel
 import com.relaytester.app.feature.fingerprint.ModelDetectionStatus
+import com.relaytester.app.feature.fingerprint.formatBankBuiltAt
 import java.io.File
 import java.io.IOException
 import java.util.Collections
@@ -1764,6 +1765,29 @@ class FingerprintViewModelTest {
         assertNull("同一个包不该提示更新", state.availableBankUpdate)
         assertFalse("这不是错误", state.isMessageError)
         assertEquals("检测包已是最新", state.message)
+    }
+
+    @Test
+    fun `the offer in the bar prints the stamp the way the card prints it`() {
+        // The bar and the card are read one after the other, so the same publisher stamp must
+        // not appear as a shortened date in one place and a raw ISO string in the other.
+        val fetcher = FakeHttpFetcher().apply { publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp) }
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFetcher = fetcher,
+        )
+        runBlocking { subject.awaitIdle() }
+
+        subject.checkBankUpdate()
+        runBlocking { subject.awaitIdle() }
+
+        val message = subject.uiState.value.message.orEmpty()
+        assertTrue(
+            "气泡里的构建时间没有走卡片那套格式化：$message",
+            message.contains(formatBankBuiltAt(patchStamp)),
+        )
+        assertFalse("气泡里还印着带小数位与偏移的原始串：$message", message.contains(patchStamp))
     }
 
     @Test

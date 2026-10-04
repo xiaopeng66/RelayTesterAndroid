@@ -8,8 +8,11 @@ import com.relaytester.app.feature.fingerprint.bankNeedsNewerAppLine
 import com.relaytester.app.feature.fingerprint.bankSourceLabel
 import com.relaytester.app.feature.fingerprint.bankStateLine
 import com.relaytester.app.feature.fingerprint.bankUpdateOffer
+import com.relaytester.app.feature.fingerprint.formatBankBuiltAt
 import com.relaytester.app.feature.fingerprint.formatBankSize
 import com.relaytester.app.ui.components.UpdateCheckOutcome
+import java.time.ZoneId
+import java.time.ZoneOffset
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -57,9 +60,9 @@ class BankCardTextTest {
 
     @Test
     fun `the offer line names the build, the size and the model count`() {
-        val offer = bankUpdateOffer("2026-09-30T05:12:31+00:00", 53, 3_476_998)
+        val offer = bankUpdateOffer("2026-09-30T05:12:31+00:00", 53, 3_476_998, ZoneOffset.UTC)
 
-        assertTrue(offer.contains("2026-09-30T05:12:31+00:00"))
+        assertTrue(offer.contains("2026-09-30 05:12"))
         assertTrue(offer.contains("53"))
         assertTrue(offer.contains("3.3 MB"))
     }
@@ -76,15 +79,47 @@ class BankCardTextTest {
     fun `the installed line reads as prose`() {
         // A device run showed this line rendering "53 个模型标签 · 3.3 MB" — it is
         // user-visible prose, so it is assembled in a testable function rather than
-        // inline in the composable where nothing could check it.
+        // inline in the composable where nothing could check it. The zone is a parameter
+        // so this can pin one: the stamp a reader sees must not depend on where CI runs.
         val summary = bankStateLine(
             BankSource.INSTALLED,
             "2026-09-30T03:01:12.803902+00:00",
             53,
             3_476_998,
+            ZoneOffset.UTC,
         )
 
-        assertEquals("构建于 2026-09-30T03:01:12.803902+00:00 · 53 个模型 · 3.3 MB", summary)
+        assertEquals("构建于 2026-09-30 03:01 · 53 个模型 · 3.3 MB", summary)
+    }
+
+    @Test
+    fun `the build stamp is converted into the reader's zone`() {
+        // The published stamp is UTC; the card is read next to "上次检查：今天 14:32", which
+        // is local time. Both timestamps on this card have to speak the same clock.
+        assertEquals(
+            "2026-10-03 15:40",
+            formatBankBuiltAt("2026-10-03T07:40:28.536363+00:00", ZoneId.of("Asia/Shanghai")),
+        )
+    }
+
+    @Test
+    fun `a stamp that does not parse is trimmed rather than blanked`() {
+        // The publisher's string is not ours to format; a shape we cannot parse must still
+        // be shown, minus the fractional seconds and the offset that made it unreadable.
+        assertEquals("2026-10-03 07:40:28", formatBankBuiltAt("2026-10-03T07:40:28.5", ZoneOffset.UTC))
+        assertEquals(
+            "2026-10-03 07:40:28",
+            formatBankBuiltAt("2026-10-03 07:40:28.536363+00:00", ZoneOffset.UTC),
+        )
+        assertEquals("未知", formatBankBuiltAt("   ", ZoneOffset.UTC))
+    }
+
+    @Test
+    fun `a stamp with a Z offset is an instant like any other`() {
+        assertEquals(
+            "2026-10-03 15:40",
+            formatBankBuiltAt("2026-10-03T07:40:28Z", ZoneId.of("Asia/Shanghai")),
+        )
     }
 
     @Test

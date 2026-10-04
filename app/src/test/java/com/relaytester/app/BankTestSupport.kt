@@ -12,6 +12,7 @@ import com.relaytester.app.core.storage.UpdatePreferencesState
 import com.relaytester.app.core.update.DownloadProgress
 import java.io.File
 import java.io.IOException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import org.json.JSONObject
 
@@ -339,6 +340,16 @@ internal class FakeHttpFetcher(
 ) : HttpFetcher {
     val urls = mutableListOf<String>()
 
+    /**
+     * How many fetches were cancelled while parked on [gate].
+     *
+     * A check that stands down for another one is cancelled rather than ignored, and the
+     * difference is invisible from the outside: both leave the state looking the same. This
+     * counter is what makes "the quiet check was actually taken down" assertable, because a
+     * fetch that is merely left running would still answer its own request later.
+     */
+    var cancellations = 0
+
     /** Parks every fetch until the test releases it, so a job can be held in flight. */
     var gate: CompletableDeferred<Unit>? = null
 
@@ -373,7 +384,12 @@ internal class FakeHttpFetcher(
         // bytes, then the finished count. A test can therefore catch the panel mid-download
         // by parking [gate] here, between the two.
         onProgress(DownloadProgress(bytesRead = 0, totalBytes = bytes.size.toLong()))
-        gate?.await()
+        try {
+            gate?.await()
+        } catch (error: CancellationException) {
+            cancellations++
+            throw error
+        }
         failure?.let { throw it }
         onProgress(DownloadProgress(bytesRead = bytes.size.toLong(), totalBytes = bytes.size.toLong()))
         return bytes
@@ -414,21 +430,31 @@ internal class MemoryUpdatePreferences(
     var state: UpdatePreferencesState = UpdatePreferencesState(),
     /** When set, every write throws it, standing in for a disk that refuses. */
     var writeFails: Boolean = false,
+    /**
+     * When set, every write is accepted and then forgotten.
+     *
+     * A third state beside "writes land" and "writes throw": a store that keeps reporting the
+     * value it had before the write, which is what the throttle sees when a write was lost.
+     */
+    var dropWrites: Boolean = false,
 ) : UpdatePreferences(null) {
     override suspend fun read(): UpdatePreferencesState = state
 
     override suspend fun setAutoCheckBank(enabled: Boolean) {
         if (writeFails) throw IOException("写入更新开关失败")
+        if (dropWrites) return
         state = state.copy(autoCheckBank = enabled)
     }
 
     override suspend fun setAutoCheckApp(enabled: Boolean) {
         if (writeFails) throw IOException("写入更新开关失败")
+        if (dropWrites) return
         state = state.copy(autoCheckApp = enabled)
     }
 
     override suspend fun setLastAppCheckAt(millis: Long) {
         if (writeFails) throw IOException("写入更新开关失败")
+        if (dropWrites) return
         state = state.copy(lastAppCheckAt = millis)
     }
 }

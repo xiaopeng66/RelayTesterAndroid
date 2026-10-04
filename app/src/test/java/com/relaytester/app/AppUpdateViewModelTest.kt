@@ -7,8 +7,10 @@ import com.relaytester.app.feature.update.AppUpdateViewModel
 import com.relaytester.app.feature.update.InstalledAppVersion
 import java.io.IOException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
@@ -146,6 +148,190 @@ class AppUpdateViewModelTest {
 
         assertFalse("第二次启动又查了一遍", started)
         assertEquals(1, fetcher.urls.size)
+    }
+
+    // ---- the periodic check --------------------------------------------------
+
+    @Test
+    fun `coming up makes one request, not one from the launch check and one from the timer`() {
+        // The launch check and the timer read the same stored timestamp and would both see
+        // the stale one. The timer is therefore started after the check has written the new
+        // timestamp; if it started first, one launch would be two requests.
+        val fetcher = FakeHttpFetcher().apply { publishApp(apk) }
+        val preferences = MemoryUpdatePreferences(
+            UpdatePreferencesState(lastAppCheckAt = fixedNow - 7 * 60 * 60 * 1000L),
+        )
+        val subject = viewModel(fetcher = fetcher, preferences = preferences)
+
+        runBlocking { subject.checkOnLaunch() }
+        // Anything the timer had scheduled for "now" runs here.
+        dispatcher.scheduler.runCurrent()
+        assertEquals("一次启动发了两个请求", 1, fetcher.urls.size)
+
+        // The launch check just wrote a fresh timestamp, so the timer's first wake is a while
+        // window away. A timer started *before* that check would instead have read the stale
+        // stamp and — with the due time in the past — fired at its minimum wait. A minute of
+        // virtual time is what tells the two orders apart.
+        now = fixedNow + 61_000L
+        dispatcher.scheduler.advanceTimeBy(61_000L)
+
+        assertEquals("启动后一分钟内又查了一次", 1, fetcher.urls.size)
+    }
+
+    @Test
+    fun `the periodic check wakes when the window is due`() {
+        val fetcher = FakeHttpFetcher().apply { publishApp(apk, versionCode = 10_505L) }
+        val preferences = MemoryUpdatePreferences(
+            UpdatePreferencesState(lastAppCheckAt = fixedNow - 60 * 60 * 1000L),
+        )
+        val subject = viewModel(fetcher = fetcher, preferences = preferences)
+
+        runBlocking { subject.checkOnLaunch() }
+        assertEquals("窗口内不该查", emptyList<String>(), fetcher.urls)
+
+        // Five hours later the six-hour window is up. Virtual time is what lets the timer be
+        // observed without waiting six real hours; the injected clock moves with it, because
+        // the due time is computed from that clock.
+        now = fixedNow + 5 * 60 * 60 * 1000L
+        dispatcher.scheduler.advanceTimeBy(5 * 60 * 60 * 1000L + 1_000L)
+
+        assertEquals("到点没有自动检查", 1, fetcher.urls.size)
+        assertEquals(now, preferences.state.lastAppCheckAt)
+        assertNull("常开时的自动检查报了消息", subject.uiState.value.message)
+    }
+
+    @Test
+    fun `a check whose timestamp is lost does not become a request storm`() {
+        // DataStore writes can fail, and a store that keeps handing back the value it had
+        // before the write is what the wake-time arithmetic sees then. If that were the only
+        // reference, every wake would compute "due six hours ago": the timer would re-check
+        // immediately, forever. The in-memory stamp is what makes that a six-hourly check.
+        val fetcher = FakeHttpFetcher().apply { publishApp(apk, versionCode = 10_505L) }
+        val preferences = MemoryUpdatePreferences(dropWrites = true)
+        val subject = viewModel(fetcher = fetcher, preferences = preferences)
+
+        runBlocking { subject.checkOnLaunch() }
+        assertEquals("启动那一次照常发", 1, fetcher.urls.size)
+
+        // A window of virtual time, during which a storm would have sent many requests.
+        now = fixedNow + 6 * 60 * 60 * 1000L
+        dispatcher.scheduler.advanceTimeBy(6 * 60 * 60 * 1000L + 1_000L)
+
+        assertEquals("时间戳没落地就退化成死循环式重查", 2, fetcher.urls.size)
+    }
+
+    @Test
+    fun `the periodic check respects the switch`() {
+        val fetcher = FakeHttpFetcher().apply { publishApp(apk, versionCode = 10_505L) }
+        val preferences = MemoryUpdatePreferences(UpdatePreferencesState(autoCheckApp = false))
+        val subject = viewModel(fetcher = fetcher, preferences = preferences)
+
+        runBlocking { subject.checkOnLaunch() }
+        now += 24 * 60 * 60 * 1000L
+        dispatcher.scheduler.advanceTimeBy(24 * 60 * 60 * 1000L + 1_000L)
+
+        assertEquals("关着开关还是查了", emptyList<String>(), fetcher.urls)
+    }
+
+    @Test
+    fun `a wake never re-checks inside the timer's minimum wait`() {
+        // The floor exists for the case where the wake arithmetic says "due before now": a
+        // wake stays at least a minute out, so an arithmetic bug costs one late check instead
+        // of a busy loop. Thirty seconds past due is the only window where it changes the
+        // answer, which is why the test drives exactly that.
+        val fetcher = FakeHttpFetcher().apply { publishApp(apk, versionCode = 10_505L) }
+        val preferences = MemoryUpdatePreferences(
+            UpdatePreferencesState(lastAppCheckAt = fixedNow - 6 * 60 * 60 * 1000L + 30_000L),
+        )
+        val subject = viewModel(fetcher = fetcher, preferences = preferences)
+
+        runBlocking { subject.checkOnLaunch() }
+        assertEquals("窗口没到就查了", emptyList<String>(), fetcher.urls)
+
+        // 45 s: past the arithmetic's due time, inside the floor.
+        now = fixedNow + 45_000L
+        dispatcher.scheduler.advanceTimeBy(45_000L)
+        assertEquals("最小间隔没兜住提前的唤醒", emptyList<String>(), fetcher.urls)
+
+        now = fixedNow + 61_000L
+        dispatcher.scheduler.advanceTimeBy(16_000L)
+        assertEquals("过了最小间隔还是没有自动检查", 1, fetcher.urls.size)
+    }
+
+    @Test
+    fun `a check in flight keeps the timer from starting another`() {
+        // Two checks at once would be two requests for one window. The timer is the only leg
+        // that can run into a check it did not start, so this is where the guard is load
+        // bearing: a wake that finds one in flight waits out another window.
+        val fetcher = FakeHttpFetcher().apply { publishApp(apk, versionCode = 10_505L) }
+        val subject = viewModel(fetcher = fetcher)
+
+        runBlocking { subject.checkOnLaunch() }
+        assertEquals("启动那一次照常发", 1, fetcher.urls.size)
+
+        // The user's own check, parked in flight.
+        val gate = CompletableDeferred<Unit>()
+        fetcher.gate = gate
+        subject.checkNow()
+        assertEquals("按钮的检查没发出去", 2, fetcher.urls.size)
+
+        // A window of virtual time, with that check still parked: the timer wakes into it.
+        now = fixedNow + 6 * 60 * 60 * 1000L
+        dispatcher.scheduler.advanceTimeBy(6 * 60 * 60 * 1000L + 1_000L)
+
+        assertEquals("已有检查在飞时定时器又开了一个", 2, fetcher.urls.size)
+
+        fetcher.gate = null
+        gate.complete(Unit)
+        dispatcher.scheduler.runCurrent()
+    }
+
+    @Test
+    fun `a check running by itself owns the status row`() {
+        val fetcher = FakeHttpFetcher().apply { publishApp(apk, versionCode = 10_505L) }
+        val subject = viewModel(fetcher = fetcher)
+        val gate = CompletableDeferred<Unit>()
+        fetcher.gate = gate
+
+        val launcher = CoroutineScope(dispatcher).launch { subject.checkOnLaunch() }
+
+        // The status row is the only sign a check the user did not ask for is happening, so
+        // this flag is what draws it. Nothing else may be drawn while it runs.
+        assertTrue("静默检查没有占住状态行", subject.uiState.value.isCheckingQuietly)
+        assertTrue(subject.uiState.value.isChecking)
+
+        gate.complete(Unit)
+        runBlocking { launcher.join() }
+
+        assertFalse("检查结束后仍标着静默", subject.uiState.value.isCheckingQuietly)
+        assertFalse(subject.uiState.value.isChecking)
+    }
+
+    @Test
+    fun `the button takes over from a check running by itself`() {
+        // The user pressed the button, so the requested check must not queue behind the quiet
+        // one: it cancels it instead. A quiet check answers nothing (no "已是最新版本"), so
+        // the message is the proof that the *requested* check is the one that finished — and
+        // it can only have finished if the parked quiet one was cancelled.
+        val fetcher = FakeHttpFetcher().apply { publishApp(apk, versionCode = 10_505L) }
+        val subject = viewModel(fetcher = fetcher)
+        val gate = CompletableDeferred<Unit>()
+        fetcher.gate = gate
+
+        val launcher = CoroutineScope(dispatcher).launch { subject.checkOnLaunch() }
+        assertTrue("静默检查没有占住状态行", subject.uiState.value.isCheckingQuietly)
+        fetcher.gate = null
+
+        subject.checkNow()
+
+        assertFalse("按钮的检查被静默检查挡住了", subject.uiState.value.isCheckingQuietly)
+        assertEquals("按钮的检查没有走完", "已是最新版本", subject.uiState.value.message)
+        // And it was cancelled, not merely ignored: a parked quiet check left running would
+        // still answer its own request later, which is one press of the button paying for two.
+        assertEquals("静默检查没有被取消，而是与新检查并行", 1, fetcher.cancellations)
+
+        gate.complete(Unit)
+        runBlocking { launcher.join() }
     }
 
     // ---- what a check says --------------------------------------------------
