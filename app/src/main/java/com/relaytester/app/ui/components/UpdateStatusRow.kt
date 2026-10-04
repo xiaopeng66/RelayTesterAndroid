@@ -32,6 +32,16 @@ enum class UpdateCheckOutcome {
     NEVER_CHECKED,
     UP_TO_DATE,
 
+    /**
+     * A check finished earlier, in a process that is gone.
+     *
+     * The launch check is throttled by a persisted timestamp, so an app opened again inside
+     * the window runs no check at all and this process has no verdict of its own. The stored
+     * timestamp is still a fact worth printing; the verdict is not, because whether the
+     * endpoint had something is exactly what this process did not ask.
+     */
+    EARLIER_CHECK,
+
     /** The endpoint offers something this app can install. */
     OFFER,
 
@@ -60,6 +70,10 @@ fun updateCheckLine(
     // pressed the button, so the row must not fall back to "尚未检查".
     checkedAtMillis == null && outcome == UpdateCheckOutcome.FAILED -> "上次检查失败"
     checkedAtMillis == null -> "尚未检查"
+    // No verdict to append: the check this stamp describes ran in an earlier process, and
+    // naming a result here would be inventing one. The time alone is the whole truth.
+    outcome == UpdateCheckOutcome.EARLIER_CHECK ->
+        "上次检查：${formatCheckStamp(checkedAtMillis, nowMillis, zone)}"
     else -> "上次检查：${formatCheckStamp(checkedAtMillis, nowMillis, zone)} · ${outcomeLabel(outcome)}"
 }
 
@@ -67,11 +81,13 @@ fun updateCheckLine(
  * The short label for a finished check, used after the timestamp.
  *
  * "发现新版本" rather than the version number: the offer line right above it already names
- * the build, and printing it twice would read as two different facts.
+ * the build, and printing it twice would read as two different facts. [UpdateCheckOutcome.EARLIER_CHECK]
+ * has no label on purpose — see [updateCheckLine], which drops the separator with it.
  */
 fun outcomeLabel(outcome: UpdateCheckOutcome): String = when (outcome) {
     UpdateCheckOutcome.NEVER_CHECKED -> "尚无结果"
     UpdateCheckOutcome.UP_TO_DATE -> "已是最新"
+    UpdateCheckOutcome.EARLIER_CHECK -> ""
     UpdateCheckOutcome.OFFER -> "发现新版本"
     UpdateCheckOutcome.NEEDS_NEWER_APP -> "需要更新 App"
     UpdateCheckOutcome.FAILED -> "失败"

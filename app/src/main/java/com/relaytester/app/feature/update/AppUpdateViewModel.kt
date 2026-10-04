@@ -56,6 +56,15 @@ data class AppUpdateUiState(
     val downloadProgress: DownloadProgress? = null,
     /** When the last finished check ran, or null before the first one. */
     val checkedAtMillis: Long? = null,
+    /**
+     * When the last check finished, if it did not run in this process.
+     *
+     * Same split as the detection package's card, for the same reason: the launch check is
+     * throttled by a stamp on disk, so a launch inside the window runs no check and would
+     * otherwise fall back to 「尚未检查」 — which is false, the feed was asked, just not now.
+     * The time is printed without a verdict; [checkedAtMillis] wins whenever it exists.
+     */
+    val earlierCheckAtMillis: Long? = null,
     /** True when the last check ended in an error; see the bank card for why it is stored. */
     val checkFailed: Boolean = false,
     val available: AppUpdateManifest? = null,
@@ -155,7 +164,14 @@ class AppUpdateViewModel(
 
     private suspend fun runLaunchCheck(): Boolean {
         val stored = withContext(ioDispatcher) { preferences.read() }
-        _uiState.update { it.copy(autoCheckApp = stored.autoCheckApp) }
+        // Same as the detection-package card: the stored stamp is what lets a launch that
+        // checks nothing still say when the last check was.
+        _uiState.update {
+            it.copy(
+                autoCheckApp = stored.autoCheckApp,
+                earlierCheckAtMillis = stored.lastAppCheckAt.takeIf { stamp -> stamp > 0 },
+            )
+        }
         if (!stored.autoCheckApp) return false
         val since = clock() - stored.lastAppCheckAt
         if (stored.lastAppCheckAt > 0 && since < checkIntervalMillis) {
@@ -199,18 +215,33 @@ class AppUpdateViewModel(
                 // instead of a six-hourly check.
                 val reference = maxOf(stored.lastAppCheckAt, lastCheckAtMillis)
                 val dueAt = if (reference > 0) reference + checkIntervalMillis else 0L
-                // The floor is the second half of that guard: whatever the timestamps say, a
-                // wake never re-checks within [MIN_WAKE_MILLIS]. It is two orders of magnitude
-                // below the window, so it cannot delay a legitimate check in a way anyone
-                // could notice, and it turns "some path computed a due time in the past" from
-                // a busy loop into a bounded, visible mistake.
-                delay((dueAt - clock()).coerceIn(MIN_WAKE_MILLIS, checkIntervalMillis))
+                val wait = dueAt - clock()
+                if (wait > 0) {
+                    // Not due yet: sleep towards it and decide again from scratch rather than
+                    // treating the wake itself as "due". The bounds are the guard: whatever
+                    // the timestamps say, a wake is never shorter than [MIN_WAKE_MILLIS] —
+                    // which turns "some path computed a due time in the past" from a busy
+                    // loop into a bounded, visible mistake — and never longer than a window.
+                    // Both can move the wake off the exact due time, so by the time it fires
+                    // the stamp may have moved on (a check the user pressed, or this loop's
+                    // own previous one landing late); deciding again keeps the timing a
+                    // property of the stamps rather than of when the loop happened to wake.
+                    delay(wait.coerceIn(MIN_WAKE_MILLIS, checkIntervalMillis))
+                    continue
+                }
                 if (busy()) {
                     delay(checkIntervalMillis)
                     continue
                 }
                 checkJob = viewModelScope.launch { check(silent = true) }
+                // Waited for, so the next wake is computed from the stamp this check wrote.
                 checkJob?.join()
+                // And then the same floor as above, for the case a completed check would
+                // otherwise decide again immediately: if neither timestamp moved — the write
+                // failed *and* the in-memory copy is gone — the arithmetic says "due" forever.
+                // One iteration per minute is a visible mistake; without this it is a tight
+                // loop that no assertion can even reach, because it never suspends.
+                delay(MIN_WAKE_MILLIS)
             }
         }
     }

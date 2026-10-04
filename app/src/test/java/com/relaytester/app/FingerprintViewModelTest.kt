@@ -17,6 +17,8 @@ import com.relaytester.app.core.security.SecretStore
 import com.relaytester.app.core.storage.SupplierStore
 import com.relaytester.app.core.storage.SupplierStoreState
 import com.relaytester.app.core.storage.UpdatePreferencesState
+import com.relaytester.app.feature.fingerprint.bankCheckOutcome
+import com.relaytester.app.ui.components.UpdateCheckOutcome
 import com.relaytester.app.feature.fingerprint.ChallengeProgress
 import com.relaytester.app.feature.fingerprint.ChallengeState
 import com.relaytester.app.feature.fingerprint.DetectionMode
@@ -30,10 +32,12 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
@@ -65,6 +69,16 @@ class FingerprintViewModelTest {
 
     /** A published-bank build stamp; the same length as the packaged one by construction. */
     private val patchStamp = "2026-09-30T05:12:31.123456+00:00"
+
+    /**
+     * The clock the view models read, wound from the test scheduler's virtual time.
+     *
+     * That is what lets a test walk a whole six-hour window with `advanceTimeBy` while the
+     * loop's arithmetic sees the clock move with it — a frozen clock would make every wake
+     * compute "due long ago" and the window would never be crossed. Nothing advances time
+     * in the tests that do not care, so they still read exactly [FIXED_NOW_MILLIS].
+     */
+    private fun virtualClock(): Long = FIXED_NOW_MILLIS + mainDispatcher.scheduler.currentTime
 
     @Before
     fun setUp() {
@@ -112,7 +126,9 @@ class FingerprintViewModelTest {
         bankFetcher: FakeHttpFetcher = FakeHttpFetcher(),
         appVersionCode: Long = 10_400L,
         updatePreferences: MemoryUpdatePreferences = MemoryUpdatePreferences(),
-        clock: () -> Long = { FIXED_NOW_MILLIS },
+        /** Follows the test scheduler's virtual time; see [virtualClock]. */
+        clock: () -> Long = { virtualClock() },
+        bankCheckIntervalMillis: Long = UpdatePreferencesState.APP_CHECK_INTERVAL_MILLIS,
     ): FingerprintViewModel = FingerprintViewModel(
         supplierStore = store,
         secretStore = object : SecretStore {
@@ -128,6 +144,7 @@ class FingerprintViewModelTest {
         skipRestore = skipRestore,
         ioDispatcher = ioDispatcher,
         clock = clock,
+        bankCheckIntervalMillis = bankCheckIntervalMillis,
     ).apply {
         // A skipped restore still loads the bank, and no test may race that.
         if (skipRestore) runBlocking { awaitIdle() }
@@ -139,7 +156,13 @@ class FingerprintViewModelTest {
         parallel: Boolean = true,
         models: List<String> = listOf("test-model"),
         bankFetcher: FakeHttpFetcher = FakeHttpFetcher(),
-    ): FingerprintViewModel = apiViewModel(api, bankFetcher = bankFetcher).apply {
+        /** The main test dispatcher keeps the check deterministic; IO would not. */
+        ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    ): FingerprintViewModel = apiViewModel(
+        api = api,
+        bankFetcher = bankFetcher,
+        ioDispatcher = ioDispatcher,
+    ).apply {
         selectSupplier("sup-1")
         // Ticked one at a time, exactly as the checkboxes do; the tick order is what
         // the round follows.
@@ -1335,9 +1358,9 @@ class FingerprintViewModelTest {
             bankFetcher = fetcher,
         )
         runBlocking { subject.awaitIdle() }
-        assertEquals("构造本身不联网：检查由进入面板触发", emptyList<String>(), fetcher.urls)
+        assertEquals("构造本身不联网：检查由启动那一次触发", emptyList<String>(), fetcher.urls)
 
-        subject.refreshBankOnEntry()
+        runBlocking { subject.checkBankOnLaunch() }
         runBlocking { subject.awaitIdle() }
 
         val state = subject.uiState.value
@@ -1390,7 +1413,7 @@ class FingerprintViewModelTest {
     }
 
     @Test
-    fun `entering the panel looks for a newer package even when one is installed`() {
+    fun `the launch check looks for a newer package even when one is installed`() {
         val fetcher = FakeHttpFetcher().apply {
             publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp)
         }
@@ -1400,9 +1423,9 @@ class FingerprintViewModelTest {
             bankFetcher = fetcher,
         )
         runBlocking { subject.awaitIdle() }
-        assertEquals("装上以后不再自动联网，只有进面板才查", emptyList<String>(), fetcher.urls)
+        assertEquals("装上以后不联网：自动检查只由启动那一次触发", emptyList<String>(), fetcher.urls)
 
-        subject.refreshBankOnEntry()
+        runBlocking { subject.checkBankOnLaunch() }
         runBlocking { subject.awaitIdle() }
 
         assertEquals(listOf(FakeHttpFetcher.MANIFEST_URL), fetcher.urls)
@@ -1411,7 +1434,7 @@ class FingerprintViewModelTest {
     }
 
     @Test
-    fun `an entry check that fails does not greet the user with an error`() {
+    fun `an automatic check that fails does not greet the user with an error`() {
         val fetcher = FakeHttpFetcher(failure = IOException("网络不可用"))
         val subject = readyApiViewModelFor(
             SingleSupplierStore(testSupplier()),
@@ -1420,7 +1443,7 @@ class FingerprintViewModelTest {
         )
         runBlocking { subject.awaitIdle() }
 
-        subject.refreshBankOnEntry()
+        runBlocking { subject.checkBankOnLaunch() }
         runBlocking { subject.awaitIdle() }
 
         assertEquals(listOf(FakeHttpFetcher.MANIFEST_URL), fetcher.urls)
@@ -1430,7 +1453,7 @@ class FingerprintViewModelTest {
     }
 
     @Test
-    fun `an entry check asked for during the startup read is replayed once it lands`() {
+    fun `the launch check asked for during the startup read is replayed once it lands`() {
         // The screen asks on every panel entry, but never twice; if it is dropped while
         // the panel is still loading, the first visit silently loses it — and on a fresh
         // install that check is what puts the download button on the empty card.
@@ -1448,8 +1471,8 @@ class FingerprintViewModelTest {
         )
         assertTrue("启动读取还挂在门上，面板应在加载态", subject.uiState.value.isLoading)
 
-        // The panel becomes visible and asks for its entry check while the read is running.
-        subject.refreshBankOnEntry()
+        // The app comes up and asks for its launch check while the read is still running.
+        runBlocking { subject.checkBankOnLaunch() }
         assertEquals("在飞的启动读取还没落地，检查只能先记住", emptyList<String>(), fetcher.urls)
 
         gate.complete(Unit)
@@ -1474,18 +1497,20 @@ class FingerprintViewModelTest {
     }
 
     @Test
-    fun `a round starts even while the entry check is still in flight`() {
+    fun `a round starts even while the automatic check is still in flight`() {
         val api = FakeCompletionApi(goldenCase().answers)
         val gate = CompletableDeferred<Unit>()
         val fetcher = FakeHttpFetcher().apply {
             publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp)
             this.gate = gate
         }
-        val subject = readyApiViewModel(api, bankFetcher = fetcher)
+        // mainDispatcher 作 IO：静默检查会在清单请求里确定性停住，取位一次算一次。
+        val subject = readyApiViewModel(api, bankFetcher = fetcher, ioDispatcher = mainDispatcher)
         runBlocking { subject.awaitIdle() }
-        // 进面板的检查没人按过，只能占它自己的那个门：用户点下的检测必须照跑，
-        // 不能被一个用户没请求的 HTTP 请求挡在门外。
-        subject.refreshBankOnEntry()
+        // 自动检查没人按过，只能占它自己的那个门：用户点下的检测必须照跑，
+        // 不能被一个用户没请求的 HTTP 请求挡在门外。启动那一次自己会等到检查落地，
+        // 所以这里必须用一条自己的协程发起它，不能在 runBlocking 里等它返回。
+        val launcher = CoroutineScope(mainDispatcher).launch { subject.checkBankOnLaunch() }
         assertTrue("静默检查必须真的在飞", subject.uiState.value.isCheckingBankInBackground)
 
         subject.runApiDetection()
@@ -1509,7 +1534,7 @@ class FingerprintViewModelTest {
         assertFalse("静默检查要让位", subject.uiState.value.isCheckingBankInBackground)
         assertNull("没人按过的检查不该留话", subject.uiState.value.message)
         gate.complete(Unit)
-        runBlocking { subject.awaitIdle() }
+        runBlocking { launcher.join() }
     }
 
     @Test
@@ -1593,7 +1618,7 @@ class FingerprintViewModelTest {
     }
 
     @Test
-    fun `a check the user pressed takes over the entry check instead of queueing behind it`() {
+    fun `a check the user pressed takes over the automatic check instead of queueing behind it`() {
         val api = FakeCompletionApi(goldenCase().answers)
         val gate = CompletableDeferred<Unit>()
         val fetcher = FakeHttpFetcher().apply { publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp) }
@@ -1607,7 +1632,7 @@ class FingerprintViewModelTest {
         runBlocking { subject.awaitIdle() }
 
         fetcher.gate = gate
-        subject.refreshBankOnEntry()
+        val launcher = CoroutineScope(mainDispatcher).launch { subject.checkBankOnLaunch() }
         assertTrue(subject.uiState.value.isCheckingBankInBackground)
         assertEquals("静默检查先发出一次清单请求并停在门上", 1, fetcher.urls.size)
 
@@ -1626,11 +1651,11 @@ class FingerprintViewModelTest {
         assertNotNull("用户按下的检查必须汇报结果", subject.uiState.value.message)
         assertFalse(subject.uiState.value.isCheckingBankUpdate)
         gate.complete(Unit)
-        runBlocking { subject.awaitIdle() }
+        runBlocking { launcher.join() }
     }
 
     @Test
-    fun `reentering during a silent bank check keeps one request for manual takeover`() {
+    fun `a second automatic check while one is in flight keeps one request for manual takeover`() {
         val gate = CompletableDeferred<Unit>()
         val fetcher = FakeHttpFetcher().apply {
             publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp)
@@ -1641,15 +1666,15 @@ class FingerprintViewModelTest {
             FakeCompletionApi(goldenCase().answers),
             bankFetcher = fetcher,
         )
-        subject.refreshBankOnEntry()
+        val launcher = CoroutineScope(mainDispatcher).launch { subject.checkBankOnLaunch() }
         assertTrue(subject.uiState.value.isCheckingBankInBackground)
         assertEquals(listOf(FakeHttpFetcher.MANIFEST_URL), fetcher.urls)
 
         try {
-            // A second entry must keep the first check reachable rather than launch
+            // A second automatic ask must keep the first check reachable rather than launch
             // another request and replace the job that manual takeover needs to cancel.
-            subject.refreshBankOnEntry()
-            assertEquals("重复进入只保留原来的静默清单请求", listOf(FakeHttpFetcher.MANIFEST_URL), fetcher.urls)
+            runBlocking { subject.checkBankOnLaunch() }
+            assertEquals("重复的自动检查只保留原来的静默清单请求", listOf(FakeHttpFetcher.MANIFEST_URL), fetcher.urls)
             assertTrue(subject.uiState.value.isCheckingBankInBackground)
             assertFalse(subject.uiState.value.isCheckingBankUpdate)
             assertNull(subject.uiState.value.message)
@@ -1664,6 +1689,7 @@ class FingerprintViewModelTest {
         } finally {
             gate.complete(Unit)
             runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { subject.awaitIdle() } }
+            runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { launcher.join() } }
         }
     }
 
@@ -1878,7 +1904,7 @@ class FingerprintViewModelTest {
     }
 
     @Test
-    fun `the silent entry check also flags a package that needs a newer app`() {
+    fun `the automatic check also flags a package that needs a newer app`() {
         // A data-only upstream change rides the package channel, but a package whose
         // format moved cannot be installed by an older app. The user has to hear that
         // from the automatic per-entry check — someone who never presses the manual
@@ -1896,7 +1922,7 @@ class FingerprintViewModelTest {
         )
         runBlocking { subject.awaitIdle() }
 
-        subject.refreshBankOnEntry()
+        runBlocking { subject.checkBankOnLaunch() }
         runBlocking { subject.awaitIdle() }
 
         val state = subject.uiState.value
@@ -1907,7 +1933,7 @@ class FingerprintViewModelTest {
     }
 
     @Test
-    fun `the silent entry check explains an unreadable format as an app update`() {
+    fun `the automatic check explains an unreadable format as an app update`() {
         // Reported from a device: the panel answered a format-3 manifest with
         // 「更新清单的格式版本 3 不受支持」 — a format number, and nothing the user could
         // do — even though the manifest stated the app version that would fix it. The
@@ -1931,7 +1957,7 @@ class FingerprintViewModelTest {
         )
         runBlocking { subject.awaitIdle() }
 
-        subject.refreshBankOnEntry()
+        runBlocking { subject.checkBankOnLaunch() }
         runBlocking { subject.awaitIdle() }
 
         val state = subject.uiState.value
@@ -1942,7 +1968,7 @@ class FingerprintViewModelTest {
 
     @Test
     fun `a finished check leaves a timestamp the card can print`() {
-        // The entry check used to be invisible: it either produced an offer or left no
+        // The automatic check used to be invisible: it either produced an offer or left no
         // trace at all, so "checked, nothing new" and "never checked" looked the same.
         val fetcher = FakeHttpFetcher().apply { publish(fixtureBankBytes()) }
         val subject = readyApiViewModelFor(
@@ -1953,7 +1979,7 @@ class FingerprintViewModelTest {
         runBlocking { subject.awaitIdle() }
         assertNull("构造本身不是一次检查", subject.uiState.value.bankCheckedAtMillis)
 
-        subject.refreshBankOnEntry()
+        runBlocking { subject.checkBankOnLaunch() }
         runBlocking { subject.awaitIdle() }
 
         assertEquals(FIXED_NOW_MILLIS, subject.uiState.value.bankCheckedAtMillis)
@@ -1971,7 +1997,7 @@ class FingerprintViewModelTest {
         )
         runBlocking { subject.awaitIdle() }
 
-        subject.refreshBankOnEntry()
+        runBlocking { subject.checkBankOnLaunch() }
         runBlocking { subject.awaitIdle() }
 
         val state = subject.uiState.value
@@ -1989,13 +2015,16 @@ class FingerprintViewModelTest {
             bankFetcher = fetcher,
         )
         runBlocking { subject.awaitIdle() }
-        subject.refreshBankOnEntry()
+        runBlocking { subject.checkBankOnLaunch() }
         runBlocking { subject.awaitIdle() }
         assertTrue(subject.uiState.value.bankCheckFailed)
 
+        // The button, not the automatic path: the launch check wrote the throttle, so a
+        // second automatic ask inside the same window would be refused on purpose. What this
+        // test is about is the state the *next finished check* leaves behind.
         fetcher.failure = null
         fetcher.publish(fixtureBankBytes())
-        subject.refreshBankOnEntry()
+        subject.checkBankUpdate()
         runBlocking { subject.awaitIdle() }
 
         assertFalse("第二次成功之后不能再报失败", subject.uiState.value.bankCheckFailed)
@@ -2013,14 +2042,219 @@ class FingerprintViewModelTest {
         runBlocking { subject.awaitIdle() }
         assertFalse("启动读到的开关要落到面板上", subject.uiState.value.autoCheckBank)
 
-        subject.refreshBankOnEntry()
+        runBlocking { subject.checkBankOnLaunch() }
         runBlocking { subject.awaitIdle() }
-        assertEquals("关掉之后进面板不得联网", emptyList<String>(), fetcher.urls)
+        assertEquals("关掉之后启动也不得联网", emptyList<String>(), fetcher.urls)
 
         // The button is still the way in, and it is the same request.
         subject.checkBankUpdate()
         runBlocking { subject.awaitIdle() }
         assertEquals(listOf(FakeHttpFetcher.MANIFEST_URL), fetcher.urls)
+    }
+
+    @Test
+    fun `the launch check runs once and the next one waits out the window`() {
+        // 这就是用户要的语义：打开软件只自动检测一次。以前挂在「进面板」上，切三大界面
+        // 来回一次就重查一次，卡片上的「上次检查」跟着跳。节流的判据必须是落盘的时间戳，
+        // 否则每次启动都算「第一次」，关掉再开就是两次请求。
+        val fetcher = FakeHttpFetcher().apply { publish(fixtureBankBytes()) }
+        val preferences = MemoryUpdatePreferences()
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFetcher = fetcher,
+            updatePreferences = preferences,
+        )
+        runBlocking { subject.awaitIdle() }
+
+        assertTrue("启动那一次没有查", runBlocking { subject.checkBankOnLaunch() })
+        assertEquals(listOf(FakeHttpFetcher.MANIFEST_URL), fetcher.urls)
+        assertEquals(
+            "查完的时间必须落盘，否则每次启动都是「第一次」",
+            FIXED_NOW_MILLIS,
+            preferences.state.lastBankCheckAt,
+        )
+
+        // 同一个六小时窗口里再启动一次：端点不问第二遍。
+        assertFalse("窗口里又查了一次", runBlocking { subject.checkBankOnLaunch() })
+        assertEquals("窗口内的第二次启动不得联网", 1, fetcher.urls.size)
+
+        // 同一个窗口里重开软件：新实例的内存是空的，唯一记得这次检查的就是盘里那份时间戳
+        // —— 判据必须是它，否则每次启动都会当「从没查过」，关掉再开就是又一次请求。
+        val relaunched = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFetcher = fetcher,
+            updatePreferences = preferences,
+        )
+        runBlocking { relaunched.awaitIdle() }
+        assertFalse("重开软件就把节流忘了", runBlocking { relaunched.checkBankOnLaunch() })
+        assertEquals("窗口内重开不得联网", 1, fetcher.urls.size)
+
+        // 上一次检查已经过期的启动：换个实例模拟「重开软件」，它从盘里读到的是过期的
+        // 时间戳，于是该查。
+        val restarted = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFetcher = fetcher,
+            updatePreferences = MemoryUpdatePreferences(
+                UpdatePreferencesState(
+                    lastBankCheckAt = FIXED_NOW_MILLIS -
+                        UpdatePreferencesState.APP_CHECK_INTERVAL_MILLIS - 1L,
+                ),
+            ),
+        )
+        runBlocking { restarted.awaitIdle() }
+        assertTrue("过了窗口却没查", runBlocking { restarted.checkBankOnLaunch() })
+        assertEquals(2, fetcher.urls.size)
+    }
+
+    @Test
+    fun `a launch inside the window still says when the last check was`() {
+        // 这一次启动不查（窗口没到），但卡片不能因此退回「尚未检查」：上一次检查的时间是
+        // 盘上就写着的事实，只是它的结论本进程没看到过，所以只印时间、不印结论。
+        val lastCheck = FIXED_NOW_MILLIS - 60 * 60 * 1000L
+        val fetcher = FakeHttpFetcher().apply { publish(fixtureBankBytes()) }
+        val subject = apiViewModel(
+            api = FakeCompletionApi(goldenCase().answers),
+            ioDispatcher = mainDispatcher,
+            bankFetcher = fetcher,
+            updatePreferences = MemoryUpdatePreferences(
+                UpdatePreferencesState(lastBankCheckAt = lastCheck),
+            ),
+        )
+
+        assertFalse("窗口没到却查了", runBlocking { subject.checkBankOnLaunch() })
+        assertEquals("窗口内的启动不该联网", emptyList<String>(), fetcher.urls)
+        assertEquals(lastCheck, subject.uiState.value.bankEarlierCheckAtMillis)
+        assertEquals(UpdateCheckOutcome.EARLIER_CHECK, bankCheckOutcome(subject.uiState.value))
+    }
+
+    @Test
+    fun `the timer checks again while the app stays open`() {
+        val fetcher = FakeHttpFetcher().apply { publish(fixtureBankBytes()) }
+        val subject = apiViewModel(
+            api = FakeCompletionApi(goldenCase().answers),
+            ioDispatcher = mainDispatcher,
+            bankFetcher = fetcher,
+        )
+        runBlocking { subject.checkBankOnLaunch() }
+        assertEquals("启动那次照常发", 1, fetcher.urls.size)
+
+        // 常开一路走过去，没到窗口就不查。
+        mainDispatcher.scheduler.advanceTimeBy(2 * 60 * 60 * 1000L)
+        assertEquals("窗口没到就查了", 1, fetcher.urls.size)
+
+        // 跨过窗口，常开也要自己查一次；而且只能一次 —— 定时器醒来时若把「刚查完」
+        // 当成「到期了」，一个窗口里就会问端点两遍。
+        mainDispatcher.scheduler.advanceTimeBy(UpdatePreferencesState.APP_CHECK_INTERVAL_MILLIS)
+        assertEquals("常开过了一个窗口却没自动查", 2, fetcher.urls.size)
+
+        // 再走一个窗口，还是一个窗口一次。
+        mainDispatcher.scheduler.advanceTimeBy(UpdatePreferencesState.APP_CHECK_INTERVAL_MILLIS)
+        assertEquals("第二个窗口的次数不对", 3, fetcher.urls.size)
+    }
+
+    @Test
+    fun `a wake never re-checks inside the timer's minimum wait`() {
+        // 最小间隔存在的理由和软件更新那条一样：唤醒算术把时间算到了过去时，一次唤醒
+        // 至少还隔一分钟，于是算术出错只花掉一次迟到的检查，而不是变成一个紧循环。
+        val fetcher = FakeHttpFetcher().apply { publish(fixtureBankBytes()) }
+        val subject = apiViewModel(
+            api = FakeCompletionApi(goldenCase().answers),
+            ioDispatcher = mainDispatcher,
+            bankFetcher = fetcher,
+            updatePreferences = MemoryUpdatePreferences(
+                UpdatePreferencesState(
+                    // 差 30 秒到期：唯一一段最小间隔会改变答案的窗口。
+                    lastBankCheckAt = FIXED_NOW_MILLIS -
+                        UpdatePreferencesState.APP_CHECK_INTERVAL_MILLIS + 30_000L,
+                ),
+            ),
+        )
+
+        assertFalse("窗口没到却查了", runBlocking { subject.checkBankOnLaunch() })
+        assertEquals(emptyList<String>(), fetcher.urls)
+
+        // 45 秒：已经过了算术上的到期点，但还在最小间隔里。
+        mainDispatcher.scheduler.advanceTimeBy(45_000L)
+        assertEquals("最小间隔没兜住提前的唤醒", emptyList<String>(), fetcher.urls)
+
+        mainDispatcher.scheduler.advanceTimeBy(16_000L)
+        assertEquals("过了最小间隔还是没有自动检查", 1, fetcher.urls.size)
+    }
+
+    @Test
+    fun `a check in flight keeps the timer from starting another`() {
+        // 一个窗口两次请求就是白花一次：定时器是唯一会撞上「不是我发起的检查」的那条腿。
+        val fetcher = FakeHttpFetcher().apply { publish(fixtureBankBytes()) }
+        val subject = apiViewModel(
+            api = FakeCompletionApi(goldenCase().answers),
+            ioDispatcher = mainDispatcher,
+            bankFetcher = fetcher,
+        )
+        runBlocking { subject.checkBankOnLaunch() }
+        assertEquals("启动那次照常发", 1, fetcher.urls.size)
+
+        // 用户按下的那次停在门上。
+        val gate = CompletableDeferred<Unit>()
+        fetcher.gate = gate
+        subject.checkBankUpdate()
+        assertEquals("按钮的检查没发出去", 2, fetcher.urls.size)
+
+        // 一个窗口的虚拟时间过去，那次检查还停在门上，定时器醒来撞上它。
+        mainDispatcher.scheduler.advanceTimeBy(UpdatePreferencesState.APP_CHECK_INTERVAL_MILLIS + 1_000L)
+        assertEquals("已有检查在飞时定时器又开了一个", 2, fetcher.urls.size)
+
+        fetcher.gate = null
+        gate.complete(Unit)
+        mainDispatcher.scheduler.runCurrent()
+    }
+
+    @Test
+    fun `the timer respects the switch`() {
+        // 开关关的不是「启动那一次」，是整条自动检查：常开一路也不能绕过去。
+        val fetcher = FakeHttpFetcher().apply { publish(fixtureBankBytes()) }
+        val subject = apiViewModel(
+            api = FakeCompletionApi(goldenCase().answers),
+            ioDispatcher = mainDispatcher,
+            bankFetcher = fetcher,
+            updatePreferences = MemoryUpdatePreferences(UpdatePreferencesState(autoCheckBank = false)),
+        )
+        assertFalse("关着开关却查了", runBlocking { subject.checkBankOnLaunch() })
+
+        mainDispatcher.scheduler.advanceTimeBy(
+            UpdatePreferencesState.APP_CHECK_INTERVAL_MILLIS * 3 + 1_000L,
+        )
+        assertEquals("关着开关的常开一路还是查了", emptyList<String>(), fetcher.urls)
+
+        // 打开之后，最近的这次唤醒就会查 —— 关着的时候从没写过时间戳，所以没有可等窗口。
+        subject.setAutoCheckBank(true)
+        runBlocking { subject.awaitIdle() }
+        mainDispatcher.scheduler.advanceTimeBy(
+            UpdatePreferencesState.APP_CHECK_INTERVAL_MILLIS + 1_000L,
+        )
+        assertEquals("打开开关后不再自己查", 1, fetcher.urls.size)
+    }
+
+    @Test
+    fun `a check whose timestamp is lost does not become a request storm`() {
+        // 落盘可能失败，而只递回旧值的存储正是唤醒算术看到的东西。要是只认落盘那份，每次
+        // 唤醒都会算出「早就该查了」，一个窗口里会问端点无数次；进程内那份才是它变成
+        // 「六小时一次」的原因。
+        val fetcher = FakeHttpFetcher().apply { publish(fixtureBankBytes()) }
+        val subject = apiViewModel(
+            api = FakeCompletionApi(goldenCase().answers),
+            ioDispatcher = mainDispatcher,
+            bankFetcher = fetcher,
+            updatePreferences = MemoryUpdatePreferences(dropWrites = true),
+        )
+        runBlocking { subject.checkBankOnLaunch() }
+        assertEquals("启动那次照常发", 1, fetcher.urls.size)
+
+        // 一个窗口的虚拟时间；要是退化成死循环式重查，这里会是一堆请求。
+        mainDispatcher.scheduler.advanceTimeBy(UpdatePreferencesState.APP_CHECK_INTERVAL_MILLIS + 1_000L)
+        assertEquals("时间戳没落地就退化成死循环式重查", 2, fetcher.urls.size)
     }
 
     @Test
@@ -2057,13 +2291,15 @@ class FingerprintViewModelTest {
         runBlocking { subject.awaitIdle() }
         fetcher.manifestBody =
             manifestJson(patched, builtAt = patchStamp, minAppVersionCode = 10_500L)
-        subject.refreshBankOnEntry()
+        runBlocking { subject.checkBankOnLaunch() }
         runBlocking { subject.awaitIdle() }
         assertNotNull(subject.uiState.value.bankNeedsNewerApp)
 
+        // A second look at what the publisher ships now; the button, because the automatic
+        // path is throttled to one attempt per window and this test is about the state.
         fetcher.manifestBody =
             manifestJson(patched, builtAt = patchStamp, minAppVersionCode = 10_400L)
-        subject.refreshBankOnEntry()
+        subject.checkBankUpdate()
         runBlocking { subject.awaitIdle() }
 
         val state = subject.uiState.value

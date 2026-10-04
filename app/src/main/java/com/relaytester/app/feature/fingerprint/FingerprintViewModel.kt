@@ -36,12 +36,14 @@ import com.relaytester.app.core.security.SecretStore
 import com.relaytester.app.core.storage.SupplierStore
 import com.relaytester.app.core.storage.SupplierStoreState
 import com.relaytester.app.core.storage.UpdatePreferences
+import com.relaytester.app.core.storage.UpdatePreferencesState
 import com.relaytester.app.core.update.OkHttpFetcher
 import com.relaytester.app.core.update.DownloadProgress
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -175,6 +177,16 @@ data class FingerprintUiState(
      * ran. This is what the status row prints, and it is written by both paths.
      */
     val bankCheckedAtMillis: Long? = null,
+    /**
+     * When the last check finished, if it did not run in this process.
+     *
+     * The automatic check is throttled by a stamp on disk, so an app opened again inside the
+     * window runs no check and has no verdict of its own — and the row would fall back to
+     * 「尚未检查」, which is false: the endpoint was asked, just not now. The stored stamp is
+     * kept apart from [bankCheckedAtMillis] (this process's own finished check, which always
+     * wins) so the row can print the time without claiming a result it never saw.
+     */
+    val bankEarlierCheckAtMillis: Long? = null,
     /**
      * True when the last package check ended in an error.
      *
@@ -314,6 +326,13 @@ class FingerprintViewModel(
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     /** Overridden by tests so a check's timestamp is a value, not "whenever this ran". */
     private val clock: () -> Long = System::currentTimeMillis,
+    /**
+     * How often the panel looks for a newer package while the app stays open.
+     *
+     * Injected so a test can drive the periodic check with virtual time instead of waiting
+     * six hours; production uses the same window as the app's own channel.
+     */
+    private val bankCheckIntervalMillis: Long = UpdatePreferencesState.APP_CHECK_INTERVAL_MILLIS,
 ) : ViewModel() {
     private val relayApi: RelayApi by lazy { relayApiFactory() }
 
@@ -552,6 +571,25 @@ class FingerprintViewModel(
     /** The switch write, tracked so a test can tell "flipped" from "flipped and stored". */
     private var preferenceJob: Job? = null
 
+    /** The periodic package check; one loop for the life of the activity. */
+    private var bankTimerJob: Job? = null
+
+    /**
+     * When this process last finished a package check.
+     *
+     * The loop's wake time is computed from the later of this and the stored timestamp: the
+     * stored one is what survives a restart, and this one is what keeps the loop honest when
+     * that write did not land — without it a lost write would make every wake compute "due
+     * long ago" and re-check in a tight cycle.
+     */
+    private var lastBankCheckAtMillis = 0L
+
+    override fun onCleared() {
+        // The timer is the only thing here that would otherwise outlive the activity.
+        bankTimerJob?.cancel()
+        super.onCleared()
+    }
+
     /**
      * Suspends until anything the view model started has settled.
      *
@@ -585,12 +623,12 @@ class FingerprintViewModel(
     private var pendingPrefill: Pair<String?, String>? = null
 
     /**
-     * Set when the panel asked for its entry check while a startup read was still running.
+     * Set when the launch check was asked for while a startup read was still running.
      *
-     * [startBankCheck] drops a check while anything else is in flight, and the screen
-     * only asks once per panel entry, so without this the first visit to the panel could
-     * lose the check entirely — including the first-run case where that check is what
-     * puts the download button on an empty card. Replayed as soon as the read lands.
+     * [startBankCheck] drops a check while anything else is in flight, and the launch check
+     * runs once per activity, so without this the first launch could lose it entirely —
+     * including the first-run case where that check is what puts the download button on an
+     * empty card. Replayed as soon as the read lands.
      */
     private var entryCheckPending = false
 
@@ -1561,21 +1599,131 @@ class FingerprintViewModel(
     fun checkBankUpdate() = startBankCheck(silent = false)
 
     /**
-     * The check every panel entry does, so an update published since the last visit is
-     * already on the card.
+     * The automatic check: once when the app comes up, then every [bankCheckIntervalMillis]
+     * for as long as the app stays open.
      *
-     * This is the only way the panel learns about a new package without being asked, and
-     * it is deliberately the quiet version: the card shows "可更新到…" and the button, but
-     * a phone with no network does not get an error snackbar on every visit for a check
-     * the user did not ask for. Detection itself stays offline either way.
+     * Deliberately *not* tied to opening the panel. It used to run on every panel entry,
+     * which meant switching between the three tabs re-asked the endpoint each time — the
+     * card's "上次检查：…" moved with it, so the row looked like it reset itself. One check
+     * per launch, timed from a *stored* timestamp, is what "只自动检测一次" means: without
+     * the stored stamp every launch would be "the first check in a while" and closing the
+     * app twice would be two requests.
+     *
+     * Starting the periodic check is part of coming up, not of this check succeeding: an app
+     * launched with the switch off, or inside the window, still has to be watching for the
+     * moment the window passes.
+     *
+     * @return true when a check was actually started.
      */
-    fun refreshBankOnEntry() {
+    suspend fun checkBankOnLaunch(): Boolean {
+        // The check runs before the timer starts, never beside it: both read the same stored
+        // timestamp, and a timer that started first would see the stale one too and race this
+        // check for the same request. Started last, its first wake is a whole window away
+        // because this check just wrote the timestamp it computes from.
+        val started = runLaunchBankCheck()
+        ensureBankAutoCheckTimer()
+        return started
+    }
+
+    private suspend fun runLaunchBankCheck(): Boolean {
+        val stored = withContext(ioDispatcher) { updatePreferences.read() }
+        // Handed to the row before anything can return early: a launch that checks nothing
+        // because the window has not passed still knows when the last check was, and the
+        // stored stamp is the only thing that can say it.
+        _uiState.update {
+            it.copy(
+                autoCheckBank = stored.autoCheckBank,
+                bankEarlierCheckAtMillis = stored.lastBankCheckAt.takeIf { stamp -> stamp > 0 },
+            )
+        }
         // The switch is the whole point: off means this panel does not talk to the release
-        // endpoint unless the user presses 「检查更新」. Checked here rather than at the
-        // call site so every entry path honours it.
-        if (!_uiState.value.autoCheckBank) return
+        // endpoint unless the user presses 「检查更新」.
+        if (!stored.autoCheckBank) return false
+        val since = clock() - stored.lastBankCheckAt
+        if (stored.lastBankCheckAt > 0 && since < bankCheckIntervalMillis) return false
+        // Remembered rather than dropped when the startup read is still running: on a fresh
+        // install this check is what puts the download button on an empty card.
         entryCheckPending = true
-        startBankCheck(silent = true)
+        if (!startBankCheck(silent = true)) return false
+        // Waited for, so the timer that starts next computes its first due time from a
+        // timestamp this check has already written. Started beside it instead, that wake
+        // could read the stale stamp, decide the check was due long ago, and ask the
+        // endpoint a second time a minute later — two requests where the design is one.
+        val attempt = bankUpdateJob
+        attempt?.join()
+        if (attempt?.isCancelled == true) {
+            // Something claimed the slot while this check was dialing — the user pressed
+            // 「检查更新」, or a round started. The endpoint *was* asked, so the window starts
+            // from this attempt: without it the timer would begin with no reference at all,
+            // read that as 「从没查过」, and ask again the moment it started. A takeover writes
+            // its own, later stamp a moment after this one, and the later one wins.
+            lastBankCheckAtMillis = clock()
+            withContext(ioDispatcher) { updatePreferences.setLastBankCheckAt(clock()) }
+        }
+        return true
+    }
+
+    /**
+     * The check the app runs by itself while it stays open.
+     *
+     * One loop for the activity-scoped view model, and each wake waits until the next check
+     * is *due* — the remaining time computed from the stored timestamp — rather than a fixed
+     * period. That is what keeps a manual check and this one from stacking: if the user
+     * pressed 「检查更新」 two hours ago, this wakes in four, because the timestamp that check
+     * wrote is also the one this reads.
+     *
+     * A wake that finds something else in flight steps back for a whole window instead of
+     * retrying: the only way to make progress here is to wait, and retrying in a tight loop
+     * would be a busy-wait on a disk read.
+     */
+    private fun ensureBankAutoCheckTimer() {
+        if (bankTimerJob?.isActive == true) return
+        bankTimerJob = viewModelScope.launch {
+            while (true) {
+                val stored = withContext(ioDispatcher) { updatePreferences.read() }
+                if (!stored.autoCheckBank) {
+                    // Still wakes on schedule while the switch is off, so turning it back on
+                    // does not inherit a wait that started before it was turned off.
+                    delay(bankCheckIntervalMillis)
+                    continue
+                }
+                // `max` of the stored stamp and this process's own: the stored one is what
+                // survives a restart, and the in-memory one is what keeps the loop honest if
+                // that write never landed.
+                val reference = maxOf(stored.lastBankCheckAt, lastBankCheckAtMillis)
+                val dueAt = if (reference > 0) reference + bankCheckIntervalMillis else 0L
+                val wait = dueAt - clock()
+                if (wait > 0) {
+                    // Not due yet: sleep towards it — never less than [MIN_WAKE_MILLIS],
+                    // never more than a window — and then decide again from scratch rather
+                    // than treating the wake itself as "due". The bounds can move the wake
+                    // off the exact due time in either direction, and by then the stamp may
+                    // have moved on (a check the user pressed, or this loop's own previous
+                    // one landing late); deciding again is what keeps the loop's timing a
+                    // property of the stamps rather than of when it happened to wake.
+                    delay(wait.coerceIn(MIN_WAKE_MILLIS, bankCheckIntervalMillis))
+                    continue
+                }
+                if (!startBankCheck(silent = true)) {
+                    // A wake that finds the slot taken — a round in flight, the startup read
+                    // still running, another check dialing — steps back for a whole window
+                    // instead of retrying: the only way to make progress is to wait, and
+                    // retrying in a tight loop would be a busy-wait on a disk read.
+                    delay(bankCheckIntervalMillis)
+                    continue
+                }
+                // Waited for, so the loop's next wake is computed from the timestamp this
+                // check wrote: recomputing while it was still in flight would find the old
+                // stamp, call the window "due", and sleep a whole extra window.
+                bankUpdateJob?.join()
+                // And then the same floor as above, for the case a completed check would
+                // otherwise decide again immediately: if neither timestamp moved — the write
+                // failed *and* the in-memory copy is gone — the arithmetic says "due" forever.
+                // One iteration per minute is a visible mistake; without this it is a tight
+                // loop that no assertion can even reach, because it never suspends.
+                delay(MIN_WAKE_MILLIS)
+            }
+        }
     }
 
     /**
@@ -1590,27 +1738,29 @@ class FingerprintViewModel(
         preferenceJob = viewModelScope.launch { updatePreferences.setAutoCheckBank(enabled) }
     }
 
-    private fun startBankCheck(silent: Boolean) {
+    /** @return true when a check was launched, false when something else owned the slot. */
+    private fun startBankCheck(silent: Boolean): Boolean {
         val state = _uiState.value
         // A round in flight wins: swapping the package underneath it would leave it scoring
         // with one package while its rows report a ranking from another.
         if (state.isRunning || state.isLoading || state.isInstallingBank) {
             // Said out loud: a button that quietly does nothing reads as a broken button.
             if (!silent) showMessage("检测正在进行，请稍候再试", isError = true)
-            return
+            return false
         }
-        if (state.isCheckingBankUpdate) return
-        // A second panel entry while the first silent check is still dialing: keep the
-        // job the takeover path knows how to cancel instead of stranding it and opening a
-        // duplicate request nobody owns. The check in flight already owes the offer, so
-        // nothing is left pending either.
+        if (state.isCheckingBankUpdate) return false
+        // A second automatic check while the first one is still dialing: keep the job the
+        // takeover path knows how to cancel instead of stranding it and opening a duplicate
+        // request nobody owns. The check in flight already owes the offer, so nothing is
+        // left pending either.
         if (silent && state.isCheckingBankInBackground) {
             entryCheckPending = false
-            return
+            return false
         }
         if (!silent) standDownBackgroundCheck()
         entryCheckPending = false
         bankUpdateJob = viewModelScope.launch { checkBankUpdateNow(silent) }
+        return true
     }
 
     /**
@@ -1669,6 +1819,12 @@ class FingerprintViewModel(
                 if (silent) it.copy(isCheckingBankInBackground = false) else it.copy(isCheckingBankUpdate = false)
             }
         }
+        // Recorded for every outcome: the throttle is about how often the endpoint is asked,
+        // not about how the last answer went. A cancelled check never reaches this line, which
+        // is what keeps "让位」 from counting as a check. The in-memory copy is written first,
+        // so a failing write cannot leave the timer thinking this check never happened.
+        lastBankCheckAtMillis = clock()
+        withContext(ioDispatcher) { updatePreferences.setLastBankCheckAt(clock()) }
     }
 
     private fun applyCheckResult(check: BankUpdateCheck, silent: Boolean) {
@@ -1861,6 +2017,15 @@ class FingerprintViewModel(
          * it, and this is only used before one is installed.
          */
         const val DEFAULT_MINIMUM_VALID_NUMBERS = 80
+
+        /**
+         * The shortest gap between two wakes of the periodic package check.
+         *
+         * Far below the six-hour window, so it never delays a check anyone was waiting for;
+         * its job is to bound the damage if some path ever computes a due time in the past —
+         * without it that is a tight loop against the feed rather than a slow one.
+         */
+        private const val MIN_WAKE_MILLIS = 60_000L
 
         fun factory(context: Context): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")

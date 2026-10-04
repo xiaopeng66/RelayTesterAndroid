@@ -3,6 +3,8 @@ package com.relaytester.app
 import com.relaytester.app.core.storage.UpdatePreferencesState
 import com.relaytester.app.core.update.AppUpdateClient
 import com.relaytester.app.feature.update.AppUpdateUiState
+import com.relaytester.app.feature.update.appCheckOutcome
+import com.relaytester.app.ui.components.UpdateCheckOutcome
 import com.relaytester.app.feature.update.AppUpdateViewModel
 import com.relaytester.app.feature.update.InstalledAppVersion
 import java.io.IOException
@@ -198,6 +200,21 @@ class AppUpdateViewModelTest {
         assertEquals("到点没有自动检查", 1, fetcher.urls.size)
         assertEquals(now, preferences.state.lastAppCheckAt)
         assertNull("常开时的自动检查报了消息", subject.uiState.value.message)
+    }
+
+    @Test
+    fun `a launch inside the window still says when the last check was`() {
+        // Same as the detection package's card: no check this launch, but the stored stamp is
+        // still a fact worth printing, and printing it must not claim a verdict.
+        val lastCheck = fixedNow - 60 * 60 * 1000L
+        val fetcher = FakeHttpFetcher().apply { publishApp(apk) }
+        val preferences = MemoryUpdatePreferences(UpdatePreferencesState(lastAppCheckAt = lastCheck))
+        val subject = viewModel(fetcher = fetcher, preferences = preferences)
+
+        assertFalse("窗口内不该查", runBlocking { subject.checkOnLaunch() })
+        assertEquals(emptyList<String>(), fetcher.urls)
+        assertEquals(lastCheck, subject.uiState.value.earlierCheckAtMillis)
+        assertEquals(UpdateCheckOutcome.EARLIER_CHECK, appCheckOutcome(subject.uiState.value))
     }
 
     @Test

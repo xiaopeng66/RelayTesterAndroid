@@ -119,6 +119,10 @@ internal fun bankCheckOutcome(state: FingerprintUiState): UpdateCheckOutcome = w
     state.bankCheckFailed -> UpdateCheckOutcome.FAILED
     state.bankNeedsNewerApp != null -> UpdateCheckOutcome.NEEDS_NEWER_APP
     state.availableBankUpdate != null -> UpdateCheckOutcome.OFFER
+    // This stamp came off the disk, not from a check this process ran: the time is real, the
+    // verdict is not, so the row prints the time alone.
+    state.bankCheckedAtMillis == null && state.bankEarlierCheckAtMillis != null ->
+        UpdateCheckOutcome.EARLIER_CHECK
     state.bankCheckedAtMillis == null -> UpdateCheckOutcome.NEVER_CHECKED
     else -> UpdateCheckOutcome.UP_TO_DATE
 }

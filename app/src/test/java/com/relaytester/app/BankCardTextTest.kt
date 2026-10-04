@@ -182,6 +182,27 @@ class BankCardTextTest {
     }
 
     @Test
+    fun `a stamp from an earlier launch is a time without a verdict`() {
+        // 窗口内的这次启动不查，于是盘上那个时间戳是本进程唯一知道的事实。把它读成
+        // 「从未查过」是错的（端点问过，只是不在这次启动），读成「已是最新」同样是错的
+        // （结论本进程没看到过）。
+        assertEquals(
+            UpdateCheckOutcome.EARLIER_CHECK,
+            bankCheckOutcome(FingerprintUiState(bankEarlierCheckAtMillis = 1_791_009_120_000L)),
+        )
+    }
+
+    @Test
+    fun `a check this process ran outranks the stamp it inherited`() {
+        val state = FingerprintUiState(
+            bankCheckedAtMillis = 1_791_009_120_000L,
+            bankEarlierCheckAtMillis = 1_791_005_000_000L,
+        )
+
+        assertEquals(UpdateCheckOutcome.UP_TO_DATE, bankCheckOutcome(state))
+    }
+
+    @Test
     fun `an offer and a newer-app demand each map to their own outcome`() {
         assertEquals(
             UpdateCheckOutcome.OFFER,

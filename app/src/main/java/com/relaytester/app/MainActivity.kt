@@ -74,6 +74,11 @@ private fun RelayTesterApp() {
         // The launch check: throttled inside the view model, and it stays off when the
         // switch is off. Keyed on nothing, so it runs once per activity, not per tab switch.
         LaunchedEffect(Unit) { appUpdateViewModel.checkOnLaunch() }
+        // The detection package's automatic check runs on the same terms — once per launch,
+        // timed from a stored timestamp, plus a six-hour timer while the app stays open. It
+        // used to hang off opening the fingerprint panel, which made every switch between
+        // the three tabs re-ask the endpoint and reset the card's「上次检查」row.
+        LaunchedEffect(Unit) { fingerprintViewModel.checkBankOnLaunch() }
 
         // A Box only so the snackbar host below can sit at the bottom edge; the
         // screens keep their own layout.

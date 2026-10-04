@@ -7,6 +7,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
@@ -48,6 +49,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.LocalRippleConfiguration
+import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedCard
@@ -124,9 +126,9 @@ fun FingerprintScreen(
     LaunchedEffect(activeDestination) {
         if (activeDestination == AppDestination.FINGERPRINT) {
             viewModel.refreshCatalogue()
-            // A package published since the last visit should be on the card already,
-            // rather than waiting for the user to think of pressing "检查更新".
-            viewModel.refreshBankOnEntry()
+            // 检测包的自动检查不在这里：它挂在「打开 App 一次 + 常驻 6 小时定时器」上
+            // （见 FingerprintViewModel.checkBankOnLaunch）。挂在进面板上时，切三大界面
+            // 来回一次就重查一次，卡片上的「上次检查」跟着跳。
         }
     }
 
@@ -484,6 +486,8 @@ private fun HistoryDialog(
                             } else {
                                 MaterialTheme.colorScheme.error
                             },
+                            // 只有报错那一支降重，成功的绿色结论仍是标签的 Medium。
+                            fontWeight = if (entry.error == null) null else ERROR_MESSAGE_WEIGHT,
                         )
                         Text(
                             buildString {
@@ -558,7 +562,9 @@ private fun ReferenceBankCard(
     val isCheckingQuietly = state.isCheckingBankInBackground
     // Fixed for as long as the timestamp it describes: "今天 14:32" only changes when
     // midnight passes, and re-reading the clock on every recomposition buys nothing.
-    val nowMillis = remember(state.bankCheckedAtMillis) { System.currentTimeMillis() }
+    val nowMillis = remember(state.bankCheckedAtMillis, state.bankEarlierCheckAtMillis) {
+        System.currentTimeMillis()
+    }
     OutlinedCard {
         Column(
             modifier = Modifier.fillMaxWidth().padding(14.dp),
@@ -607,7 +613,9 @@ private fun ReferenceBankCard(
             UpdateStatusRow(
                 text = updateCheckLine(
                     isChecking = isCheckingQuietly,
-                    checkedAtMillis = state.bankCheckedAtMillis,
+                    // This process's own finished check first: a check made here knows its
+                    // verdict, the stamp off the disk does not.
+                    checkedAtMillis = state.bankCheckedAtMillis ?: state.bankEarlierCheckAtMillis,
                     outcome = bankCheckOutcome(state),
                     nowMillis = nowMillis,
                 ),
@@ -661,7 +669,7 @@ private fun ReferenceBankCard(
             }
 
             // 「检查更新」与「删除检测包」并排两栏（等宽），「下载/更新检测包」是这张卡上
-            // 唯一的主操作，单独占一行。三个标签都短到半栏放得下，且一律单行不换行。
+            // 唯一的主操作，单独占一行。
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -679,27 +687,18 @@ private fun ReferenceBankCard(
                         )
                         Spacer(Modifier.width(8.dp))
                     }
-                    Text(
-                        "检查更新",
-                        maxLines = 1,
-                        softWrap = false,
-                        overflow = TextOverflow.Ellipsis,
-                    )
+                    ButtonLabel("检查更新")
                 }
                 if (state.bankSource != BankSource.NOT_PROVISIONED) {
-                    // 文字按钮而不是第二个实心框：删除是破坏性操作，同高不同重，位置对
-                    // 齐、视觉上仍明显是次要动作。
-                    TextButton(
+                    // 与「检查更新」同一个 M3 默认描边样式：两个按钮是一对并列动作，一个
+                    // 有框一个没有，看着像没画完（用户反馈）。要能跟下面「查看支持的模型」
+                    // 区分开，靠的是那个按钮的 primary 色描边加图标，不是这两栏的不对称。
+                    OutlinedButton(
                         onClick = onRemovePackage,
                         enabled = !busy,
                         modifier = Modifier.weight(1f).heightIn(min = 48.dp),
                     ) {
-                        Text(
-                            "删除检测包",
-                            maxLines = 1,
-                            softWrap = false,
-                            overflow = TextOverflow.Ellipsis,
-                        )
+                        ButtonLabel("删除检测包")
                     }
                 }
             }
@@ -796,6 +795,38 @@ private fun ReferenceBankCard(
 }
 
 /**
+ * A one-line button label that shrinks instead of being cut off.
+ *
+ * The card under 检测包 is the only place with two labels side by side in half-width columns, and
+ * at the 2.0× system font scale both stop fitting: 「删除检测包」 renders as 「删除检测…」 and the
+ * roster button as 「查看支持的模型（58 …」 (device measurement, API 35 emulator). These strings
+ * are copy, not layout, so the label gives up size rather than a character. The measurement is
+ * the one the 有效 8/8 column already does — Compose 1.7 has no scale-to-fit text and the app
+ * carries no dependency that would add one. At the normal scale the text already fits, so the
+ * style and therefore the rendering are untouched.
+ */
+@Composable
+private fun ButtonLabel(text: String) {
+    val measurer = rememberTextMeasurer()
+    val density = LocalDensity.current
+    val style = LocalTextStyle.current
+    BoxWithConstraints {
+        val available = maxWidth
+        val natural = with(density) {
+            measurer.measure(text, style, maxLines = 1, softWrap = false).size.width.toDp()
+        }
+        val fitted = if (natural > available) {
+            // 0.98 keeps the rounding of the scaled font from landing a hair over the edge
+            // and clipping the last glyph.
+            style.copy(fontSize = style.fontSize * (available / natural) * 0.98f)
+        } else {
+            style
+        }
+        Text(text, style = fitted, maxLines = 1, softWrap = false)
+    }
+}
+
+/**
  * Which models the package in use can identify.
  *
  * 53 entries would push the rest of the panel off screen, so the roster lives in a dialog
@@ -818,11 +849,7 @@ private fun SupportedModelsButton(models: List<BankModelInfo>) {
             modifier = Modifier.size(18.dp),
         )
         Spacer(Modifier.width(8.dp))
-        Text(
-            "查看支持的模型（${models.size} 个）",
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
+        ButtonLabel("查看支持的模型（${models.size} 个）")
     }
     if (open) {
         SupportedModelsDialog(models = models, onDismiss = { open = false })
@@ -1285,6 +1312,13 @@ private fun BatchResultList(results: List<ModelFingerprintResult>) {
                                     ModelDetectionStatus.RUNNING -> Color(0xFF1D4ED8)
                                     ModelDetectionStatus.PENDING -> MaterialTheme.colorScheme.onSurfaceVariant
                                 },
+                                // 同样是「只有报错那一支降重」：等待/进行中/结论这些标签
+                                // 保持 Medium，失败理由跟着格子里的报错一起用 Normal。
+                                fontWeight = if (row.status == ModelDetectionStatus.FAILED) {
+                                    ERROR_MESSAGE_WEIGHT
+                                } else {
+                                    null
+                                },
                                 maxLines = 2,
                             )
                         }
@@ -1386,6 +1420,17 @@ private val MODELS_DIALOG_MAX_HEIGHT = 380.dp
 
 /** Past this the history list scrolls; 50 entries would never fit otherwise. */
 private val HISTORY_DIALOG_MAX_HEIGHT = 420.dp
+
+/**
+ * The weight every line that reports a failure is drawn at.
+ *
+ * `labelSmall` carries Material 3's default `FontWeight.Medium`, and a Medium *CJK* face is
+ * visibly heavier than a Medium Latin one — an error that mixes the two (「HTTP 403」 next to
+ * a Chinese reason) came out looking like two different weights, with the Chinese side the
+ * bold one. Dropping failure text to Normal makes both scripts render at the same weight, and
+ * puts error lines on the same footing as the body text around them.
+ */
+private val ERROR_MESSAGE_WEIGHT = FontWeight.Normal
 
 /** Where the detection package's reference data comes from. */
 private const val LM_DETECTOR_URL = "https://github.com/Ikaleio/lm-detector"
@@ -1685,11 +1730,17 @@ private fun ChallengeCell(
                     error,
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.error,
+                    fontWeight = ERROR_MESSAGE_WEIGHT,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                 )
             }
             if (retryable) {
+                // 失败理由占 0/1/2 行，格子本身又靠 IntrinsicSize.Min 跟同组另外两格等
+                // 高，所以上面那行一变长，「重试」就被顶下去 —— 三格里同一排按钮凑不到一
+                // 个水平高度（用户反馈）。留白放在理由下面：弹簧吃掉剩余空间，按钮永远贴
+                // 格子底边，三格等高时三枚按钮同高；理由多的格子空白自然就少。
+                Spacer(Modifier.weight(1f))
                 // 一枚居中的小芯片，住在一整格宽、48dp 高的触控条里。原来用 M3 的
                 // TextButton：它把 11sp 的「重试」放进一个 58×48dp 的盒子，还按 Column
                 // 的默认 Start 对齐贴着格子左缘 —— 于是看起来是一段悬在左边的小字，

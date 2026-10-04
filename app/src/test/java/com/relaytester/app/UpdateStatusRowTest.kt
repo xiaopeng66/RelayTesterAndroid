@@ -100,6 +100,17 @@ class UpdateStatusRowTest {
     }
 
     @Test
+    fun `a check from an earlier process prints the time and nothing else`() {
+        // 定时节流让「这次启动不查」成为常态，那一刻盘上有时间戳、但本进程没有任何结论。
+        // 印时间不印结论是这条信息唯一诚实的样子；多一个「 · 已是最新」就是在替端点断言。
+        val line = line(checkedAtMillis = now, outcome = UpdateCheckOutcome.EARLIER_CHECK)
+
+        assertEquals("上次检查：今天 14:32", line)
+        assertFalse(line.contains("·"))
+        assertEquals("", outcomeLabel(UpdateCheckOutcome.EARLIER_CHECK))
+    }
+
+    @Test
     fun `every outcome has its own label`() {
         val labels = UpdateCheckOutcome.entries.map { outcomeLabel(it) }
 

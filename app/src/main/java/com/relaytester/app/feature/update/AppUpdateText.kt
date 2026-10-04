@@ -38,6 +38,9 @@ internal fun appCheckOutcome(state: AppUpdateUiState): UpdateCheckOutcome = when
     state.checkFailed -> UpdateCheckOutcome.FAILED
     state.otherPackage != null -> UpdateCheckOutcome.NEEDS_NEWER_APP
     state.available != null -> UpdateCheckOutcome.OFFER
+    // A stamp read off the disk carries a time but no verdict; see the enum's own note.
+    state.checkedAtMillis == null && state.earlierCheckAtMillis != null ->
+        UpdateCheckOutcome.EARLIER_CHECK
     state.checkedAtMillis == null -> UpdateCheckOutcome.NEVER_CHECKED
     else -> UpdateCheckOutcome.UP_TO_DATE
 }

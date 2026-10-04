@@ -6,7 +6,6 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
@@ -39,6 +38,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
@@ -76,7 +76,9 @@ fun UpdateDialog(
     val state by appViewModel.uiState.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
-    val nowMillis = remember(state.checkedAtMillis) { System.currentTimeMillis() }
+    val nowMillis = remember(state.checkedAtMillis, state.earlierCheckAtMillis) {
+        System.currentTimeMillis()
+    }
 
     // This page is a window of its own, so the host MainActivity keeps for the launch-time
     // news sits behind it: the failures and messages produced while it is open need a host
@@ -95,14 +97,17 @@ fun UpdateDialog(
             decorFitsSystemWindows = false,
         ),
     ) {
-        Box(modifier = Modifier.fillMaxSize()) {
+        // 高度随内容收缩，只留一个上限：以前这里写死 0.9 屏高，检测包卡片搬走以后内容少
+        // 了一大块，窗口却还是那么大，底下空一片。上限之外的部分交给内容自己的滚动。
+        val maxSheetHeight = (LocalConfiguration.current.screenHeightDp * 0.9f).dp
+        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Surface(
-                modifier = Modifier.fillMaxWidth(0.94f).fillMaxHeight(0.9f),
+                modifier = Modifier.fillMaxWidth(0.94f).heightIn(max = maxSheetHeight),
                 shape = MaterialTheme.shapes.extraLarge,
                 tonalElevation = 6.dp,
                 shadowElevation = 10.dp,
             ) {
-                Column(modifier = Modifier.fillMaxSize()) {
+                Column(modifier = Modifier.fillMaxWidth()) {
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp, top = 12.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -121,7 +126,7 @@ fun UpdateDialog(
 
                     Column(
                         modifier = Modifier
-                            .weight(1f)
+                            .fillMaxWidth()
                             .verticalScroll(rememberScrollState())
                             .padding(horizontal = 20.dp, vertical = 16.dp),
                         verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -227,7 +232,8 @@ private fun AppUpdateCard(
             UpdateStatusRow(
                 text = updateCheckLine(
                     isChecking = state.isCheckingQuietly,
-                    checkedAtMillis = state.checkedAtMillis,
+                    // This process's own check first; the stamp off the disk has no verdict.
+                    checkedAtMillis = state.checkedAtMillis ?: state.earlierCheckAtMillis,
                     outcome = appCheckOutcome(state),
                     nowMillis = nowMillis,
                 ),

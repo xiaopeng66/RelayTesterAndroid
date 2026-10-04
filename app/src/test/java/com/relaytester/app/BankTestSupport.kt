@@ -457,4 +457,10 @@ internal class MemoryUpdatePreferences(
         if (dropWrites) return
         state = state.copy(lastAppCheckAt = millis)
     }
+
+    override suspend fun setLastBankCheckAt(millis: Long) {
+        if (writeFails) throw IOException("写入更新开关失败")
+        if (dropWrites) return
+        state = state.copy(lastBankCheckAt = millis)
+    }
 }
