@@ -46,5 +46,5 @@
 - 文件：`RelayTester-v1.6.0-android.apk`
 - 包名：`com.relaytester.app`
 - 版本代码：`10600`
-- 字节数：`2,958,267`
-- SHA-256：`7265227a297cd9e48ff081d25e3cc5f0a42dd0afbf968c68d2d73bb7e003b2de`
+- 字节数：`2,958,139`
+- SHA-256：`c02fd5857289389468d3344d723c32d40f6b8477225511417af361b0801850a6`

@@ -48,9 +48,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.relaytester.app.ui.components.DialogDismissScrim
 import com.relaytester.app.ui.components.UpdateDownloadRow
 import com.relaytester.app.ui.components.UpdateStatusRow
 import com.relaytester.app.ui.components.openUriSafely
+import com.relaytester.app.ui.components.rememberDialogWindowBox
 import com.relaytester.app.ui.components.updateCheckLine
 
 /** The project's public repository, shown as the dialog's one outbound link. */
@@ -90,17 +92,23 @@ fun UpdateDialog(
         appViewModel.clearMessage()
     }
 
+    // 卡片要占屏宽 94%（平台默认窗口只给约 320dp），所以得关掉平台的默认宽度——代价是 Compose
+    // 会按整屏测量内容，内容盒比窗口还高，贴底的东西会被裁到屏幕外。盒子的大小因此自己说：
+    // Modifier.dialogWindowBox() 把内容盒定成窗口真正能占的那块（[0,128]-[1080,2337]）。
+    // decorFitsSystemWindows 与这套几何无关：本机 ≥S 时它只影响窗口主题，<S 才影响软键盘模式
+    // 与 windowIsFloating，所以这里按默认值走。
+    // 在弹窗**外面**算好这块盒子的尺寸：弹窗自己的窗口夹在状态栏与导航栏之间，在里面读内边距
+    // 一律是 0，算出来就是整屏高（这个修复就没用了）。返回值是普通 Modifier，可以带进弹窗内容。
+    val windowBox = rememberDialogWindowBox()
     Dialog(
         onDismissRequest = onDismiss,
-        properties = DialogProperties(
-            usePlatformDefaultWidth = false,
-            decorFitsSystemWindows = false,
-        ),
+        properties = DialogProperties(usePlatformDefaultWidth = false),
     ) {
         // 高度随内容收缩，只留一个上限：以前这里写死 0.9 屏高，检测包卡片搬走以后内容少
         // 了一大块，窗口却还是那么大，底下空一片。上限之外的部分交给内容自己的滚动。
         val maxSheetHeight = (LocalConfiguration.current.screenHeightDp * 0.9f).dp
-        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Box(modifier = windowBox, contentAlignment = Alignment.Center) {
+            DialogDismissScrim(onDismiss = onDismiss)
             Surface(
                 modifier = Modifier.fillMaxWidth(0.94f).heightIn(max = maxSheetHeight),
                 shape = MaterialTheme.shapes.extraLarge,

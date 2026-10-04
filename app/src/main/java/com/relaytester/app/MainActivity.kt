@@ -6,6 +6,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.LaunchedEffect
@@ -145,7 +146,11 @@ private fun RelayTesterApp() {
         if (!showUpdates) {
             SnackbarHost(
                 hostState = updateSnackbarHostState,
-                modifier = Modifier.align(Alignment.BottomCenter),
+                // 活动窗口是 edge-to-edge（内容铺到导航栏底下），而这个宿主不在 Scaffold 里，
+                // 没人替它避开导航栏：不补这一下，卡片会压在导航栏上。补上以后它和三个页面里
+                // Scaffold 宿主（Scaffold 自己会吃掉导航栏内边距）以及更新弹窗里那个宿主落在
+                // 同一个位置——都在导航栏上沿。
+                modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding(),
             )
             LaunchedEffect(appUpdateState.message) {
                 val text = appUpdateState.message ?: return@LaunchedEffect

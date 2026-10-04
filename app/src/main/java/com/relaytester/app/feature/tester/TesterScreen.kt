@@ -114,8 +114,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.relaytester.app.core.model.ModelTestResult
 import com.relaytester.app.core.model.ModelCatalogEntry
@@ -129,9 +129,11 @@ import com.relaytester.app.core.model.matchesAnyModelFilterTerm
 import com.relaytester.app.core.model.mergeModelFilterTerms
 import com.relaytester.app.core.network.RelayBaseUrl
 import com.relaytester.app.ui.navigation.AppDestination
+import com.relaytester.app.ui.components.DialogDismissScrim
 import com.relaytester.app.ui.components.QuietIconButton
 import com.relaytester.app.ui.components.RelayAppHeader
 import com.relaytester.app.ui.components.copyToClipboard
+import com.relaytester.app.ui.components.rememberDialogWindowBox
 import java.io.OutputStreamWriter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -892,107 +894,117 @@ private fun SupplierConfigurationDialog(
     onTestingDisabledChange: (Boolean) -> Unit,
     onSave: () -> Unit,
 ) {
+    // 卡片要占屏宽 94%，所以关掉平台的默认宽度（它只给约 320dp）；代价是 Compose 会按整屏测量
+    // 内容，盒子的高度得自己按窗口算，见 rememberDialogWindowBox()——注意在弹窗**外面**调用：
+    // 弹窗窗口夹在状态栏与导航栏之间，在里面读内边距一律是 0。
+    val windowBox = rememberDialogWindowBox()
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false),
     ) {
-        Box(modifier = Modifier.fillMaxWidth(0.94f)) {
-            Surface(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 44.dp),
-                shape = MaterialTheme.shapes.extraLarge,
-                tonalElevation = 6.dp,
-                shadowElevation = 10.dp,
-            ) {
-                Column(modifier = Modifier.fillMaxWidth()) {
-                    Box(modifier = Modifier.fillMaxWidth()) {
+        // 外层这层是为了「点到卡片外就关掉」：内容铺满整个窗口时，平台看不到「在窗口内但在卡片外」
+        // 的点击，dismissOnClickOutside 不会触发，遮罩只能自己画（见 DialogDismissScrim）。
+        // 它同时把内容居中——卡片的高度随内容走，居中得自己说。
+        Box(modifier = windowBox, contentAlignment = Alignment.Center) {
+            DialogDismissScrim(onDismiss = onDismiss)
+            Box(modifier = Modifier.fillMaxWidth(0.94f)) {
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 44.dp),
+                    shape = MaterialTheme.shapes.extraLarge,
+                    tonalElevation = 6.dp,
+                    shadowElevation = 10.dp,
+                ) {
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Box(modifier = Modifier.fillMaxWidth()) {
+                            Column(
+                                modifier = Modifier.padding(
+                                    start = 24.dp,
+                                    end = 64.dp,
+                                    top = 20.dp,
+                                    bottom = 20.dp,
+                                ),
+                                verticalArrangement = Arrangement.spacedBy(2.dp),
+                            ) {
+                                Text("供应商配置", style = MaterialTheme.typography.headlineSmall)
+                                Text(
+                                    draft.name,
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                            // Destructive control lives inside the card's own top-right
+                            // corner so it reads as part of this supplier's sheet.
+                            IconButton(
+                                onClick = onDelete,
+                                enabled = enabled && deleteEnabled,
+                                modifier = Modifier
+                                    .align(Alignment.TopEnd)
+                                    .padding(end = 12.dp, top = 12.dp)
+                                    .size(44.dp),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Outlined.DeleteOutline,
+                                    contentDescription = if (deleteEnabled) {
+                                        "删除该供应商"
+                                    } else {
+                                        "至少保留一个供应商，无法删除"
+                                    },
+                                    tint = MaterialTheme.colorScheme.error,
+                                )
+                            }
+                        }
                         Column(
-                            modifier = Modifier.padding(
-                                start = 24.dp,
-                                end = 64.dp,
-                                top = 20.dp,
-                                bottom = 20.dp,
-                            ),
-                            verticalArrangement = Arrangement.spacedBy(2.dp),
-                        ) {
-                            Text("供应商配置", style = MaterialTheme.typography.headlineSmall)
-                            Text(
-                                draft.name,
-                                style = MaterialTheme.typography.labelLarge,
-                                color = MaterialTheme.colorScheme.primary,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
-                        // Destructive control lives inside the card's own top-right
-                        // corner so it reads as part of this supplier's sheet.
-                        IconButton(
-                            onClick = onDelete,
-                            enabled = enabled && deleteEnabled,
                             modifier = Modifier
-                                .align(Alignment.TopEnd)
-                                .padding(end = 12.dp, top = 12.dp)
-                                .size(44.dp),
+                                .fillMaxWidth()
+                                .heightIn(max = 480.dp)
+                                .verticalScroll(rememberScrollState())
+                                .padding(horizontal = 24.dp),
+                            verticalArrangement = Arrangement.spacedBy(12.dp),
                         ) {
-                            Icon(
-                                imageVector = Icons.Outlined.DeleteOutline,
-                                contentDescription = if (deleteEnabled) {
-                                    "删除该供应商"
-                                } else {
-                                    "至少保留一个供应商，无法删除"
-                                },
-                                tint = MaterialTheme.colorScheme.error,
+                            SupplierConfigurationForm(
+                                draft = draft,
+                                errors = errors,
+                                enabled = enabled,
+                                isSecretsHydrating = isSecretsHydrating,
+                                onNameChange = onNameChange,
+                                onBaseUrlChange = onBaseUrlChange,
+                                onProtocolChange = onProtocolChange,
+                                onApiKeyChange = onApiKeyChange,
+                                onTestingDisabledChange = onTestingDisabledChange,
                             )
                         }
-                    }
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(max = 480.dp)
-                            .verticalScroll(rememberScrollState())
-                            .padding(horizontal = 24.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp),
-                    ) {
-                        SupplierConfigurationForm(
-                            draft = draft,
-                            errors = errors,
-                            enabled = enabled,
-                            isSecretsHydrating = isSecretsHydrating,
-                            onNameChange = onNameChange,
-                            onBaseUrlChange = onBaseUrlChange,
-                            onProtocolChange = onProtocolChange,
-                            onApiKeyChange = onApiKeyChange,
-                            onTestingDisabledChange = onTestingDisabledChange,
-                        )
-                    }
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 24.dp, vertical = 12.dp),
-                        horizontalArrangement = Arrangement.End,
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        TextButton(onClick = onDismiss, modifier = Modifier.heightIn(min = 48.dp)) {
-                            Text("关闭")
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 24.dp, vertical = 12.dp),
+                            horizontalArrangement = Arrangement.End,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            TextButton(onClick = onDismiss, modifier = Modifier.heightIn(min = 48.dp)) {
+                                Text("关闭")
+                            }
+                            Spacer(Modifier.width(8.dp))
+                            Button(
+                                onClick = onSave,
+                                enabled = enabled,
+                                modifier = Modifier.heightIn(min = 48.dp),
+                            ) { Text("保存供应商") }
                         }
-                        Spacer(Modifier.width(8.dp))
-                        Button(
-                            onClick = onSave,
-                            enabled = enabled,
-                            modifier = Modifier.heightIn(min = 48.dp),
-                        ) { Text("保存供应商") }
                     }
                 }
-            }
-            if (saveCompletedAt > 0L) {
-                Toast(
-                    message = "供应商配置已保存",
-                    modifier = Modifier
-                        .align(Alignment.TopCenter)
-                        .padding(top = 4.dp),
-                    onToastShown = onToastShown,
-                )
+                if (saveCompletedAt > 0L) {
+                    Toast(
+                        message = "供应商配置已保存",
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .padding(top = 4.dp),
+                        onToastShown = onToastShown,
+                    )
+                }
             }
         }
     }
@@ -2560,269 +2572,236 @@ private fun ModelCatalogDialog(
         onClearPicker()
     }
 
+    // 卡片要占屏宽 94%，所以关掉平台的默认宽度（它只给约 320dp）；代价是 Compose 会按整屏测量
+    // 内容，卡片「可用高度的九成」也就跟着算错（比可见窗口还高、底部一截在屏幕外），盒子的高度
+    // 得自己按窗口算，见 rememberDialogWindowBox()——同样要在弹窗外面调用。
+    val windowBox = rememberDialogWindowBox()
     Dialog(
         onDismissRequest = onDismiss,
-        properties = DialogProperties(
-            usePlatformDefaultWidth = false,
-            decorFitsSystemWindows = false,
-        ),
+        properties = DialogProperties(usePlatformDefaultWidth = false),
     ) {
-        Surface(
-            modifier = Modifier
-                .fillMaxWidth(0.94f)
-                .fillMaxHeight(0.9f),
-            shape = MaterialTheme.shapes.extraLarge,
-            tonalElevation = 6.dp,
-            shadowElevation = 10.dp,
-        ) {
-            Column(modifier = Modifier.fillMaxSize()) {
-                Column(
-                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp),
-                ) {
-                    Text(
-                        if (editingEntryId == null) "高级测试" else "编辑模型来源",
-                        style = MaterialTheme.typography.headlineSmall,
-                    )
-                    Text(
-                        "同一模型可配多个供应商来源，分别检查连接。",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-                HorizontalDivider()
-                Column(
-                    modifier = Modifier
-                        .weight(1f)
-                        .verticalScroll(rememberScrollState())
-                        .padding(horizontal = 20.dp, vertical = 16.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
-                    AppTextField(
-                        value = entryName,
-                        onValueChange = { entryName = it },
-                        label = "模型名称",
-                        placeholder = "例如 GPT-4o（主用）",
-                        enabled = editingEnabled,
-                        errorMessage = entryNameError,
-                    )
-                    Text("来源管理", style = MaterialTheme.typography.titleSmall)
-                    Surface(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = MaterialTheme.shapes.medium,
-                        color = MaterialTheme.colorScheme.surfaceContainerLow,
-                        tonalElevation = 1.dp,
+        // 自绘遮罩 + 内容居中：内容铺满整个窗口时平台看不到「窗口内、卡片外」的点击，遮罩只能
+        // 自己画；卡片高度随内容走，居中由这层盒子来说。见 DialogDismissScrim。
+        Box(modifier = windowBox, contentAlignment = Alignment.Center) {
+            DialogDismissScrim(onDismiss = onDismiss)
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth(0.94f)
+                    .fillMaxHeight(0.9f),
+                shape = MaterialTheme.shapes.extraLarge,
+                tonalElevation = 6.dp,
+                shadowElevation = 10.dp,
+            ) {
+                Column(modifier = Modifier.fillMaxSize()) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
                     ) {
-                        Column(
-                            modifier = Modifier.padding(12.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        Text(
+                            if (editingEntryId == null) "高级测试" else "编辑模型来源",
+                            style = MaterialTheme.typography.headlineSmall,
+                        )
+                        Text(
+                            "同一模型可配多个供应商来源，分别检查连接。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    HorizontalDivider()
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .verticalScroll(rememberScrollState())
+                            .padding(horizontal = 20.dp, vertical = 16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        AppTextField(
+                            value = entryName,
+                            onValueChange = { entryName = it },
+                            label = "模型名称",
+                            placeholder = "例如 GPT-4o（主用）",
+                            enabled = editingEnabled,
+                            errorMessage = entryNameError,
+                        )
+                        Text("来源管理", style = MaterialTheme.typography.titleSmall)
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = MaterialTheme.shapes.medium,
+                            color = MaterialTheme.colorScheme.surfaceContainerLow,
+                            tonalElevation = 1.dp,
                         ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            Column(
+                                modifier = Modifier.padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
                             ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text("跨供应商检索", style = MaterialTheme.typography.titleSmall)
-                                }
-                                if (state.isCatalogSearching) {
-                                    CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-                                }
-                            }
-                            // 贴底对齐，再让出 MODEL_SEARCH_BUTTON_INSET：OutlinedTextField 的
-                            // 布局盒是 64dp，画出来的边框只占下面 56dp（顶端 8dp 留给浮动
-                            // 标签），按布局盒居中会让按钮看起来偏高。1.0× 与 2.0× 字号下都用
-                            // uiautomator 量过节点与可见边框。
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.Bottom,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            ) {
-                                OutlinedTextField(
-                                    value = catalogSearchKeyword,
-                                    onValueChange = { catalogSearchKeyword = it },
-                                    modifier = Modifier.weight(1f),
-                                    enabled = editingEnabled && !state.isCatalogSearching,
-                                    label = { Text("模型关键词") },
-                                    placeholder = { Text("例如 gpt、claude") },
-                                    singleLine = true,
-                                    leadingIcon = { Icon(Icons.Outlined.Search, contentDescription = null) },
-                                )
-                                Button(
-                                    onClick = {
-                                        selectedSearchKeys = emptySet()
-                                        onSearchAllModels(catalogSearchKeyword)
-                                        editingSearchKeyword = catalogSearchKeyword
-                                    },
-                                    enabled = editingEnabled && !state.isCatalogSearching && catalogSearchKeyword.isNotBlank(),
-                                    contentPadding = PaddingValues(horizontal = 12.dp),
-                                    modifier = Modifier
-                                        .padding(bottom = MODEL_SEARCH_BUTTON_INSET)
-                                        .heightIn(min = 48.dp),
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 ) {
-                                    Icon(Icons.Outlined.Search, contentDescription = null, modifier = Modifier.size(18.dp))
-                                    Spacer(Modifier.width(4.dp))
-                                    Text("检索", maxLines = 1, softWrap = false)
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text("跨供应商检索", style = MaterialTheme.typography.titleSmall)
+                                    }
+                                    if (state.isCatalogSearching) {
+                                        CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                                    }
                                 }
-                            }
-                            if (searchResults.isNotEmpty()) {
-                                val searchResultKeys = searchResults.map {
-                                    it.supplierId + "\u0000" + it.modelId
-                                }.toSet()
-                                val pendingSourceKeys = pendingSources.map {
-                                    it.supplierId + "\u0000" + it.modelId
-                                }.toSet().intersect(searchResultKeys)
-                                LaunchedEffect(searchResults, pendingSourceKeys) {
-                                    selectedSearchKeys = selectedSearchKeys
-                                        .intersect(searchResultKeys)
-                                        .subtract(pendingSourceKeys)
-                                }
-                                Text(
-                                    "找到 ${searchResults.size} 个模型，勾选后添加来源",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                                Column(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .heightIn(max = 240.dp)
-                                        .verticalScroll(rememberScrollState()),
+                                // 贴底对齐，再让出 MODEL_SEARCH_BUTTON_INSET：OutlinedTextField 的
+                                // 布局盒是 64dp，画出来的边框只占下面 56dp（顶端 8dp 留给浮动
+                                // 标签），按布局盒居中会让按钮看起来偏高。1.0× 与 2.0× 字号下都用
+                                // uiautomator 量过节点与可见边框。
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.Bottom,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 ) {
-                                    searchResults.forEach { result ->
-                                        val resultKey = result.supplierId + "\u0000" + result.modelId
-                                        val resultLock = resultKey in pendingSourceKeys
-                                        val checked = resultLock || resultKey in selectedSearchKeys
-                                        Row(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .clickable(
-                                                    enabled = editingEnabled && !resultLock,
-                                                    onClick = {
-                                                        selectedSearchKeys = if (checked) {
-                                                            selectedSearchKeys - resultKey
-                                                        } else {
-                                                            selectedSearchKeys + resultKey
+                                    OutlinedTextField(
+                                        value = catalogSearchKeyword,
+                                        onValueChange = { catalogSearchKeyword = it },
+                                        modifier = Modifier.weight(1f),
+                                        enabled = editingEnabled && !state.isCatalogSearching,
+                                        label = { Text("模型关键词") },
+                                        placeholder = { Text("例如 gpt、claude") },
+                                        singleLine = true,
+                                        leadingIcon = { Icon(Icons.Outlined.Search, contentDescription = null) },
+                                    )
+                                    Button(
+                                        onClick = {
+                                            selectedSearchKeys = emptySet()
+                                            onSearchAllModels(catalogSearchKeyword)
+                                            editingSearchKeyword = catalogSearchKeyword
+                                        },
+                                        enabled = editingEnabled && !state.isCatalogSearching && catalogSearchKeyword.isNotBlank(),
+                                        contentPadding = PaddingValues(horizontal = 12.dp),
+                                        modifier = Modifier
+                                            .padding(bottom = MODEL_SEARCH_BUTTON_INSET)
+                                            .heightIn(min = 48.dp),
+                                    ) {
+                                        Icon(Icons.Outlined.Search, contentDescription = null, modifier = Modifier.size(18.dp))
+                                        Spacer(Modifier.width(4.dp))
+                                        Text("检索", maxLines = 1, softWrap = false)
+                                    }
+                                }
+                                if (searchResults.isNotEmpty()) {
+                                    val searchResultKeys = searchResults.map {
+                                        it.supplierId + "\u0000" + it.modelId
+                                    }.toSet()
+                                    val pendingSourceKeys = pendingSources.map {
+                                        it.supplierId + "\u0000" + it.modelId
+                                    }.toSet().intersect(searchResultKeys)
+                                    LaunchedEffect(searchResults, pendingSourceKeys) {
+                                        selectedSearchKeys = selectedSearchKeys
+                                            .intersect(searchResultKeys)
+                                            .subtract(pendingSourceKeys)
+                                    }
+                                    Text(
+                                        "找到 ${searchResults.size} 个模型，勾选后添加来源",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .heightIn(max = 240.dp)
+                                            .verticalScroll(rememberScrollState()),
+                                    ) {
+                                        searchResults.forEach { result ->
+                                            val resultKey = result.supplierId + "\u0000" + result.modelId
+                                            val resultLock = resultKey in pendingSourceKeys
+                                            val checked = resultLock || resultKey in selectedSearchKeys
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .clickable(
+                                                        enabled = editingEnabled && !resultLock,
+                                                        onClick = {
+                                                            selectedSearchKeys = if (checked) {
+                                                                selectedSearchKeys - resultKey
+                                                            } else {
+                                                                selectedSearchKeys + resultKey
+                                                            }
+                                                        },
+                                                    )
+                                                    .heightIn(min = 48.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                            ) {
+                                                Checkbox(
+                                                    checked = checked,
+                                                    onCheckedChange = { nextChecked ->
+                                                        if (!resultLock) {
+                                                            selectedSearchKeys = if (nextChecked) {
+                                                                selectedSearchKeys + resultKey
+                                                            } else {
+                                                                selectedSearchKeys - resultKey
+                                                            }
                                                         }
                                                     },
+                                                    enabled = editingEnabled && !resultLock,
                                                 )
-                                                .heightIn(min = 48.dp),
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                        ) {
-                                            Checkbox(
-                                                checked = checked,
-                                                onCheckedChange = { nextChecked ->
-                                                    if (!resultLock) {
-                                                        selectedSearchKeys = if (nextChecked) {
-                                                            selectedSearchKeys + resultKey
-                                                        } else {
-                                                            selectedSearchKeys - resultKey
-                                                        }
-                                                    }
-                                                },
-                                                enabled = editingEnabled && !resultLock,
-                                            )
-                                            Column(modifier = Modifier.weight(1f)) {
-                                                Text(
-                                                    result.modelId,
-                                                    style = MaterialTheme.typography.bodyMedium,
-                                                    maxLines = 1,
-                                                    overflow = TextOverflow.Ellipsis,
-                                                )
-                                                Text(
-                                                    "来源：${result.supplierName}",
-                                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                                                    color = MaterialTheme.colorScheme.primary,
-                                                    maxLines = 1,
-                                                    overflow = TextOverflow.Ellipsis,
-                                                )
+                                                Column(modifier = Modifier.weight(1f)) {
+                                                    Text(
+                                                        result.modelId,
+                                                        style = MaterialTheme.typography.bodyMedium,
+                                                        maxLines = 1,
+                                                        overflow = TextOverflow.Ellipsis,
+                                                    )
+                                                    Text(
+                                                        "来源：${result.supplierName}",
+                                                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                                        color = MaterialTheme.colorScheme.primary,
+                                                        maxLines = 1,
+                                                        overflow = TextOverflow.Ellipsis,
+                                                    )
+                                                }
                                             }
                                         }
                                     }
-                                }
-                                val selectedSearchCount = selectedSearchKeys
-                                    .intersect(searchResultKeys)
-                                    .subtract(pendingSourceKeys)
-                                    .size
-                                val remainingSourceSlots = (MAX_MODEL_SOURCES_PER_ENTRY - pendingSources.size).coerceAtLeast(0)
-                                OutlinedButton(
-                                    onClick = {
-                                        val additions = searchResults
-                                            .filter { it.supplierId + "\u0000" + it.modelId in selectedSearchKeys }
-                                            .take(remainingSourceSlots)
-                                            .map { ModelSource(it.supplierId, it.modelId) }
-                                        pendingSources = (pendingSources + additions)
-                                            .distinctBy { it.supplierId + "\u0000" + it.modelId }
-                                        selectedSearchKeys = emptySet()
-                                    },
-                                    enabled = editingEnabled && selectedSearchCount > 0 && remainingSourceSlots > 0,
-                                    modifier = Modifier.heightIn(min = 44.dp),
-                                ) {
-                                    Icon(Icons.Outlined.Add, contentDescription = null, modifier = Modifier.size(18.dp))
-                                    Spacer(Modifier.width(4.dp))
-                                    Text("添加已选（$selectedSearchCount）", maxLines = 1, softWrap = false)
-                                }
-                            } else if (!state.isCatalogSearching && state.catalogSearchMessage != null) {
-                                Text(
-                                    state.catalogSearchMessage,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = if (state.isCatalogSearchError) {
-                                        MaterialTheme.colorScheme.error
-                                    } else {
-                                        MaterialTheme.colorScheme.onSurfaceVariant
-                                    },
-                                    maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                            }
-                            HorizontalDivider()
-                            Text("手动选模型", style = MaterialTheme.typography.titleSmall)
-                            Box(modifier = Modifier.fillMaxWidth()) {
-                                OutlinedButton(
-                                    onClick = { supplierMenuExpanded = true },
-                                    enabled = editingEnabled && !state.isCatalogFetching && state.suppliers.isNotEmpty(),
-                                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-                                ) {
+                                    val selectedSearchCount = selectedSearchKeys
+                                        .intersect(searchResultKeys)
+                                        .subtract(pendingSourceKeys)
+                                        .size
+                                    val remainingSourceSlots = (MAX_MODEL_SOURCES_PER_ENTRY - pendingSources.size).coerceAtLeast(0)
+                                    OutlinedButton(
+                                        onClick = {
+                                            val additions = searchResults
+                                                .filter { it.supplierId + "\u0000" + it.modelId in selectedSearchKeys }
+                                                .take(remainingSourceSlots)
+                                                .map { ModelSource(it.supplierId, it.modelId) }
+                                            pendingSources = (pendingSources + additions)
+                                                .distinctBy { it.supplierId + "\u0000" + it.modelId }
+                                            selectedSearchKeys = emptySet()
+                                        },
+                                        enabled = editingEnabled && selectedSearchCount > 0 && remainingSourceSlots > 0,
+                                        modifier = Modifier.heightIn(min = 44.dp),
+                                    ) {
+                                        Icon(Icons.Outlined.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                                        Spacer(Modifier.width(4.dp))
+                                        Text("添加已选（$selectedSearchCount）", maxLines = 1, softWrap = false)
+                                    }
+                                } else if (!state.isCatalogSearching && state.catalogSearchMessage != null) {
                                     Text(
-                                        selectedSupplier?.name ?: "选择供应商",
-                                        modifier = Modifier.weight(1f),
-                                        maxLines = 1,
+                                        state.catalogSearchMessage,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = if (state.isCatalogSearchError) {
+                                            MaterialTheme.colorScheme.error
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurfaceVariant
+                                        },
+                                        maxLines = 2,
                                         overflow = TextOverflow.Ellipsis,
                                     )
-                                    Text("选择")
                                 }
-                                DropdownMenu(
-                                    expanded = supplierMenuExpanded,
-                                    onDismissRequest = { supplierMenuExpanded = false },
-                                    modifier = Modifier.heightIn(max = 280.dp),
-                                ) {
-                                    state.suppliers.forEach { supplier ->
-                                        DropdownMenuItem(
-                                            text = { Text(supplier.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                                            onClick = {
-                                                supplierMenuExpanded = false
-                                                selectedSupplierId = supplier.id
-                                                selectedModel = ""
-                                                onClearPicker()
-                                            },
-                                        )
-                                    }
-                                }
-                            }
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Box(modifier = Modifier.weight(1f)) {
+                                HorizontalDivider()
+                                Text("手动选模型", style = MaterialTheme.typography.titleSmall)
+                                Box(modifier = Modifier.fillMaxWidth()) {
                                     OutlinedButton(
-                                        onClick = { modelMenuExpanded = true },
-                                        enabled = editingEnabled && !state.isCatalogFetching && pickerModels.isNotEmpty() &&
-                                            state.catalogPickerSupplierId == selectedSupplierId,
+                                        onClick = { supplierMenuExpanded = true },
+                                        enabled = editingEnabled && !state.isCatalogFetching && state.suppliers.isNotEmpty(),
                                         modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                                     ) {
                                         Text(
-                                            selectedModel.ifBlank { "尚未选择模型" },
+                                            selectedSupplier?.name ?: "选择供应商",
                                             modifier = Modifier.weight(1f),
                                             maxLines = 1,
                                             overflow = TextOverflow.Ellipsis,
@@ -2830,237 +2809,276 @@ private fun ModelCatalogDialog(
                                         Text("选择")
                                     }
                                     DropdownMenu(
-                                        expanded = modelMenuExpanded,
-                                        onDismissRequest = { modelMenuExpanded = false },
+                                        expanded = supplierMenuExpanded,
+                                        onDismissRequest = { supplierMenuExpanded = false },
                                         modifier = Modifier.heightIn(max = 280.dp),
                                     ) {
-                                        pickerModels.forEach { model ->
+                                        state.suppliers.forEach { supplier ->
                                             DropdownMenuItem(
-                                                text = { Text(model, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                                                text = { Text(supplier.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                                                 onClick = {
-                                                    selectedModel = model
-                                                    modelMenuExpanded = false
+                                                    supplierMenuExpanded = false
+                                                    selectedSupplierId = supplier.id
+                                                    selectedModel = ""
+                                                    onClearPicker()
                                                 },
                                             )
                                         }
                                     }
                                 }
-                                OutlinedButton(
-                                    onClick = { selectedSupplierId?.let(onFetchModels) },
-                                    enabled = editingEnabled && selectedSupplierId != null && !state.isCatalogFetching,
-                                    contentPadding = PaddingValues(horizontal = 8.dp),
-                                    modifier = Modifier.widthIn(min = 96.dp, max = 100.dp).heightIn(min = 48.dp),
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
                                 ) {
-                                    if (state.isCatalogFetching) {
-                                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-                                    } else {
-                                        Icon(Icons.Outlined.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Box(modifier = Modifier.weight(1f)) {
+                                        OutlinedButton(
+                                            onClick = { modelMenuExpanded = true },
+                                            enabled = editingEnabled && !state.isCatalogFetching && pickerModels.isNotEmpty() &&
+                                                state.catalogPickerSupplierId == selectedSupplierId,
+                                            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                                        ) {
+                                            Text(
+                                                selectedModel.ifBlank { "尚未选择模型" },
+                                                modifier = Modifier.weight(1f),
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                            Text("选择")
+                                        }
+                                        DropdownMenu(
+                                            expanded = modelMenuExpanded,
+                                            onDismissRequest = { modelMenuExpanded = false },
+                                            modifier = Modifier.heightIn(max = 280.dp),
+                                        ) {
+                                            pickerModels.forEach { model ->
+                                                DropdownMenuItem(
+                                                    text = { Text(model, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                                                    onClick = {
+                                                        selectedModel = model
+                                                        modelMenuExpanded = false
+                                                    },
+                                                )
+                                            }
+                                        }
                                     }
-                                    Spacer(Modifier.width(4.dp))
-                                    Text(
-                                        if (state.isCatalogFetching) "拉取中" else "拉取",
-                                        maxLines = 1,
-                                        softWrap = false,
-                                        overflow = TextOverflow.Clip,
-                                    )
+                                    OutlinedButton(
+                                        onClick = { selectedSupplierId?.let(onFetchModels) },
+                                        enabled = editingEnabled && selectedSupplierId != null && !state.isCatalogFetching,
+                                        contentPadding = PaddingValues(horizontal = 8.dp),
+                                        modifier = Modifier.widthIn(min = 96.dp, max = 100.dp).heightIn(min = 48.dp),
+                                    ) {
+                                        if (state.isCatalogFetching) {
+                                            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                                        } else {
+                                            Icon(Icons.Outlined.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                                        }
+                                        Spacer(Modifier.width(4.dp))
+                                        Text(
+                                            if (state.isCatalogFetching) "拉取中" else "拉取",
+                                            maxLines = 1,
+                                            softWrap = false,
+                                            overflow = TextOverflow.Clip,
+                                        )
+                                    }
                                 }
                             }
                         }
-                    }
-                    if (pendingSources.isNotEmpty()) {
-                        Column(verticalArrangement = Arrangement.spacedBy(0.dp)) {
-                            Text(
-                                "已添加 ${pendingSources.size} / $MAX_MODEL_SOURCES_PER_ENTRY 个来源",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = if (sourceLimitReached) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.padding(bottom = 4.dp),
-                            )
-                            pendingSources.forEachIndexed { index, source ->
-                                if (index > 0) HorizontalDivider()
-                                val supplierName = state.suppliers.firstOrNull { it.id == source.supplierId }?.name ?: "已删除供应商"
-                                Row(
-                                    modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                ) {
-                                    Text(
-                                        "$supplierName · ${source.modelId}",
-                                        modifier = Modifier.weight(1f),
-                                        style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold),
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                    )
-                                    IconButton(
-                                        onClick = { sourceToDelete = source },
-                                        enabled = editingEnabled,
-                                        modifier = Modifier.size(44.dp),
+                        if (pendingSources.isNotEmpty()) {
+                            Column(verticalArrangement = Arrangement.spacedBy(0.dp)) {
+                                Text(
+                                    "已添加 ${pendingSources.size} / $MAX_MODEL_SOURCES_PER_ENTRY 个来源",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = if (sourceLimitReached) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(bottom = 4.dp),
+                                )
+                                pendingSources.forEachIndexed { index, source ->
+                                    if (index > 0) HorizontalDivider()
+                                    val supplierName = state.suppliers.firstOrNull { it.id == source.supplierId }?.name ?: "已删除供应商"
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
                                     ) {
-                                        Icon(Icons.Outlined.DeleteOutline, contentDescription = "移除来源", modifier = Modifier.size(20.dp))
+                                        Text(
+                                            "$supplierName · ${source.modelId}",
+                                            modifier = Modifier.weight(1f),
+                                            style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold),
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                        IconButton(
+                                            onClick = { sourceToDelete = source },
+                                            enabled = editingEnabled,
+                                            modifier = Modifier.size(44.dp),
+                                        ) {
+                                            Icon(Icons.Outlined.DeleteOutline, contentDescription = "移除来源", modifier = Modifier.size(20.dp))
+                                        }
                                     }
+                                }
+                            }
+                        }
+                        HorizontalDivider()
+                        Text("已配置模型", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            "${state.modelCatalog.size} 个模型 · ${state.modelCatalog.sumOf { it.sources.size }} 个供应商来源",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        if (state.modelCatalog.isEmpty()) {
+                            Text(
+                                "先拉取模型列表，再添加来源。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        } else {
+                            Column(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                state.modelCatalog.forEach { entry ->
+                                    val entryTestingKeys = state.unifiedTestingKeys.filter { key ->
+                                        key.startsWith("${entry.id}\u0000")
+                                    }
+                                    val entryTestingCount = entryTestingKeys.size
+                                    val entrySourceCount = entry.sources.size
+                                    val entryCompletedCount = (entrySourceCount - entryTestingCount).coerceIn(0, entrySourceCount)
+                                    // A model whose every source is pull-only has nothing to run.
+                                    val entryHasTestableSource = entry.sources.any { source ->
+                                        val supplier = state.suppliers.firstOrNull { it.id == source.supplierId }
+                                        val missing = "${source.supplierId}\u0000${source.modelId}" in
+                                            state.catalogMissingSources
+                                        supplier != null && !supplier.isTestingDisabled && !missing
+                                    }
+                                    ModelCatalogEntryCard(
+                                        entry = entry,
+                                        suppliers = state.suppliers,
+                                        results = unifiedByEntry[entry.id].orEmpty(),
+                                        testingKeys = state.unifiedTestingKeys,
+                                        progressDone = entryCompletedCount,
+                                        progressTotal = entrySourceCount,
+                                        editingEnabled = editingEnabled,
+                                        testingEnabled = entryHasTestableSource,
+                                        isTesting = entryTestingKeys.isNotEmpty(),
+                                        isRefreshing = entry.id in state.catalogRefreshingEntryIds,
+                                        missingSources = state.catalogMissingSources,
+                                        onEdit = {
+                                            editingEntryId = entry.id
+                                            entryName = entry.name
+                                            pendingSources = entry.sources
+                    selectedSupplierId = entry.sources.firstOrNull()?.supplierId ?: state.suppliers.firstOrNull()?.id
+                    selectedModel = ""
+                    catalogSearchKeyword = editingSearchKeyword
+                    onClearPickerPreservingSearch()
+                                        },
+                                        onRun = { onRunEntry(entry.id) },
+                                        onRunSource = { source -> onRunSource(entry.id, source) },
+                                        onCancel = onCancelRun,
+                                        onDelete = { entryToDeleteId = entry.id },
+                                        onRefresh = { onRefreshEntry(entry.id) },
+                                        onRemoveSource = { src ->
+                                            // Deleting the entry's last source drops the whole
+                                            // entry in the ViewModel, so an in-progress edit of
+                                            // that entry would point at a model that no longer
+                                            // exists. Reset the draft instead of leaving it stale.
+                                            if (entry.sources.size <= 1 && editingEntryId == entry.id) {
+                                                resetDraft()
+                                            }
+                                            onRemoveSource(entry.id, src)
+                                        },
+                                    )
                                 }
                             }
                         }
                     }
                     HorizontalDivider()
-                    Text("已配置模型", style = MaterialTheme.typography.titleMedium)
-                    Text(
-                        "${state.modelCatalog.size} 个模型 · ${state.modelCatalog.sumOf { it.sources.size }} 个供应商来源",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    if (state.modelCatalog.isEmpty()) {
-                        Text(
-                            "先拉取模型列表，再添加来源。",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    } else {
-                        Column(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            state.modelCatalog.forEach { entry ->
-                                val entryTestingKeys = state.unifiedTestingKeys.filter { key ->
-                                    key.startsWith("${entry.id}\u0000")
-                                }
-                                val entryTestingCount = entryTestingKeys.size
-                                val entrySourceCount = entry.sources.size
-                                val entryCompletedCount = (entrySourceCount - entryTestingCount).coerceIn(0, entrySourceCount)
-                                // A model whose every source is pull-only has nothing to run.
-                                val entryHasTestableSource = entry.sources.any { source ->
-                                    val supplier = state.suppliers.firstOrNull { it.id == source.supplierId }
-                                    val missing = "${source.supplierId}\u0000${source.modelId}" in
-                                        state.catalogMissingSources
-                                    supplier != null && !supplier.isTestingDisabled && !missing
-                                }
-                                ModelCatalogEntryCard(
-                                    entry = entry,
-                                    suppliers = state.suppliers,
-                                    results = unifiedByEntry[entry.id].orEmpty(),
-                                    testingKeys = state.unifiedTestingKeys,
-                                    progressDone = entryCompletedCount,
-                                    progressTotal = entrySourceCount,
-                                    editingEnabled = editingEnabled,
-                                    testingEnabled = entryHasTestableSource,
-                                    isTesting = entryTestingKeys.isNotEmpty(),
-                                    isRefreshing = entry.id in state.catalogRefreshingEntryIds,
-                                    missingSources = state.catalogMissingSources,
-                                    onEdit = {
-                                        editingEntryId = entry.id
-                                        entryName = entry.name
-                                        pendingSources = entry.sources
-                selectedSupplierId = entry.sources.firstOrNull()?.supplierId ?: state.suppliers.firstOrNull()?.id
-                selectedModel = ""
-                catalogSearchKeyword = editingSearchKeyword
-                onClearPickerPreservingSearch()
-                                    },
-                                    onRun = { onRunEntry(entry.id) },
-                                    onRunSource = { source -> onRunSource(entry.id, source) },
-                                    onCancel = onCancelRun,
-                                    onDelete = { entryToDeleteId = entry.id },
-                                    onRefresh = { onRefreshEntry(entry.id) },
-                                    onRemoveSource = { src ->
-                                        // Deleting the entry's last source drops the whole
-                                        // entry in the ViewModel, so an in-progress edit of
-                                        // that entry would point at a model that no longer
-                                        // exists. Reset the draft instead of leaving it stale.
-                                        if (entry.sources.size <= 1 && editingEntryId == entry.id) {
-                                            resetDraft()
-                                        }
-                                        onRemoveSource(entry.id, src)
-                                    },
-                                )
-                            }
-                        }
-                    }
-                }
-                HorizontalDivider()
-                Row(
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    TextButton(onClick = onDismiss, modifier = Modifier.heightIn(min = 48.dp)) { Text("关闭") }
-                    Spacer(Modifier.weight(1f))
-                    OutlinedButton(
-                        onClick = {
-                            val supplierId = selectedSupplierId
-                            if (supplierId != null && selectedModel.isNotBlank()) {
-                                pendingSources = (pendingSources + ModelSource(supplierId, selectedModel))
-                                    .distinctBy { it.supplierId + "\u0000" + it.modelId }
-                                selectedModel = ""
-                            }
-                        },
-                        enabled = canAddSource,
-                        contentPadding = PaddingValues(horizontal = 8.dp),
-                        modifier = Modifier.heightIn(min = 48.dp),
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Icon(Icons.Outlined.Add, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(3.dp))
-                        Text("添加来源", maxLines = 1)
+                        TextButton(onClick = onDismiss, modifier = Modifier.heightIn(min = 48.dp)) { Text("关闭") }
+                        Spacer(Modifier.weight(1f))
+                        OutlinedButton(
+                            onClick = {
+                                val supplierId = selectedSupplierId
+                                if (supplierId != null && selectedModel.isNotBlank()) {
+                                    pendingSources = (pendingSources + ModelSource(supplierId, selectedModel))
+                                        .distinctBy { it.supplierId + "\u0000" + it.modelId }
+                                    selectedModel = ""
+                                }
+                            },
+                            enabled = canAddSource,
+                            contentPadding = PaddingValues(horizontal = 8.dp),
+                            modifier = Modifier.heightIn(min = 48.dp),
+                        ) {
+                            Icon(Icons.Outlined.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(3.dp))
+                            Text("添加来源", maxLines = 1)
+                        }
+                        Button(
+                            onClick = {
+                                onSaveEntry(editingEntryId, entryName, pendingSources)
+                                resetDraft()
+                            },
+                            enabled = canSave,
+                            contentPadding = PaddingValues(horizontal = 10.dp),
+                            modifier = Modifier.heightIn(min = 48.dp),
+                        ) { Text(if (editingEntryId == null) "保存模型来源" else "保存修改") }
                     }
-                    Button(
-                        onClick = {
-                            onSaveEntry(editingEntryId, entryName, pendingSources)
-                            resetDraft()
-                        },
-                        enabled = canSave,
-                        contentPadding = PaddingValues(horizontal = 10.dp),
-                        modifier = Modifier.heightIn(min = 48.dp),
-                    ) { Text(if (editingEntryId == null) "保存模型来源" else "保存修改") }
                 }
             }
         }
-    }
-    sourceToDelete?.let { source ->
-        val supplierName = state.suppliers.firstOrNull { it.id == source.supplierId }?.name ?: "未知供应商"
-        AlertDialog(
-            onDismissRequest = { sourceToDelete = null },
-            title = { Text("移除供应商来源？") },
-            text = { Text("将移除「$supplierName · ${source.modelId}」；已保存配置不受影响。") },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        sourceToDelete = null
-                        pendingSources = pendingSources - source
-                    },
-                    modifier = Modifier.heightIn(min = 48.dp),
-                ) { Text("移除", color = MaterialTheme.colorScheme.error) }
-            },
-            dismissButton = {
-                TextButton(
-                    onClick = { sourceToDelete = null },
-                    modifier = Modifier.heightIn(min = 48.dp),
-                ) { Text("取消") }
-            },
-        )
-    }
-    entryToDeleteId?.let { entryId ->
-        val entry = state.modelCatalog.firstOrNull { it.id == entryId }
-        if (entry != null) {
+        sourceToDelete?.let { source ->
+            val supplierName = state.suppliers.firstOrNull { it.id == source.supplierId }?.name ?: "未知供应商"
             AlertDialog(
-                onDismissRequest = { entryToDeleteId = null },
-                title = { Text("删除已配置模型？") },
-                text = { Text("删除「${entry.name}」及其全部来源，无法撤销。") },
+                onDismissRequest = { sourceToDelete = null },
+                title = { Text("移除供应商来源？") },
+                text = { Text("将移除「$supplierName · ${source.modelId}」；已保存配置不受影响。") },
                 confirmButton = {
                     TextButton(
                         onClick = {
-                            entryToDeleteId = null
-                            onDeleteEntry(entry.id)
-                            if (editingEntryId == entry.id) {
-                                resetDraft()
-                            }
+                            sourceToDelete = null
+                            pendingSources = pendingSources - source
                         },
                         modifier = Modifier.heightIn(min = 48.dp),
-                    ) { Text("删除", color = MaterialTheme.colorScheme.error) }
+                    ) { Text("移除", color = MaterialTheme.colorScheme.error) }
                 },
                 dismissButton = {
                     TextButton(
-                        onClick = { entryToDeleteId = null },
+                        onClick = { sourceToDelete = null },
                         modifier = Modifier.heightIn(min = 48.dp),
                     ) { Text("取消") }
                 },
             )
         }
+        entryToDeleteId?.let { entryId ->
+            val entry = state.modelCatalog.firstOrNull { it.id == entryId }
+            if (entry != null) {
+                AlertDialog(
+                    onDismissRequest = { entryToDeleteId = null },
+                    title = { Text("删除已配置模型？") },
+                    text = { Text("删除「${entry.name}」及其全部来源，无法撤销。") },
+                    confirmButton = {
+                        TextButton(
+                            onClick = {
+                                entryToDeleteId = null
+                                onDeleteEntry(entry.id)
+                                if (editingEntryId == entry.id) {
+                                    resetDraft()
+                                }
+                            },
+                            modifier = Modifier.heightIn(min = 48.dp),
+                        ) { Text("删除", color = MaterialTheme.colorScheme.error) }
+                    },
+                    dismissButton = {
+                        TextButton(
+                            onClick = { entryToDeleteId = null },
+                            modifier = Modifier.heightIn(min = 48.dp),
+                        ) { Text("取消") }
+                    },
+                )
+            }
+            }
     }
 }
 
