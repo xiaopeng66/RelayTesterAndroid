@@ -111,9 +111,9 @@ Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询�
 
 - 最新：[v1.6.0 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.6.0) · [发行说明](RELEASE_NOTES_1.6.0.md)
   - `RelayTester-v1.6.0-android.apk` · `2,958,267` 字节 · SHA-256 `aa9519b45e38ed2b51a993dc62e4910a76cb194a507aa74868be5aa5c51ae3d8`
-  - 本版把包名与签名改成正式发布版本，**是从旧版升级的最后一次手动安装**（升级步骤见发行说明）。
+  - 本版起所有发行版共用同一个包名 `com.relaytester.app` 与同一把正式发布密钥，**任何一个版本都能直接覆盖升级到更新的版本**，不必卸载重装（早期使用调试证书的安装包除外，说明见下）。
 
-历史版本：
+历史版本（2026-10-04 起已用正式发布密钥重建后重新发布，代码与版本号与首次发布时相同，因此字节数与 SHA-256 与最初那一份不同；每个版本的说明页写明了该版当前的字节数与 SHA-256）：
 
 - [v1.5.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.5.0) · [发行说明](RELEASE_NOTES_1.5.0.md)
 - [v1.4.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.4.0) · [发行说明](RELEASE_NOTES_1.4.0.md)
@@ -121,6 +121,8 @@ Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询�
 - [v1.2.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.2.0) · [发行说明](RELEASE_NOTES_1.2.0.md)
 - [v1.1.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.1.0) · [发行说明](RELEASE_NOTES_1.1.0.md)
 - [v1.0.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.0.0) · [发行说明](RELEASE_NOTES_1.0.0.md)
+
+2026-10-04 之前发布的安装包（包名 `com.relaytester.app.debug`、用 Android 调试证书签名）与现在的版本是**两个不同的 App**，Android 不允许互相覆盖。如果你手机上装的是那时下载的版本，需要手动装一次现在的正式签名包：先在旧 App 里「导入或导出配置」做一次加密导出，装好新包后导入即可；之后所有更新都在 App 内完成。详细步骤见 [RELEASE_SIGNING.md](RELEASE_SIGNING.md)。
 
 ## 更多文档
 

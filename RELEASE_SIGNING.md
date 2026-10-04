@@ -24,6 +24,39 @@ Signing is v2 + v3. v3 carries a key-rotation lineage: if this key is ever lost,
 key can still be delivered as an update (Android 9+) by rotating with a proof-of-rotation
 lineage, instead of telling every user to uninstall.
 
+## Every published version shares this identity
+
+Since 2026-10-04 every release on the release pages — v1.0.0 through v1.6.0 — carries package
+`com.relaytester.app` and is signed with the key above. That is what lets any one of them replace
+any other in place (both `adb install -r` and the in-app updater require the matching package
+name *and* certificate), so a user on any published version can move to the newest one without
+uninstalling.
+
+To reach that state v1.0.0–v1.5.0 were **rebuilt from their own tags** on 2026-10-04 and
+republished:
+
+- the `optimized` build type's `applicationIdSuffix = ".debug"` and
+  `versionNameSuffix = "-optimized"` were removed, and its signing config switched from `debug`
+  to `release`;
+- the code, `versionCode` and `versionName` are unchanged from the first publication;
+- Android builds are not byte-reproducible, so the rebuilt files have **new byte counts and
+  SHA-256 digests**. Each release page's `## 下载` block carries the values of the file that is
+  currently published, and the note above it says the build was rebuilt.
+
+If a historical version ever has to be rebuilt again: in a detached worktree of its tag
+(`git worktree add --detach <dir> <tag>`), drop those two suffixes and point the `optimized` type
+at `signingConfigs.getByName("release")` — adding the `signingConfigs`/`secret()` block above if
+the tag predates it — copy `local.properties` and the keystore in, build `assembleOptimized`, then
+confirm with `apksigner verify --print-certs` that the package and certificate match this file
+before publishing, and update the release notes' digest/size to the new artifact.
+
+**Copies installed before that date are a different app**: package `com.relaytester.app.debug`,
+signed by the Android debug certificate
+(`40dcd408050cd0abeafdd1b4092ac9e89bec3af313ea87594c5f7fb2cbfac15d`, DN `CN=Android Debug`,
+v2 only). Nothing published can update them in place, so each such user needs one manual install
+of a current release (export the configuration from the old app first — see the README); every
+update after that happens inside the app.
+
 ## Where the password lives
 
 **Never in this repository** — this file is committed and the repository is public. PKCS12 uses
@@ -55,7 +88,8 @@ recording because they are easy to get wrong:
 - Despite the `.p12` name it is a **JKS** keystore (magic `FEEDFEED`). The signing config used
   to declare `storeType = "PKCS12"` for it, which would fail even with the right password.
 - Its password is recorded nowhere on this machine; the values once written in this file did
-  not open it. **It has never signed a published build**: every release from v1.0.0 through
-  v1.5.0 is signed with the Android debug certificate
-  (`40dcd408050cd0abeafdd1b4092ac9e89bec3af313ea87594c5f7fb2cbfac15d`), which is why it was
-  safe to replace rather than recover it.
+  not open it. **It has never signed a published build**: as originally published, every release
+  from v1.0.0 through v1.5.0 was signed with the Android debug certificate
+  (`40dcd408050cd0abeafdd1b4092ac9e89bec3af313ea87594c5f7fb2cbfac15d`) — those files have since
+  been rebuilt with the release key (see above) — which is why it was safe to replace rather than
+  recover it.
