@@ -30,6 +30,20 @@
 #   * forks: the job would publish into the fork's own release, which no app reads, so it
 #     is harmless there. No repository guard is used, because a rename would then stop the
 #     schedule silently.
+#
+# Failing runs, in two layers — a transient hiccup should not need a person:
+#   * the steps retry what they can do again cheaply (`git ls-remote`, `git clone`);
+#   * `tools/update_fingerprint_package.py` + `tools/publish_bank.py` retry every call they
+#     make to GitHub (5xx, 429, rate-limited 403, DNS/TLS/timeouts/resets) with backoff,
+#     and return permanent answers like a 401/404/422 immediately — see `tools/retry.py`;
+#   * anything a retry inside a step cannot reach (runner killed the job, step timed out,
+#     an unexpected exception) is picked up by `.github/workflows/retry-failed-detection-package.yml`,
+#     which re-runs *this* run's failed jobs, bounded by attempt count and a time window.
+#     The publish is idempotent — a rebuild is deterministic and downloads are compared by
+#     digest — so a re-run either finds nothing to do ("无需发布") or replaces the assets
+#     again; it cannot publish twice or publish something stale.
+#   * the retry budget is tunable per run without editing code: BANK_RETRY_ATTEMPTS,
+#     BANK_RETRY_BASE_DELAY, BANK_RETRY_MAX_DELAY, BANK_RETRY_JITTER.
 
 name: Update detection package
 
@@ -64,28 +78,53 @@ jobs:
       - name: Read upstream revision
         id: upstream
         # `git ls-remote` instead of the commits API: no token to spend on a third-party
-        # repository, and no anonymous rate limit to hit.
+        # repository, and no anonymous rate limit to hit. It still talks to github.com
+        # directly, so a TLS reset or a DNS hiccup here used to fail the run before any
+        # real work had started; three tries with a short backoff cover that.
         run: |
           set -euo pipefail
-          sha="$(git ls-remote https://github.com/Ikaleio/lm-detector.git HEAD | cut -f1)"
+          sha=""
+          for attempt in 1 2 3; do
+            # stderr is left alone on purpose: when the read fails, git's own message
+            # (TLS, DNS, proxy) is the only thing that says which kind of failure it was.
+            sha="$(git ls-remote https://github.com/Ikaleio/lm-detector.git HEAD | cut -f1 || true)"
+            if [ -n "$sha" ]; then break; fi
+            echo "读取上游失败（第 $attempt/3 次），稍后重试" >&2
+            sleep $((attempt * 5))
+          done
           test -n "$sha"
           echo "upstream HEAD is $sha"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Check out this repository
         # A plain clone rather than actions/checkout: the tools are all this job needs, and
-        # this keeps the workflow free of third-party actions to trust.
-        run: git clone --depth 1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" work
+        # this keeps the workflow free of third-party actions to trust. A partial `work`
+        # directory is removed before each attempt so a failed clone cannot be mistaken
+        # for a finished one.
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            rm -rf work
+            if git clone --depth 1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" work; then
+              break
+            fi
+            echo "clone 失败（第 $attempt/3 次），稍后重试" >&2
+            sleep $((attempt * 5))
+          done
+          test -f work/tools/update_fingerprint_package.py
 
       - name: Check the publishing tools import
         working-directory: work
         # Cheap and first: a broken tools/ push should fail in a second, not after the
-        # 44 MB upstream download.
+        # 44 MB upstream download. `retry.py` is in the list because every network call in
+        # the tools imports it — a syntax error there would otherwise surface later.
         run: |
           python3 -m py_compile \
             tools/build_fingerprint_asset.py \
             tools/publish_bank.py \
-            tools/update_fingerprint_package.py
+            tools/update_fingerprint_package.py \
+            tools/retry.py \
+            tools/retry_failed_runs.py
 
       - name: Rebuild and publish if upstream moved
         working-directory: work
@@ -93,6 +132,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
           FORCE: ${{ inputs.force }}
+          # Retry budget for the calls this script makes (see tools/retry.py). Four
+          # attempts with a 2s→30s backoff and `Retry-After` honoured: long enough to ride
+          # out a CDN hiccup or a moment of API rate limiting, short enough that a real
+          # failure still fails the job and reaches the job-level retry.
+          BANK_RETRY_ATTEMPTS: "4"
+          BANK_RETRY_BASE_DELAY: "2"
+          BANK_RETRY_MAX_DELAY: "30"
+          BANK_RETRY_JITTER: "0.25"
         # The build is deterministic (its builtAt comes from upstream's data, not from the
         # clock), so an unchanged upstream rebuilds to the published digest and the script
         # reports "无需发布". Publishing also reads both assets back and compares them

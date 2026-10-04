@@ -1,0 +1,85 @@
+# Re-runs failed jobs of the detection-package publishing workflow.
+#
+# Why this exists next to the retries inside `update_fingerprint_package.py`: those cover
+# the calls that fail transiently *inside* a step. Everything else — a job the runner
+# killed, a clone that never started, an unexpected exception, a GitHub-side outage — used
+# to leave a red run that nobody sees until the next daily schedule, 24 hours later. This
+# workflow notices within minutes and starts the failed jobs over.
+#
+# What it can and cannot do, deliberately:
+#   * it never runs the publish itself. It only calls `rerun-failed-jobs` on a run GitHub
+#     already made, from the same commit with the same inputs;
+#   * it asks for `actions: write` and nothing else. No `contents: write`, so it cannot
+#     touch the release, its assets, or any file in the repository — a compromised or
+#     broken watchdog cannot corrupt a published package;
+#   * the publish is idempotent (deterministic rebuild + digest compare), so re-running a
+#     job whose upload already succeeded prints "无需发布" instead of publishing twice;
+#   * `tools/retry_failed_runs.py` caps the work at `--max-attempts` and a time window;
+#     a run that fails repeatedly stays red on purpose.
+#
+# Two triggers, on purpose:
+#   * `workflow_run` fires the moment a publish run finishes red: the retry happens in
+#     minutes, which is what makes a transient failure invisible in practice;
+#   * `schedule` is the safety net for the case where the watchdog itself was skipped —
+#     a dropped `workflow_run` delivery, or a repository that was quiet when the failure
+#     happened. It re-examines the same window and finds nothing new when all is well.
+#
+# Security shape, same posture as the publish workflow: no third-party actions (plain git
+# and python from the runner image), no `push`/`pull_request` triggers, and the only
+# credential is the run's own short-lived GITHUB_TOKEN.
+
+name: Retry failed detection package runs
+
+on:
+  workflow_run:
+    workflows: ["Update detection package"]
+    types: [completed]
+  schedule:
+    # Hourly, off the hour: GitHub delays or drops runs scheduled at peak load.
+    - cron: "41 * * * *"
+  workflow_dispatch:
+    inputs:
+      max_attempts:
+        description: 同一个运行最多跑到第几次 attempt（默认 3 = 原始 + 2 次重跑）
+        type: number
+        default: 3
+
+permissions:
+  # `rerun-failed-jobs` is the whole job; that endpoint needs actions: write. Nothing here
+  # needs contents: write, so it is not asked for.
+  actions: write
+
+# The watchdog itself must not overlap: two of them could otherwise try to re-run the
+# same run at the same moment.
+concurrency:
+  group: retry-failed-detection-package
+  cancel-in-progress: false
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out this repository
+        # A plain clone rather than actions/checkout, same reasoning as the publish
+        # workflow: nothing third-party to trust. Only `tools/` is read from here.
+        run: git clone --depth 1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" work
+
+      - name: Check the watchdog imports
+        working-directory: work
+        run: python3 -m py_compile tools/retry_failed_runs.py tools/publish_bank.py tools/retry.py
+
+      - name: Re-run failed jobs
+        working-directory: work
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITHUB_REPOSITORY is already set by the runner; passing it explicitly keeps the
+          # tool honest about which repository it is watching.
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          # Empty on the `workflow_run` and `schedule` triggers (the input only exists for a
+          # manual dispatch); the shell default below turns that into 3 without depending on
+          # how a missing expression context compares to a number.
+          MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+        run: |
+          set -euo pipefail
+          python3 tools/retry_failed_runs.py --max-attempts "${MAX_ATTEMPTS:-3}"

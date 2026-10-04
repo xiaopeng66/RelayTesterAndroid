@@ -13,6 +13,13 @@ The manifest is derived from the asset itself — build stamp, model count, refe
 digest, size and SHA-256 are all read back out of the binary — so the two can never
 disagree. Both files are downloaded again afterwards and compared byte for byte.
 
+Every call to GitHub goes through `retry.py`, which repeats transient answers (5xx, 429,
+timeouts, resets) and returns permanent ones immediately — see that module for why the
+split matters. Counts and delays come from BANK_RETRY_* in the environment. The publish
+itself stays idempotent: re-running after a failure rebuilds the same bytes and either
+finds them already published ("无需发布") or replaces the assets again, so a retried job
+cannot publish twice or publish something stale.
+
 Usage:
     python tools/publish_bank.py                 # publish build/lm-fingerprint/lite-bank.bin
     python tools/publish_bank.py --dry-run       # print the manifest, upload nothing
@@ -32,6 +39,8 @@ import sys
 import time
 import urllib.error
 import urllib.request
+
+import retry
 
 REPO = "xiaopeng66/RelayTesterAndroid"
 TAG = "bank"
@@ -128,10 +137,8 @@ def build_manifest(bank_bytes):
     }
 
 
-def request(token, method, url, data=None, content_type="application/json", raw=False):
-    payload = data
-    if payload is not None and not raw:
-        payload = json.dumps(payload).encode("utf-8")
+def _request_once(token, method, url, payload, content_type):
+    """One attempt. Returns (status, body, headers); HTTP errors come back as statuses."""
     request_object = urllib.request.Request(url, data=payload, method=method)
     request_object.add_header("Authorization", "Bearer " + token)
     request_object.add_header("Accept", "application/vnd.github+json")
@@ -140,10 +147,42 @@ def request(token, method, url, data=None, content_type="application/json", raw=
         request_object.add_header("Content-Type", content_type)
     try:
         with urllib.request.urlopen(request_object, timeout=120) as response:
-            body = response.read()
-            return response.status, body
+            return response.status, response.read(), dict(response.headers)
     except urllib.error.HTTPError as error:
-        return error.code, error.read()
+        return error.code, error.read(), dict(error.headers or {})
+
+
+def request(token, method, url, data=None, content_type="application/json", raw=False,
+            policy=None):
+    """Call the GitHub API, retrying only answers that mean "not now".
+
+    A 401/404/422 is returned on the first attempt: repeating it cannot change the
+    answer, and the caller's own message ("删除旧资产失败", "上传失败") is far more useful
+    than a stack of identical attempts. 5xx (the CDN in front of the asset endpoints
+    answers 502/503 during its own hiccups), 429, and transport-level failures are
+    retried with backoff, honouring `Retry-After` when GitHub sends one.
+    """
+    policy = policy or retry.Policy.from_env()
+    payload = data
+    if payload is not None and not raw:
+        payload = json.dumps(payload).encode("utf-8")
+    label = f"{method} {url.split('/repos/')[-1][:80]}"
+    for index in range(policy.attempts):
+        try:
+            status, body, headers = _request_once(token, method, url, payload, content_type)
+        except Exception as error:  # noqa: BLE001 - transient_error decides worth
+            if index + 1 >= policy.attempts or not retry.transient_error(error):
+                raise
+            seconds = policy.delay(index)
+            print(f"{label}: {retry.describe_error(error)}（第 {index + 1}/{policy.attempts} 次），"
+                  f"{seconds:.1f}s 后重试")
+            continue
+        if status not in retry.TRANSIENT_STATUS or index + 1 >= policy.attempts:
+            return status, body
+        wait = retry.delay_for_status(policy, index, headers)
+        print(f"{label}: HTTP {status}（第 {index + 1}/{policy.attempts} 次），"
+              f"{wait:.1f}s 后重试")
+    raise AssertionError("unreachable")  # the loop returns or raises on every path
 
 
 def release_by_tag(token):
@@ -180,6 +219,15 @@ def ensure_release(token):
 
 
 def replace_asset(token, release, name, payload, content_type):
+    """Put [name] on the release, replacing any asset of that name.
+
+    A release cannot hold two assets with the same name, so a replacement is a delete
+    followed by an upload — which leaves a short window with no asset of that name. A
+    device that happens to check inside that window gets a 404 and simply checks again
+    later (the app never treats a failed download as "no update"); a *failed job* here is
+    the worse case, so the upload says plainly when the asset is currently missing and
+    the job-level retry rebuilds and re-uploads it.
+    """
     for asset in release.get("assets", []):
         if asset["name"] == name:
             status, body = request(token, "DELETE", f"{API}/repos/{REPO}/releases/assets/{asset['id']}")
@@ -187,19 +235,43 @@ def replace_asset(token, release, name, payload, content_type):
                 raise SystemExit(f"删除旧资产 {name} 失败：HTTP {status} {body[:200]!r}")
             print(f"deleted old asset {name}")
     upload_url = release["upload_url"].split("{")[0] + f"?name={name}"
-    status, body = request(token, "POST", upload_url, payload, content_type, raw=True)
+    try:
+        status, body = request(token, "POST", upload_url, payload, content_type, raw=True)
+    except Exception as error:  # noqa: BLE001 - re-raised with the release's state
+        raise SystemExit(
+            f"上传 {name} 失败：{error}\n"
+            f"注意：旧资产已删除，release 里现在没有 {name}；重新运行本流程会重新上传"
+            "（构建是确定性的，重新上传的就是这份字节）。",
+        ) from error
     if status not in (200, 201):
-        raise SystemExit(f"上传 {name} 失败：HTTP {status} {body[:300]!r}")
+        raise SystemExit(
+            f"上传 {name} 失败：HTTP {status} {body[:300]!r}\n"
+            f"注意：旧资产可能已删除，release 里现在缺少 {name}；重新运行本流程会恢复它。",
+        )
     return json.loads(body)
 
 
-def download(url, cache_bust=False):
+def download(url, cache_bust=False, attempts=None, policy=None):
+    """Fetch a public asset, retrying transport hiccups.
+
+    `attempts=1` is for callers that already own a retry loop (see `verify`, which
+    distinguishes a byte mismatch from a failed download and counts both against the same
+    budget) — without it the two loops would multiply.
+    """
     if cache_bust:
         separator = "&" if "?" in url else "?"
         url = f"{url}{separator}cb={int(time.time() * 1000)}"
-    request_object = urllib.request.Request(url)
-    with urllib.request.urlopen(request_object, timeout=180) as response:
-        return response.read()
+    policy = policy or retry.Policy.from_env()
+    if attempts is not None:
+        policy = retry.Policy(attempts=attempts, base_delay=policy.base_delay,
+                              max_delay=policy.max_delay, jitter=policy.jitter)
+
+    def once():
+        request_object = urllib.request.Request(url)
+        with urllib.request.urlopen(request_object, timeout=180) as response:
+            return response.read()
+
+    return retry.run(once, policy=policy, label=f"下载 {url.split('/')[-1][:40]}", log=print)
 
 
 def verify(release, bank_bytes, manifest_bytes, attempts=6, wait_seconds=5.0):
@@ -215,6 +287,10 @@ def verify(release, bank_bytes, manifest_bytes, attempts=6, wait_seconds=5.0):
         after the assets had been uploaded, which turned a publish that had already
         succeeded into a red run. 503/timeouts are transient, so they are retried like a
         mismatch instead of aborting here.
+
+    This loop owns the attempt count, so each read-back is a single try (`attempts=1`) —
+    otherwise the per-download retry in `download()` would multiply with this one and the
+    job would sit here far longer than the numbers below suggest.
     """
     assets = {asset["name"]: asset for asset in release["assets"]}
     for name in ("lite-bank.bin", "latest.json"):
@@ -226,8 +302,8 @@ def verify(release, bank_bytes, manifest_bytes, attempts=6, wait_seconds=5.0):
     last_error = None
     for attempt in range(attempts):
         try:
-            fetched_bank = download(bank_url, cache_bust=True)
-            fetched_manifest = download(manifest_url, cache_bust=True)
+            fetched_bank = download(bank_url, cache_bust=True, attempts=1)
+            fetched_manifest = download(manifest_url, cache_bust=True, attempts=1)
         except urllib.error.URLError as error:
             # HTTPError is a subclass of URLError, so a 5xx answer lands here too.
             last_error = error

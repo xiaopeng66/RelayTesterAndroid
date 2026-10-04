@@ -32,6 +32,9 @@ rebuilt digest is compared with the published manifest and the upload is skipped
 
 Network note: raw.githubusercontent.com is not always reachable from every network.
 Set HTTPS_PROXY if you need a proxy, or pass --data-dir with a clone of upstream.
+Transient failures (DNS/TLS/timeouts/resets, HTTP 5xx, rate-limit answers) are retried
+by `retry.py` before they are allowed to fail the run; the counts come from BANK_RETRY_*
+in the environment.
 
 Token: GITHUB_TOKEN, or the first line of E:/AI/Zcode/tmp/.ghtoken. It is only needed
 to publish and to read the release; a public upstream needs no token, but one is used
@@ -47,6 +50,7 @@ import urllib.error
 import urllib.request
 
 import publish_bank
+import retry
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 PROJECT = os.path.dirname(TOOLS)
@@ -62,7 +66,14 @@ DEFAULT_CACHE = os.path.join(PROJECT, "build/lm-fingerprint/upstream")
 
 
 def api_get(url):
-    """GET a GitHub API URL, using the token when one is available."""
+    """GET a GitHub API URL, using the token when one is available.
+
+    Rate limits are the interesting case: an *anonymous* caller shares 60 requests an hour
+    across the whole runner IP, so a busy day can answer 403/429 through no fault of this
+    run. Both are retried (403 only counts as transient when its headers say the limit was
+    exhausted — otherwise it means the token lacks a scope and repeating it is pointless),
+    and only the final failure raises the message the operator can act on.
+    """
     request = urllib.request.Request(url)
     request.add_header("Accept", "application/vnd.github+json")
     request.add_header("X-GitHub-Api-Version", "2022-11-28")
@@ -72,16 +83,35 @@ def api_get(url):
         token = None
     if token:
         request.add_header("Authorization", "Bearer " + token)
-    try:
-        with urllib.request.urlopen(request, timeout=120) as response:
-            return json.loads(response.read())
-    except urllib.error.HTTPError as error:
-        if error.code in (403, 429):
-            raise SystemExit(
-                f"GitHub API 限流或拒绝（HTTP {error.code}）：写入 token 后重试，"
-                "或改用 --data-dir 指向本地上游副本",
-            )
-        raise SystemExit(f"读取 {url} 失败：HTTP {error.code} {error.read()[:200]!r}")
+    policy = retry.Policy.from_env()
+
+    def once():
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                return json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            if error.code in (403, 429) and rate_limited(error.headers):
+                # Same status as a permanent refusal, different meaning: tell the retry
+                # loop which one this is instead of leaving it to the status code.
+                raise retry.Transient(f"GitHub API HTTP {error.code} 限流") from error
+            if error.code in (403, 429):
+                raise SystemExit(
+                    f"GitHub API 限流或拒绝（HTTP {error.code}）：写入 token 后重试，"
+                    "或改用 --data-dir 指向本地上游副本",
+                )
+            raise SystemExit(f"读取 {url} 失败：HTTP {error.code} {error.read()[:200]!r}")
+
+    return retry.run(once, policy=policy, label=f"读取 {url.split('/')[-1][:40]}")
+
+
+def rate_limited(headers):
+    """True when a 403/429 answer is the rate limiter rather than a permanent refusal."""
+    if not headers:
+        return True  # no headers at all: treat as the limiter, the caller retries and gives up
+    remaining = headers.get("X-RateLimit-Remaining")
+    if remaining is not None and str(remaining).strip() == "0":
+        return True
+    return headers.get("Retry-After") is not None
 
 
 def upstream_revision():
@@ -95,24 +125,41 @@ def upstream_revision():
 
 
 def download(url, destination):
-    """Stream one upstream file to disk so a 32 MB JSON never sits in memory twice."""
-    request = urllib.request.Request(url)
+    """Stream one upstream file to disk so a 32 MB JSON never sits in memory twice.
+
+    Retried like every other network call here: a reset in the middle of a 32 MB transfer
+    is the single most likely failure of this script, and the partial file is thrown away
+    before each attempt so a resumed-at-the-wrong-offset file can never be mistaken for a
+    complete one.
+    """
     partial = destination + ".part"
+    policy = retry.Policy.from_env()
+
+    def once():
+        request = urllib.request.Request(url)
+        try:
+            with urllib.request.urlopen(request, timeout=600) as response, open(partial, "wb") as handle:
+                while True:
+                    chunk = response.read(1 << 20)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+        except (urllib.error.URLError, OSError) as error:
+            if os.path.exists(partial):
+                os.remove(partial)
+            raise error
+        os.replace(partial, destination)
+        return destination
+
     try:
-        with urllib.request.urlopen(request, timeout=600) as response, open(partial, "wb") as handle:
-            while True:
-                chunk = response.read(1 << 20)
-                if not chunk:
-                    break
-                handle.write(chunk)
-    except (urllib.error.URLError, OSError) as error:
+        return retry.run(once, policy=policy, label=f"下载 {url.rsplit('/', 1)[-1]}")
+    except Exception as error:  # noqa: BLE001 - reported with the proxy hint below
         if os.path.exists(partial):
             os.remove(partial)
         raise SystemExit(
-            f"下载 {url} 失败：{error}\n"
+            f"下载 {url} 失败：{retry.describe_error(error)}\n"
             "该域名在部分网络不可达：设置 HTTPS_PROXY，或用 --data-dir 指向上游 clone。",
         )
-    os.replace(partial, destination)
 
 
 def fetch_data(cache_dir, revision, refresh):
