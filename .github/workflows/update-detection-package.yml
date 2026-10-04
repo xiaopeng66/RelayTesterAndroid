@@ -1,9 +1,9 @@
 # Keeps the `bank` pre-release in step with upstream lm-detector.
 #
-# The app downloads its detection package from that release (background:
-# docs/FINGERPRINT_DETECTION_PACKAGE.md). This job rebuilds the package from upstream's
-# data and publishes it only when the built bytes differ from what is already published,
-# so a run against an unchanged upstream ends in "无需发布" and changes nothing.
+# The app downloads its detection package from that release. This job rebuilds the package
+# from upstream's data and publishes it only when the built bytes differ from what is
+# already published, so a run against an unchanged upstream ends in "无需发布" and changes
+# nothing.
 #
 # Security shape, deliberately minimal:
 #   * triggers are `schedule` and `workflow_dispatch` only — no `push` and no

@@ -24,8 +24,8 @@ Usage:
     python tools/publish_release_apk.py             # upload the APK, the notes and the feed
 
 Files are read from the repository (app/build.gradle.kts, the optimized APK and
-RELEASE_NOTES_<version>.md), so nothing here can drift from the build except by being
-run against a stale APK — which the download-back check at the end catches.
+release-notes/RELEASE_NOTES_<version>.md), so nothing here can drift from the build except
+by being run against a stale APK — which the download-back check at the end catches.
 
 Token: GITHUB_TOKEN, or the first line of E:/AI/Zcode/tmp/.ghtoken.
 """
@@ -327,7 +327,7 @@ def main():
     apk_path = args.apk or os.path.join(
         PROJECT, "app/build/outputs/apk/optimized/app-optimized.apk"
     )
-    notes_path = os.path.join(PROJECT, f"RELEASE_NOTES_{version()}.md")
+    notes_path = os.path.join(PROJECT, "release-notes", f"RELEASE_NOTES_{version()}.md")
     name = f"RelayTester-{tag}-android.apk"
     with open(apk_path, "rb") as handle:
         apk_bytes = handle.read()

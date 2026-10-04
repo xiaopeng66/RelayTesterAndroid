@@ -11,8 +11,8 @@ import re
 import sys
 import zipfile
 
-# Pairs taken from docs/UI_TEXT_TRIMMING_PLAN.md: the final wording must be present and
-# the retired wording must be gone. Both directions are checked so a half-applied edit
+# The app's user-visible wording, both directions: the final wording must be present in
+# the APK and the retired wording must be gone. Both are checked so a half-applied edit
 # or a stale build cannot pass.
 FINAL = [
     "暂无模型；可在「模型测试」拉取，或直接输入模型名。",

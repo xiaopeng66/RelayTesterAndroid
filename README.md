@@ -46,31 +46,23 @@ Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询�
 
     .\tools\build-android.ps1 assembleDebug
 
-调试包位于 `app/build/outputs/apk/debug/app-debug.apk`（包名 `com.relaytester.app.debug`），发布用的优化包位于 `app/build/outputs/apk/optimized/app-optimized.apk`（包名 `com.relaytester.app`）。发布包的签名口令在仓库外，配置方式见 [RELEASE_SIGNING.md](RELEASE_SIGNING.md)。
+调试包位于 `app/build/outputs/apk/debug/app-debug.apk`，发布用的优化包位于 `app/build/outputs/apk/optimized/app-optimized.apk`（包名 `com.relaytester.app`）。发布包的签名口令只放在仓库外（`~/.gradle/gradle.properties` 或构建时传入），不进版本库。
 
 ## 发行版本
 
-- 最新：[v1.6.0 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.6.0) · [发行说明](RELEASE_NOTES_1.6.0.md)
+- 最新：[v1.6.0 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.6.0) · [发行说明](release-notes/RELEASE_NOTES_1.6.0.md)
   - `RelayTester-v1.6.0-android.apk` · `2,958,267` 字节 · SHA-256 `dee706ec89ee3e32db4b7603b35d1e3113466904ace7ace42547ad0c4bab1b23`
-  - 本版起所有发行版共用同一个包名 `com.relaytester.app` 与同一把正式发布密钥，**任何一个版本都能直接覆盖升级到更新的版本**，不必卸载重装（早期使用调试证书的安装包除外，说明见下）。
 
-历史版本（2026-10-04 起已用正式发布密钥重建后重新发布，代码与版本号与首次发布时相同，因此字节数与 SHA-256 与最初那一份不同；每个版本的说明页写明了该版当前的字节数与 SHA-256）：
+历史版本（每个版本的说明页写明了该版当前安装包的字节数与 SHA-256）：
 
-- [v1.5.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.5.0) · [发行说明](RELEASE_NOTES_1.5.0.md)
-- [v1.4.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.4.0) · [发行说明](RELEASE_NOTES_1.4.0.md)
-- [v1.3.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.3.0) · [发行说明](RELEASE_NOTES_1.3.0.md)
-- [v1.2.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.2.0) · [发行说明](RELEASE_NOTES_1.2.0.md)
-- [v1.1.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.1.0) · [发行说明](RELEASE_NOTES_1.1.0.md)
-- [v1.0.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.0.0) · [发行说明](RELEASE_NOTES_1.0.0.md)
-
-2026-10-04 之前发布的安装包（包名 `com.relaytester.app.debug`、用 Android 调试证书签名）与现在的版本是**两个不同的 App**，Android 不允许互相覆盖。如果你手机上装的是那时下载的版本，需要手动装一次现在的正式签名包：先在旧 App 里「导入或导出配置」做一次加密导出，装好新包后导入即可；之后所有更新都在 App 内完成。详细步骤见 [RELEASE_SIGNING.md](RELEASE_SIGNING.md)。
+- [v1.5.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.5.0) · [发行说明](release-notes/RELEASE_NOTES_1.5.0.md)
+- [v1.4.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.4.0) · [发行说明](release-notes/RELEASE_NOTES_1.4.0.md)
+- [v1.3.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.3.0) · [发行说明](release-notes/RELEASE_NOTES_1.3.0.md)
+- [v1.2.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.2.0) · [发行说明](release-notes/RELEASE_NOTES_1.2.0.md)
+- [v1.1.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.1.0) · [发行说明](release-notes/RELEASE_NOTES_1.1.0.md)
+- [v1.0.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.0.0) · [发行说明](release-notes/RELEASE_NOTES_1.0.0.md)
 
 ## 更多文档
 
-- [开发实施规范](DEVELOPMENT_IMPLEMENTATION_SPEC.md)
-- [余额模板指南](BALANCE_TEMPLATE_GUIDE.md)
-- [配置备份与迁移](CONFIG_BACKUP_IMPORT_EXPORT_V5_SPEC.md)
-- [界面规范](UI_STARTUP_POLISH_V6_SPEC.md)
-- [检测包与指纹检测实现](docs/FINGERPRINT_DETECTION_PACKAGE.md)
-- [发布签名](RELEASE_SIGNING.md)
+- [各版本发行说明](release-notes/)
 - [第三方许可声明](THIRD_PARTY_NOTICES.md)

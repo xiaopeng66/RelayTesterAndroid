@@ -29,7 +29,7 @@ android {
             // command line as -Drelaytester.storePassword=…, so no secret is ever written
             // into the tree. Losing either the file or the password means the published app
             // can never be updated in place again — there is no recovery, so keep a copy of
-            // both off this machine (see RELEASE_SIGNING.md).
+            // both off this machine.
             storeFile = rootProject.file("keystore-relay-tester-release.p12")
             storeType = "PKCS12"
             keyAlias = "relaytester"

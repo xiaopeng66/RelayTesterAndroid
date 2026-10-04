@@ -51,10 +51,9 @@
 
 ## 说明
 
-- 本页安装包为 **2026-10-04 用正式发布密钥重建**后重新发布：包名 `com.relaytester.app`、版本名去掉了 `-optimized` 后缀，代码与版本代码与首次发布时相同。因此它的字节数与 SHA-256 与最初那一份不同——现在所有已发布版本共用同一把密钥，任何版本都能直接覆盖升级到更新的版本。
 - 检测结果是**参考库内的封闭集合排序，不是身份证明**：不在库中的模型同样会得到最接近的候选，同家族相邻版本尤其难以区分；只有 3 条回答都有效时才给出置信度。
 - 安全区与已知限制（如：不设 `FLAG_SECURE`、模板可把密钥写进 URL、SAF 导出非原子写、重试会重放非幂等请求、错误脱敏是前缀匹配）在 README「安全与隐私」一节如实登记，请在使用前过目。
-- 移植自 [lm-detector](https://github.com/Ikaleio/lm-detector)（MIT License, Copyright (c) 2026 xqy2006）。检测包的算法与上游 `shared-detector-v1` 对齐，端侧实现与参数量化带来的差异已在 `THIRD_PARTY_NOTICES.md` 与 `docs/FINGERPRINT_DETECTION_PACKAGE.md` 中如实声明。
+- 移植自 [lm-detector](https://github.com/Ikaleio/lm-detector)（MIT License, Copyright (c) 2026 xqy2006）。检测包的算法与上游 `shared-detector-v1` 对齐，端侧实现与参数量化带来的差异已在 `THIRD_PARTY_NOTICES.md` 中如实声明。
 
 ## 下载
 
