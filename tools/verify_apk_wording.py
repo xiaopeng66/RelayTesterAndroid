@@ -37,9 +37,23 @@ FINAL = [
     "筛选模型",
     "清空筛选",
     "选择模型",
-    # 10505: the update manifest gained a format gate, so a manifest whose package format
-    # this build cannot score is refused with this exact sentence.
-    "更新清单的格式版本",
+    # The detection-package card's actionable sentence. Two causes print it (a package
+    # format too new to read, and a manifest whose minAppVersionCode is above this app's),
+    # so both halves are pinned: the form that carries the version code, and the bare one.
+    "线上检测包需要更新版本的 App 才能使用（需要版本代码 ≥ ",
+    "线上检测包需要更新版本的 App 才能使用。",
+    # The update surface: the header entry (both states of its description, since the dot
+    # is the only part that changes), the way into it from the package card, and the two
+    # switches with the sentence that says when each one fires.
+    "关于与更新",
+    "关于与更新，有新版本",
+    "去更新软件",
+    "自动检查软件更新",
+    "打开 App 时自动检查，最多每 6 小时一次",
+    "自动检查检测包更新",
+    "打开本面板时自动检查一次",
+    "两个更新渠道各自独立，可分别关闭自动检查。",
+    "自动检查检测包更新的开关在「指纹检测」面板的检测包卡片里。",
 ]
 
 # Only strings that this round retired everywhere. A word that still has a legitimate
@@ -61,6 +75,10 @@ RETIRED = [
     # 10505: upstream dropped its verifier scorer, so the caveat it fed is gone with it.
     # Nothing else in the app prints it, so it must not survive in a build.
     "排名与核验的第一候选不一致，请谨慎。",
+    # 10505 answered an unreadable package format with a format number and no way forward
+    # (「更新清单的格式版本 3 不受支持」). It now says which app version to reach instead,
+    # so the technical sentence must not come back.
+    "更新清单的格式版本",
 ]
 
 

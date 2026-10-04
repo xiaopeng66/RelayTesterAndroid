@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  What the updater may hand out through its content URI: the cache directory it downloads
+  into, and nothing else. The path has to cover `updates/` because that is where
+  AndroidApkInstaller puts the file; anything the app keeps in `files/` stays unreachable
+  from another process.
+-->
+<paths>
+    <cache-path
+        name="updates"
+        path="updates/" />
+</paths>

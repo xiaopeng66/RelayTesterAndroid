@@ -1,10 +1,15 @@
 package com.relaytester.app
 
+import com.relaytester.app.core.fingerprint.BankManifest
 import com.relaytester.app.core.fingerprint.BankSource
+import com.relaytester.app.feature.fingerprint.FingerprintUiState
+import com.relaytester.app.feature.fingerprint.bankCheckOutcome
+import com.relaytester.app.feature.fingerprint.bankNeedsNewerAppLine
 import com.relaytester.app.feature.fingerprint.bankSourceLabel
 import com.relaytester.app.feature.fingerprint.bankStateLine
 import com.relaytester.app.feature.fingerprint.bankUpdateOffer
 import com.relaytester.app.feature.fingerprint.formatBankSize
+import com.relaytester.app.ui.components.UpdateCheckOutcome
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -107,4 +112,74 @@ class BankCardTextTest {
             bankStateLine(BankSource.NOT_PROVISIONED, "", 0, 0),
         )
     }
+
+    @Test
+    fun `the newer-app line names the version code the publisher asked for`() {
+        // Two causes share this line (a package format too new to read, and a manifest
+        // whose minAppVersionCode is above this app's), and the number is the actionable
+        // part: it is what the user has to reach, so it must survive into the sentence.
+        assertEquals(
+            "线上检测包需要更新版本的 App 才能使用（需要版本代码 ≥ 10505）。",
+            bankNeedsNewerAppLine(10_505L),
+        )
+    }
+
+    @Test
+    fun `the newer-app line still reads when no version code was stated`() {
+        // A manifest too new to parse carries no requirement this build can read; the
+        // line has to stay a sentence rather than print "≥ 0".
+        val line = bankNeedsNewerAppLine(0L)
+
+        assertEquals("线上检测包需要更新版本的 App 才能使用。", line)
+        assertFalse(line.contains("版本代码"))
+    }
+
+    @Test
+    fun `a panel that never checked reports no outcome`() {
+        assertEquals(UpdateCheckOutcome.NEVER_CHECKED, bankCheckOutcome(FingerprintUiState()))
+    }
+
+    @Test
+    fun `a finished check with nothing to offer is up to date`() {
+        val state = FingerprintUiState(bankCheckedAtMillis = 1_791_009_120_000L)
+
+        assertEquals(UpdateCheckOutcome.UP_TO_DATE, bankCheckOutcome(state))
+    }
+
+    @Test
+    fun `an offer and a newer-app demand each map to their own outcome`() {
+        assertEquals(
+            UpdateCheckOutcome.OFFER,
+            bankCheckOutcome(FingerprintUiState(availableBankUpdate = manifest())),
+        )
+        assertEquals(
+            UpdateCheckOutcome.NEEDS_NEWER_APP,
+            bankCheckOutcome(FingerprintUiState(bankNeedsNewerApp = 10_505L)),
+        )
+    }
+
+    @Test
+    fun `a failure outranks the offer it left behind`() {
+        // A check that fails does not retract the last successful offer — it stays on the
+        // card — but the newest fact is that the endpoint could not be reached, so that is
+        // what the status line has to report.
+        val state = FingerprintUiState(
+            bankCheckedAtMillis = 1_791_009_120_000L,
+            bankCheckFailed = true,
+            availableBankUpdate = manifest(),
+        )
+
+        assertEquals(UpdateCheckOutcome.FAILED, bankCheckOutcome(state))
+    }
+
+    private fun manifest() = BankManifest(
+        formatVersion = 3,
+        builtAt = "2026-09-30T05:12:31+00:00",
+        referenceSha256 = "reference",
+        modelCount = 53,
+        sizeBytes = 3_476_998,
+        sha256 = "digest",
+        url = "https://example.test/bank/lite-bank.bin",
+        minAppVersionCode = 0,
+    )
 }

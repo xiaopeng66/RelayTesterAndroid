@@ -1,15 +1,20 @@
 package com.relaytester.app.ui.components
 
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.ImportExport
+import androidx.compose.material.icons.outlined.SystemUpdateAlt
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -35,6 +40,15 @@ fun RelayAppHeader(
     onDestinationSelected: (AppDestination) -> Unit,
     modifier: Modifier = Modifier,
     onConfigurationBackup: (() -> Unit)? = null,
+    onOpenUpdates: (() -> Unit)? = null,
+    /**
+     * Draws a dot on the update icon.
+     *
+     * The one piece of update state that is visible without opening anything: the panel is
+     * a separate screen away from wherever the user is, and the only honest way to say
+     * "there is something for you" from the header is a mark on the way in.
+     */
+    hasUpdate: Boolean = false,
 ) {
     Column(modifier = modifier.fillMaxWidth()) {
         TopAppBar(
@@ -66,6 +80,29 @@ fun RelayAppHeader(
                             imageVector = Icons.Outlined.ImportExport,
                             contentDescription = "导入或导出配置",
                         )
+                    }
+                }
+                onOpenUpdates?.let { onClick ->
+                    Box {
+                        IconButton(onClick = onClick) {
+                            Icon(
+                                imageVector = Icons.Outlined.SystemUpdateAlt,
+                                // The dot is invisible to a screen reader, so the news is
+                                // carried by the name as well.
+                                contentDescription = if (hasUpdate) "关于与更新，有新版本" else "关于与更新",
+                            )
+                        }
+                        if (hasUpdate) {
+                            // A plain dot in the error colour, which is the same colour the
+                            // panel uses for "something is waiting for you".
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.TopEnd)
+                                    .padding(top = 8.dp, end = 8.dp)
+                                    .size(8.dp)
+                                    .background(MaterialTheme.colorScheme.error, CircleShape),
+                            )
+                        }
                     }
                 }
             },

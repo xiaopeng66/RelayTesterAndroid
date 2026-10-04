@@ -285,8 +285,9 @@ class FingerprintProgressAndHistoryTest {
         relayApiFactory = { api },
         bankStore = MemoryBankFileSystem().store(),
         bankUpdateClient = com.relaytester.app.core.fingerprint.BankUpdateClient(
-            fetcher = FakeBankFetcher(),
+            fetcher = FakeHttpFetcher(),
         ),
+        updatePreferences = MemoryUpdatePreferences(),
         appVersionCode = 10_400L,
         historyStore = history,
         skipRestore = false,

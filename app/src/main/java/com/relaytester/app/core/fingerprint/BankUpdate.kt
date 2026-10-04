@@ -1,22 +1,30 @@
 package com.relaytester.app.core.fingerprint
 
 import androidx.compose.runtime.Immutable
-import java.io.ByteArrayOutputStream
-import java.io.IOException
-import java.util.concurrent.TimeUnit
-import kotlinx.coroutines.CancellableContinuation
-import kotlinx.coroutines.suspendCancellableCoroutine
-import okhttp3.Call
-import okhttp3.Callback
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
+import com.relaytester.app.core.update.DownloadProgress
+import com.relaytester.app.core.update.HttpFetcher
 import org.json.JSONObject
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 
-/** Anything that stops a check or an install, carrying a message meant for the panel. */
-class BankUpdateException(message: String, cause: Throwable? = null) : Exception(message, cause)
+/**
+ * Anything that stops a check or an install, carrying a message meant for the panel.
+ *
+ * Open so a caller that catches this one still catches every parse or download failure,
+ * including the typed "the package shape is newer than this build" case below.
+ */
+open class BankUpdateException(message: String, cause: Throwable? = null) : Exception(message, cause)
+
+/**
+ * The published manifest describes a package shape this build cannot score.
+ *
+ * Raised while parsing, so it carries the app version the publisher asked for: the new
+ * shape's fields are unreadable, but `minAppVersionCode` is read *before* the format range
+ * is judged exactly so this can become "update the app" instead of a raw format message.
+ * `requiredVersionCode` is 0 when the manifest does not carry the field.
+ */
+class BankFormatTooNewException(
+    val formatVersion: Int,
+    val requiredVersionCode: Long,
+) : BankUpdateException("更新清单的格式过新（$formatVersion），本版 App 读不了")
 
 /**
  * What the release endpoint advertises about the newest reference bank.
@@ -50,6 +58,10 @@ object BankManifestParser {
      * installable — the app detects the actual shape from the file's magic, so accepting
      * the older manifest only avoids making a fleet-wide upgrade out of a republish. An
      * app older than this build sees `minAppVersionCode` and offers the app update instead.
+     *
+     * A shape *newer* than [MAX_SUPPORTED_FORMAT] is not a plain error either: the
+     * publisher bumps the format when it needs app support for it, so it is reported as
+     * "this app is too old" with the version code the manifest asks for.
      */
     const val MIN_SUPPORTED_FORMAT = 2
 
@@ -63,8 +75,16 @@ object BankManifestParser {
             throw BankUpdateException("更新清单无法解析")
         }
         val formatVersion = root.optInt("formatVersion", -1)
-        if (formatVersion < MIN_SUPPORTED_FORMAT || formatVersion > MAX_SUPPORTED_FORMAT) {
-            throw BankUpdateException("更新清单的格式版本 $formatVersion 不受支持")
+        // The app requirement is read *before* the format is judged. A manifest whose
+        // shape this build cannot score is far more often "this app is old" than "the
+        // publisher is wrong", and the version code is the only part of it that still
+        // means something here — without it the user gets a format number and no action.
+        val minAppVersionCode = root.optLong("minAppVersionCode", 0L)
+        if (formatVersion > MAX_SUPPORTED_FORMAT) {
+            throw BankFormatTooNewException(formatVersion, minAppVersionCode)
+        }
+        if (formatVersion < MIN_SUPPORTED_FORMAT) {
+            throw BankUpdateException("更新清单的格式过旧（$formatVersion），无法使用")
         }
         val builtAt = root.string("builtAt", "构建时间")
         val sizeBytes = root.optLong("sizeBytes", -1)
@@ -87,7 +107,7 @@ object BankManifestParser {
             sizeBytes = sizeBytes,
             sha256 = root.digest("sha256"),
             url = url,
-            minAppVersionCode = root.optLong("minAppVersionCode", 0L),
+            minAppVersionCode = minAppVersionCode,
         )
     }
 
@@ -111,8 +131,13 @@ sealed interface BankUpdateCheck {
     /** The published bank is the one already in use. */
     data object UpToDate : BankUpdateCheck
 
-    /** The published bank needs a newer app, so installing it here would be wrong. */
-    data class NeedsNewerApp(val manifest: BankManifest) : BankUpdateCheck
+    /**
+     * The published package needs a newer app, so installing it here would be wrong.
+     *
+     * [requiredVersionCode] is what the publisher asks for, or 0 when the manifest is a
+     * shape too new to read and does not carry the field.
+     */
+    data class NeedsNewerApp(val requiredVersionCode: Long) : BankUpdateCheck
 }
 
 /** Where the published bank lives. */
@@ -123,24 +148,13 @@ object BankUpdateDefaults {
 }
 
 /**
- * Fetches bytes over the network.
- *
- * An interface so the update flow can be tested without a server, and so the device
- * end-to-end run can point at a local endpoint.
- */
-interface BankFetcher {
-    /** GETs [url], refusing a body larger than [maxBytes]. */
-    suspend fun fetch(url: String, maxBytes: Int): ByteArray
-}
-
-/**
  * Checks what is published and downloads it once the user asks for it.
  *
  * Nothing here installs anything: [download] returns verified bytes and the store
  * decides what to do with them.
  */
 class BankUpdateClient(
-    private val fetcher: BankFetcher,
+    private val fetcher: HttpFetcher,
     private val manifestUrl: String = BankUpdateDefaults.MANIFEST_URL,
     private val maxManifestBytes: Int = MAX_MANIFEST_BYTES,
 ) {
@@ -152,12 +166,21 @@ class BankUpdateClient(
      */
     suspend fun check(localSha256: String?, appVersionCode: Long): BankUpdateCheck {
         val bytes = fetcher.fetch(manifestUrl, maxManifestBytes)
-        val manifest = BankManifestParser.parse(String(bytes, Charsets.UTF_8))
+        val manifest = try {
+            BankManifestParser.parse(String(bytes, Charsets.UTF_8))
+        } catch (tooNew: BankFormatTooNewException) {
+            // A shape this build cannot read is not something to report as a parse
+            // failure: the publisher's own app requirement says what to do about it, and
+            // the panel turns this into an app-update prompt rather than a format number.
+            return BankUpdateCheck.NeedsNewerApp(tooNew.requiredVersionCode)
+        }
         return when {
             // Identity comes first: a package we already have is nothing to do, whatever
             // the manifest asks of the app.
             localSha256 != null && manifest.sha256 == localSha256 -> BankUpdateCheck.UpToDate
-            manifest.minAppVersionCode > appVersionCode -> BankUpdateCheck.NeedsNewerApp(manifest)
+            manifest.minAppVersionCode > appVersionCode ->
+                BankUpdateCheck.NeedsNewerApp(manifest.minAppVersionCode)
+
             else -> BankUpdateCheck.Available(manifest)
         }
     }
@@ -167,12 +190,23 @@ class BankUpdateClient(
      *
      * The size and the digest are checked here, so bytes that do not match what the
      * manifest promised never reach the store.
+     *
+     * [onProgress] reports bytes as they arrive. The server's declared length is used when
+     * it sent one and the manifest's own size when it did not, so a panel that wants to
+     * print "1.3/2.0 MB" always has a denominator: the two must agree anyway, because a
+     * mismatch here is rejected below.
      */
     suspend fun download(
         manifest: BankManifest,
         maxBytes: Int = FingerprintBankStore.MAX_INSTALLED_BYTES.toInt(),
+        onProgress: (DownloadProgress) -> Unit = {},
     ): ByteArray {
-        val bytes = fetcher.fetch(manifest.url, maxBytes)
+        val bytes = fetcher.fetch(manifest.url, maxBytes) { progress ->
+            onProgress(
+                if (progress.totalBytes > 0) progress
+                else progress.copy(totalBytes = manifest.sizeBytes),
+            )
+        }
         if (bytes.size.toLong() != manifest.sizeBytes) {
             throw BankUpdateException("下载的检测包大小与清单不符（${bytes.size} ≠ ${manifest.sizeBytes}）")
         }
@@ -184,81 +218,5 @@ class BankUpdateClient(
 
     companion object {
         const val MAX_MANIFEST_BYTES = 256 * 1024
-    }
-}
-
-/**
- * [BankFetcher] over OkHttp.
- *
- * Timeouts are deliberately short and separate from the relay client's: a bank is a
- * few hundred kilobytes from one fixed host, and a stalled download has to fail rather
- * than hold the panel's spinner. The call is enqueued rather than run on the calling
- * thread so cancelling the work actually closes the connection.
- */
-class OkHttpBankFetcher(
-    private val client: OkHttpClient = OkHttpClient.Builder()
-        .retryOnConnectionFailure(true)
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .callTimeout(90, TimeUnit.SECONDS)
-        .build(),
-) : BankFetcher {
-    override suspend fun fetch(url: String, maxBytes: Int): ByteArray {
-        val request = Request.Builder()
-            .url(url)
-            .header("Accept", "application/json, application/octet-stream")
-            .build()
-        val call = client.newCall(request)
-        return suspendCancellableCoroutine { continuation ->
-            continuation.invokeOnCancellation { call.cancel() }
-            call.enqueue(object : Callback {
-                override fun onFailure(call: Call, error: IOException) {
-                    continuation.complete(
-                        Result.failure(BankUpdateException("网络请求失败：${error.message ?: "连接中断"}")),
-                    )
-                }
-
-                override fun onResponse(call: Call, response: Response) {
-                    continuation.complete(runCatching { response.use { readBody(it, maxBytes) } })
-                }
-            })
-        }
-    }
-
-    private fun readBody(response: Response, maxBytes: Int): ByteArray {
-        if (!response.isSuccessful) {
-            throw BankUpdateException("服务器返回 HTTP ${response.code}")
-        }
-        val body = response.body ?: throw BankUpdateException("服务器没有返回内容")
-        val declared = body.contentLength()
-        if (declared > maxBytes) {
-            throw BankUpdateException("文件过大（$declared 字节）")
-        }
-        val out = ByteArrayOutputStream(if (declared > 0) declared.toInt() else 64 * 1024)
-        try {
-            val source = body.byteStream()
-            val buffer = ByteArray(64 * 1024)
-            while (true) {
-                val read = source.read(buffer)
-                if (read < 0) break
-                // The declared length can lie, so the ceiling is enforced while reading too.
-                if (out.size().toLong() + read > maxBytes) {
-                    throw BankUpdateException("文件过大（超过 ${maxBytes / 1024} KB）")
-                }
-                out.write(buffer, 0, read)
-            }
-        } catch (error: BankUpdateException) {
-            throw error
-        } catch (error: IOException) {
-            // A connection dropped mid-body lands here, and OkHttp words that
-            // "unexpected end of stream" — not a sentence to put in front of a user.
-            throw BankUpdateException("下载中断（${error.message ?: "连接中断"}）", error)
-        }
-        return out.toByteArray()
-    }
-
-    private fun <T> CancellableContinuation<T>.complete(result: Result<T>) {
-        // A cancelled download has already been reported; resuming again would throw.
-        if (isActive) resumeWith(result)
     }
 }

@@ -91,8 +91,11 @@ import com.relaytester.app.core.fingerprint.FingerprintHistoryStore
 import com.relaytester.app.core.fingerprint.minimumNumbersFor
 import com.relaytester.app.ui.components.QuietIconButton
 import com.relaytester.app.ui.components.RelayAppHeader
+import com.relaytester.app.ui.components.UpdateDownloadRow
+import com.relaytester.app.ui.components.UpdateStatusRow
 import com.relaytester.app.ui.components.copyToClipboard
 import com.relaytester.app.ui.components.openUriSafely
+import com.relaytester.app.ui.components.updateCheckLine
 import com.relaytester.app.ui.navigation.AppDestination
 
 /**
@@ -110,6 +113,8 @@ fun FingerprintScreen(
     activeDestination: AppDestination = AppDestination.FINGERPRINT,
     onDestinationSelected: (AppDestination) -> Unit = {},
     onConfigurationBackup: () -> Unit = {},
+    onOpenUpdates: () -> Unit = {},
+    hasAppUpdate: Boolean = false,
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
@@ -141,6 +146,8 @@ fun FingerprintScreen(
                 selectedDestination = activeDestination,
                 onDestinationSelected = onDestinationSelected,
                 onConfigurationBackup = onConfigurationBackup,
+                onOpenUpdates = onOpenUpdates,
+                hasUpdate = hasAppUpdate,
             )
         },
         snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
@@ -179,7 +186,9 @@ fun FingerprintScreen(
                 onCheckBankUpdate = viewModel::checkBankUpdate,
                 onInstallBankUpdate = viewModel::installBankUpdate,
                 onRemovePackage = viewModel::removeInstalledPackage,
+                onAutoCheckBankChange = viewModel::setAutoCheckBank,
                 onClearHistory = viewModel::clearHistory,
+                onOpenUpdates = onOpenUpdates,
                 contentPadding = innerPadding,
             )
         }
@@ -205,7 +214,9 @@ private fun FingerprintContent(
     onCheckBankUpdate: () -> Unit,
     onInstallBankUpdate: () -> Unit,
     onRemovePackage: () -> Unit,
+    onAutoCheckBankChange: (Boolean) -> Unit,
     onClearHistory: () -> Unit,
+    onOpenUpdates: () -> Unit,
     contentPadding: androidx.compose.foundation.layout.PaddingValues,
 ) {
     LazyColumn(
@@ -365,6 +376,8 @@ private fun FingerprintContent(
                 onCheckBankUpdate = onCheckBankUpdate,
                 onInstallBankUpdate = onInstallBankUpdate,
                 onRemovePackage = onRemovePackage,
+                onAutoCheckBankChange = onAutoCheckBankChange,
+                onOpenUpdates = onOpenUpdates,
             )
         }
     }
@@ -535,15 +548,24 @@ internal fun formatHistoryTime(epochMillis: Long): String =
  * one exception is noted on the card itself, because a panel that quietly talked to the
  * network would make its "检测不联网" promise a lie.
  */
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
 private fun ReferenceBankCard(
     state: FingerprintUiState,
     onCheckBankUpdate: () -> Unit,
     onInstallBankUpdate: () -> Unit,
     onRemovePackage: () -> Unit,
+    onAutoCheckBankChange: (Boolean) -> Unit,
+    onOpenUpdates: () -> Unit,
 ) {
     val context = LocalContext.current
     val busy = state.isCheckingBankUpdate || state.isInstallingBank || state.isRunning
+    // Both checks speak here. The entry check used to be invisible: it set a flag no
+    // composable read, so a silent check in flight looked exactly like nothing happening.
+    val isCheckingBank = state.isCheckingBankUpdate || state.isCheckingBankInBackground
+    // Fixed for as long as the timestamp it describes: "今天 14:32" only changes when
+    // midnight passes, and re-reading the clock on every recomposition buys nothing.
+    val nowMillis = remember(state.bankCheckedAtMillis) { System.currentTimeMillis() }
     OutlinedCard {
         Column(
             modifier = Modifier.fillMaxWidth().padding(14.dp),
@@ -589,14 +611,52 @@ private fun ReferenceBankCard(
                 )
             }
 
+            UpdateStatusRow(
+                text = updateCheckLine(
+                    isChecking = isCheckingBank,
+                    checkedAtMillis = state.bankCheckedAtMillis,
+                    outcome = bankCheckOutcome(state),
+                    nowMillis = nowMillis,
+                ),
+                isChecking = isCheckingBank,
+            )
+
+            state.bankDownloadProgress?.let { progress ->
+                UpdateDownloadRow(progress = progress)
+            }
+
             // The published package demands an app newer than this one, so no install
-            // button is offered; the panel still has to say why, on every entry.
-            state.bankRequiringNewerApp?.let {
-                Text(
-                    "新检测包需要更高版本的 App 才能安装。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error,
-                )
+            // button is offered. The sentence is only useful if it can be acted on, so
+            // the whole row opens the update page.
+            state.bankNeedsNewerApp?.let { required ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(onClick = onOpenUpdates)
+                        .padding(vertical = 2.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        bankNeedsNewerAppLine(required),
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    Text(
+                        "去更新软件",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Icon(
+                        Icons.AutoMirrored.Outlined.OpenInNew,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                        tint = MaterialTheme.colorScheme.primary,
+                    )
+                }
             }
 
             if (state.bankSource == BankSource.NOT_PROVISIONED) {
@@ -669,6 +729,37 @@ private fun ReferenceBankCard(
             }
 
             SupportedModelsButton(models = state.bankModels)
+
+            // 自动检测与它管的那件事贴在一起：开关只管「进面板要不要自己查」，与上面的
+            // 手动按钮是一件事的两条路径，所以留在同一张卡上。
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        "自动检查检测包更新",
+                        style = MaterialTheme.typography.bodyMedium,
+                        // 名字挂在开关上，标题就不再单独播报一遍，否则读屏会把同一句话念两次。
+                        modifier = Modifier.clearAndSetSemantics {},
+                    )
+                    Text(
+                        "打开本面板时自动检查一次",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                // 与「并行发送三题」同一个做法：只有开关本身可切换（整行可点会让点标题也翻
+                // 状态），并按用户反馈把涟漪关掉——按下态的圆钮高光看着像已经选中。
+                CompositionLocalProvider(LocalRippleConfiguration provides null) {
+                    Switch(
+                        checked = state.autoCheckBank,
+                        onCheckedChange = onAutoCheckBankChange,
+                        modifier = Modifier.semantics { contentDescription = "自动检查检测包更新" },
+                    )
+                }
+            }
 
             Text(
                 "检测离线；取清单与装包才联网。",

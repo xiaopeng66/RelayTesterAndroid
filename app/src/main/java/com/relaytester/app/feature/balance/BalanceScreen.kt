@@ -124,6 +124,8 @@ fun BalanceScreen(
     onDestinationSelected: (AppDestination) -> Unit,
     onConfigurationBackup: () -> Unit,
     modifier: Modifier = Modifier,
+    onOpenUpdates: () -> Unit = {},
+    hasAppUpdate: Boolean = false,
 ) {
     val state by viewModel.balanceUiState.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
@@ -162,6 +164,8 @@ fun BalanceScreen(
             activeDestination = activeDestination,
             onDestinationSelected = onDestinationSelected,
             onConfigurationBackup = onConfigurationBackup,
+            onOpenUpdates = onOpenUpdates,
+            hasAppUpdate = hasAppUpdate,
             onQuery = viewModel::queryBalance,
             onQueryAll = viewModel::queryAllBalances,
             onSelectSupplier = viewModel::selectSupplier,
@@ -189,6 +193,8 @@ private fun BalanceHome(
     activeDestination: AppDestination,
     onDestinationSelected: (AppDestination) -> Unit,
     onConfigurationBackup: () -> Unit,
+    onOpenUpdates: () -> Unit,
+    hasAppUpdate: Boolean,
     onQuery: () -> Unit,
     onQueryAll: () -> Unit,
     onSelectSupplier: (String) -> Unit,
@@ -220,6 +226,8 @@ private fun BalanceHome(
                 selectedDestination = activeDestination,
                 onDestinationSelected = onDestinationSelected,
                 onConfigurationBackup = onConfigurationBackup,
+                onOpenUpdates = onOpenUpdates,
+                hasUpdate = hasAppUpdate,
             )
         },
         snackbarHost = {

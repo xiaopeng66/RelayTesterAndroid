@@ -179,6 +179,8 @@ fun TesterScreen(
     onDestinationSelected: (AppDestination) -> Unit = {},
     onConfigurationBackup: () -> Unit = {},
     onFingerprintModel: (String) -> Unit = {},
+    onOpenUpdates: () -> Unit = {},
+    hasAppUpdate: Boolean = false,
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val context = LocalContext.current
@@ -238,6 +240,8 @@ fun TesterScreen(
                 selectedDestination = activeDestination,
                 onDestinationSelected = onDestinationSelected,
                 onConfigurationBackup = onConfigurationBackup,
+                onOpenUpdates = onOpenUpdates,
+                hasUpdate = hasAppUpdate,
             )
         },
         snackbarHost = {

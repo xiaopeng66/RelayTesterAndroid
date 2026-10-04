@@ -4,17 +4,45 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+/**
+ * A signing secret, looked up outside the source tree: the Gradle property (a
+ * `gradle.properties` in the project or in ~/.gradle, neither of which is committed), the
+ * JVM system property (`-Drelaytester.storePassword=…`), or the environment
+ * (`RELAYTESTER_STORE_PASSWORD`).
+ *
+ * Null when this machine has no signing secrets, so a debug build still works; building the
+ * published variant then fails on the missing property name instead of on a keystore error.
+ */
+fun Project.secret(name: String): String? =
+    providers.gradleProperty(name).orNull
+        ?: System.getProperty(name)
+        ?: providers.environmentVariable(name.uppercase().replace('.', '_')).orNull
+
 android {
     namespace = "com.relaytester.app"
     compileSdk = 36
 
     signingConfigs {
         create("release") {
-            storeFile = rootProject.file("keystore-relay-tester-120.p12")
-            storePassword = System.getProperty("relaytester.storePassword")
-            keyAlias = "relaytester"
-            keyPassword = System.getProperty("relaytester.keyPassword")
+            // The published key. The two properties are read from a `gradle.properties`
+            // outside this repository (normally ~/.gradle/gradle.properties) or from the
+            // command line as -Drelaytester.storePassword=…, so no secret is ever written
+            // into the tree. Losing either the file or the password means the published app
+            // can never be updated in place again — there is no recovery, so keep a copy of
+            // both off this machine (see RELEASE_SIGNING.md).
+            storeFile = rootProject.file("keystore-relay-tester-release.p12")
             storeType = "PKCS12"
+            keyAlias = "relaytester"
+            // v2 is what installs; v3 is the one that carries a key-rotation lineage. Signing
+            // with v3 now means that if this key is ever lost, a new key can be introduced as
+            // an update (with a proof-of-rotation lineage) instead of making every user
+            // uninstall — Android 9+ honours it. Costs nothing today.
+            enableV3Signing = true
+            storePassword = project.secret("relaytester.storePassword")
+            // PKCS12 uses one password for the store and the key; the separate property stays
+            // supported so a future JKS key needs no code change.
+            keyPassword = project.secret("relaytester.keyPassword")
+                ?: project.secret("relaytester.storePassword")
         }
     }
 
@@ -40,8 +68,14 @@ android {
         // the fingerprint's, aligned to the 可用 pill's text centre), centres the challenge
         // cell's retry, gives the 有效 n/3 counter a fixed slot, and reads both the current
         // detection-package format and the previous one.
-        versionCode = 10_505
-        versionName = "1.5.0"
+        // 10600 adds the update surface: a header entry with a dot when something is
+        // published, a page showing both feeds (the app itself and the detection package),
+        // byte progress for both downloads, a timestamp for the last check of each, and one
+        // switch per feed. The detection package's card finally says what the silent entry
+        // check is doing, and an unreadable package format is reported as an app update with
+        // the version code to reach instead of a format number.
+        versionCode = 10_600
+        versionName = "1.6.0"
         ndk {
             abiFilters += "arm64-v8a"
         }
@@ -73,12 +107,14 @@ android {
         }
         create("optimized") {
             initWith(getByName("release"))
-            // Keep this package identical to the installed debug package so
-            // emulator validation can use adb install -r without touching the
-            // user's DataStore or Keystore records.
-            applicationIdSuffix = ".debug"
-            versionNameSuffix = "-optimized"
-            signingConfig = signingConfigs.getByName("debug")
+            // Same signing as `release`: this variant is what gets published, and an app can
+            // only be updated in place by a build with the same package name and the same
+            // signing certificate. `debug` keeps its own `.debug` package and debug signing
+            // so a development build can sit next to the published one.
+            signingConfig = signingConfigs.getByName("release")
+            // No versionNameSuffix, unlike `debug`: the update page prints the installed
+            // version name next to the feed's, and a "-optimized" marker there reads as a
+            // different version.
         }
     }
 

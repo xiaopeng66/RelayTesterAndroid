@@ -1,12 +1,16 @@
 package com.relaytester.app
 
-import com.relaytester.app.core.fingerprint.BankFetcher
+import com.relaytester.app.core.update.HttpFetcher
 import com.relaytester.app.core.fingerprint.BankFileSystem
 import com.relaytester.app.core.fingerprint.BankReader
 import com.relaytester.app.core.fingerprint.BankUpdateDefaults
 import com.relaytester.app.core.fingerprint.FingerprintBank
 import com.relaytester.app.core.fingerprint.FingerprintBankStore
 import com.relaytester.app.core.fingerprint.sha256Hex
+import com.relaytester.app.core.storage.UpdatePreferences
+import com.relaytester.app.core.storage.UpdatePreferencesState
+import com.relaytester.app.core.update.DownloadProgress
+import java.io.File
 import java.io.IOException
 import kotlinx.coroutines.CompletableDeferred
 import org.json.JSONObject
@@ -321,37 +325,110 @@ internal fun manifestJson(
 }.toString()
 
 /**
- * A [BankFetcher] that answers from memory.
+ * A [HttpFetcher] that answers from memory.
  *
  * Records the URLs it saw, so a test can tell "no check was attempted" from "a check
  * was attempted and failed".
  */
-internal class FakeBankFetcher(
+internal class FakeHttpFetcher(
     var manifestBody: String = "",
-    var bankBytes: ByteArray = ByteArray(0),
+    /** The body served for a non-JSON URL: the detection package, or an app APK. */
+    var body: ByteArray = ByteArray(0),
     /** When set, every fetch throws it. */
     var failure: Throwable? = null,
-) : BankFetcher {
+) : HttpFetcher {
     val urls = mutableListOf<String>()
 
     /** Parks every fetch until the test releases it, so a job can be held in flight. */
     var gate: CompletableDeferred<Unit>? = null
 
-    override suspend fun fetch(url: String, maxBytes: Int): ByteArray {
+    /**
+     * Bodies by URL suffix, for a test that serves both feeds at once.
+     *
+     * The default routing (`.json` gets [manifestBody], anything else [body]) cannot tell
+     * the two manifests apart, and the update page shows both channels together.
+     */
+    private val responses = mutableMapOf<String, ByteArray>()
+
+    /** Serves [bytes] for any URL ending in [suffix], ahead of the default routing. */
+    fun serve(suffix: String, bytes: ByteArray) {
+        responses[suffix] = bytes
+    }
+
+    /** Serves [text] as UTF-8 for any URL ending in [suffix]. */
+    fun serve(suffix: String, text: String) = serve(suffix, text.toByteArray(Charsets.UTF_8))
+
+    private fun bodyFor(url: String): ByteArray =
+        responses.entries.firstOrNull { url.endsWith(it.key) }?.value
+            ?: if (url.endsWith(".json")) manifestBody.toByteArray(Charsets.UTF_8) else body
+
+    override suspend fun fetch(
+        url: String,
+        maxBytes: Int,
+        onProgress: (DownloadProgress) -> Unit,
+    ): ByteArray {
         urls += url
+        val bytes = bodyFor(url)
+        // Reports the way the real fetcher does: the declared length before any body
+        // bytes, then the finished count. A test can therefore catch the panel mid-download
+        // by parking [gate] here, between the two.
+        onProgress(DownloadProgress(bytesRead = 0, totalBytes = bytes.size.toLong()))
         gate?.await()
         failure?.let { throw it }
-        return if (url.endsWith(".json")) manifestBody.toByteArray(Charsets.UTF_8) else bankBytes
+        onProgress(DownloadProgress(bytesRead = bytes.size.toLong(), totalBytes = bytes.size.toLong()))
+        return bytes
+    }
+
+    override suspend fun downloadTo(
+        url: String,
+        target: File,
+        maxBytes: Long,
+        onProgress: (DownloadProgress) -> Unit,
+    ): File {
+        val bytes = fetch(url, maxBytes.toInt(), onProgress)
+        target.parentFile?.mkdirs()
+        target.writeBytes(bytes)
+        return target
     }
 
     /** Points the fake at a publisher that has [bytes] and describes them honestly. */
     fun publish(bytes: ByteArray, builtAt: String = "2026-09-30T05:12:31+00:00") {
-        bankBytes = bytes
+        body = bytes
         manifestBody = manifestJson(bytes, builtAt = builtAt, url = BANK_URL)
     }
 
     companion object {
         const val BANK_URL = "https://example.test/bank/lite-bank.bin"
         val MANIFEST_URL: String get() = BankUpdateDefaults.MANIFEST_URL
+    }
+}
+
+/**
+ * An in-memory [UpdatePreferences].
+ *
+ * The real one needs a Context and a disk; the view model only asks what the two switches
+ * are and records changes, so both live in a field here. [state] is exposed so a test can
+ * assert what was actually written rather than what the panel is showing.
+ */
+internal class MemoryUpdatePreferences(
+    var state: UpdatePreferencesState = UpdatePreferencesState(),
+    /** When set, every write throws it, standing in for a disk that refuses. */
+    var writeFails: Boolean = false,
+) : UpdatePreferences(null) {
+    override suspend fun read(): UpdatePreferencesState = state
+
+    override suspend fun setAutoCheckBank(enabled: Boolean) {
+        if (writeFails) throw IOException("写入更新开关失败")
+        state = state.copy(autoCheckBank = enabled)
+    }
+
+    override suspend fun setAutoCheckApp(enabled: Boolean) {
+        if (writeFails) throw IOException("写入更新开关失败")
+        state = state.copy(autoCheckApp = enabled)
+    }
+
+    override suspend fun setLastAppCheckAt(millis: Long) {
+        if (writeFails) throw IOException("写入更新开关失败")
+        state = state.copy(lastAppCheckAt = millis)
     }
 }

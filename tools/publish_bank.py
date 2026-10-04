@@ -185,17 +185,28 @@ def request(token, method, url, data=None, content_type="application/json", raw=
     raise AssertionError("unreachable")  # the loop returns or raises on every path
 
 
-def release_by_tag(token):
-    status, body = request(token, "GET", f"{API}/repos/{REPO}/releases/tags/{TAG}")
+def release_by_tag(token, tag=TAG):
+    """The release for [tag], or None.
+
+    [tag] is a parameter so the app-release publisher can reuse this: its feed lives on a
+    second pre-release (`app`), and two pre-releases that never touch each other's assets
+    is what keeps the daily bank job from being able to disturb the APK feed.
+    """
+    status, body = request(token, "GET", f"{API}/repos/{REPO}/releases/tags/{tag}")
     if status == 404:
         return None
     if status != 200:
-        raise SystemExit(f"读取 {TAG} release 失败：HTTP {status} {body[:200]!r}")
+        raise SystemExit(f"读取 {tag} release 失败：HTTP {status} {body[:200]!r}")
     return json.loads(body)
 
 
-def ensure_release(token):
-    release = release_by_tag(token)
+def ensure_release(token, tag=TAG, name=RELEASE_NAME, body_text=None):
+    """[tag]'s release, created if it does not exist yet.
+
+    [body_text] is passed in already formatted (the app feed's notes have no placeholders);
+    the default formats the bank's own template, so the existing call sites are unchanged.
+    """
+    release = release_by_tag(token, tag)
     html_url = f"https://github.com/{REPO}/releases"
     if release is None:
         status, body = request(
@@ -203,16 +214,16 @@ def ensure_release(token):
             "POST",
             f"{API}/repos/{REPO}/releases",
             {
-                "tag_name": TAG,
-                "name": RELEASE_NAME,
-                "body": RELEASE_BODY.format(release_url=html_url),
+                "tag_name": tag,
+                "name": name,
+                "body": body_text if body_text is not None else RELEASE_BODY.format(release_url=html_url),
                 "prerelease": True,
                 "draft": False,
             },
         )
         if status not in (200, 201):
-            raise SystemExit(f"创建 {TAG} release 失败：HTTP {status} {body[:300]!r}")
-        print(f"created release {TAG}")
+            raise SystemExit(f"创建 {tag} release 失败：HTTP {status} {body[:300]!r}")
+        print(f"created release {tag}")
         return json.loads(body)
     print(f"reusing release {TAG} (id {release['id']})")
     return release

@@ -27,7 +27,6 @@ import com.relaytester.app.core.fingerprint.FingerprintChallenge
 import com.relaytester.app.core.fingerprint.FingerprintHistoryStore
 import com.relaytester.app.core.fingerprint.LoadedBank
 import com.relaytester.app.core.fingerprint.NumberFeatures
-import com.relaytester.app.core.fingerprint.OkHttpBankFetcher
 import com.relaytester.app.core.fingerprint.minimumNumbersFor
 import com.relaytester.app.core.model.ApiResult
 import com.relaytester.app.core.model.ErrorKind
@@ -36,6 +35,9 @@ import com.relaytester.app.core.security.KeystoreSecretStore
 import com.relaytester.app.core.security.SecretStore
 import com.relaytester.app.core.storage.SupplierStore
 import com.relaytester.app.core.storage.SupplierStoreState
+import com.relaytester.app.core.storage.UpdatePreferences
+import com.relaytester.app.core.update.OkHttpFetcher
+import com.relaytester.app.core.update.DownloadProgress
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
@@ -158,17 +160,51 @@ data class FingerprintUiState(
     val isCheckingBankInBackground: Boolean = false,
     /** True while the checked bank is downloading and being installed. */
     val isInstallingBank: Boolean = false,
+    /**
+     * Bytes of the package download in flight; null when none is running.
+     *
+     * A 3 MB download over a phone connection is tens of seconds of "installing", which
+     * without this is indistinguishable from a hang.
+     */
+    val bankDownloadProgress: DownloadProgress? = null,
+    /**
+     * When the last package check finished, in epoch millis; null before the first one.
+     *
+     * The panel's own copy: a check used to leave either an offer or nothing at all, so a
+     * silent entry check that found no update was indistinguishable from one that never
+     * ran. This is what the status row prints, and it is written by both paths.
+     */
+    val bankCheckedAtMillis: Long? = null,
+    /**
+     * True when the last package check ended in an error.
+     *
+     * Kept because a failed check leaves no other trace: the reason is a snackbar, and the
+     * snackbar is gone the moment the user stops looking at it. The row has to be able to
+     * say the last check failed instead of falling back to "尚未检查".
+     */
+    val bankCheckFailed: Boolean = false,
+    /**
+     * Whether entering the panel checks the release endpoint on its own.
+     *
+     * Stored, not in-memory: a user who turned the automatic check off should not get it
+     * back by reopening the app. Off means the card's own 「检查更新」 is the only way to
+     * reach the endpoint.
+     */
+    val autoCheckBank: Boolean = true,
     /** Set when a check found a different published bank. */
     val availableBankUpdate: BankManifest? = null,
     /**
-     * Set when the published bank demands an app newer than this one.
+     * Set when the published package cannot be used by this app — the value is the app
+     * version code the publisher asks for, or 0 when the manifest did not say.
      *
-     * The update offer stays hidden in that case — an unparseable package must not be
-     * installable — but the panel still has to say why nothing is offered. This is the
-     * "update the app first" hint, and it is set by the silent entry check too, not
-     * only by the manual button.
+     * Two different answers land here: a manifest whose package format is newer than this
+     * build can read, and one whose `minAppVersionCode` is above this app's. They mean the
+     * same thing to the user ("update the app"), so the panel says it once instead of
+     * printing a format number. The update offer stays hidden either way — a package this
+     * app cannot score must not be installable — and the silent entry check sets this too,
+     * so the hint is there on every entry rather than only after pressing a button.
      */
-    val bankRequiringNewerApp: BankManifest? = null,
+    val bankNeedsNewerApp: Long? = null,
     val suppliers: List<SupplierOption> = emptyList(),
     val selectedSupplierId: String? = null,
     /** Filters the supplier's model list; it is no longer a free-text model name. */
@@ -267,6 +303,8 @@ class FingerprintViewModel(
     private val relayApiFactory: () -> RelayApi,
     private val bankStore: FingerprintBankStore,
     private val bankUpdateClient: BankUpdateClient,
+    /** The two update switches, which outlive the process. */
+    private val updatePreferences: UpdatePreferences,
     /** Installed version code, read by the factory from the package manager. */
     private val appVersionCode: Long = 0L,
     /** Past detections, capped on write; null in tests that do not exercise it. */
@@ -274,6 +312,8 @@ class FingerprintViewModel(
     private val skipRestore: Boolean = false,
     /** Overridden by tests so a round can be observed without racing real threads. */
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    /** Overridden by tests so a check's timestamp is a value, not "whenever this ran". */
+    private val clock: () -> Long = System::currentTimeMillis,
 ) : ViewModel() {
     private val relayApi: RelayApi by lazy { relayApiFactory() }
 
@@ -509,6 +549,9 @@ class FingerprintViewModel(
     /** A history read or write, tracked so tests can join it. */
     private var historyJob: Job? = null
 
+    /** The switch write, tracked so a test can tell "flipped" from "flipped and stored". */
+    private var preferenceJob: Job? = null
+
     /**
      * Suspends until anything the view model started has settled.
      *
@@ -521,6 +564,7 @@ class FingerprintViewModel(
         runJob?.join()
         bankUpdateJob?.join()
         historyJob?.join()
+        preferenceJob?.join()
         // A single-question retry outlives the round that spawned the failed model, so the
         // round's join alone would let a test finish while a re-ask it triggered is still in
         // flight. Snapshot first: a joined job removes itself from the map.
@@ -556,9 +600,13 @@ class FingerprintViewModel(
             // Skipping the restore is about the supplier store; every action on the panel
             // still scores against a package, so the package is loaded either way.
             loadJob = viewModelScope.launch {
-                val result = withContext(ioDispatcher) { bankStore.load() }
+                val (result, updates) = withContext(ioDispatcher) {
+                    // The switches are read on this path too: skipping the supplier read
+                    // must not mean skipping the user's "do not check on its own" choice.
+                    bankStore.load() to updatePreferences.read()
+                }
                 loadedBank = result.loaded
-                _uiState.update { it.withBank(result) }
+                _uiState.update { it.withBank(result).copy(autoCheckBank = updates.autoCheckBank) }
                 loadHistory()
                 replayPendingEntryCheck()
             }
@@ -585,10 +633,14 @@ class FingerprintViewModel(
             runCatching {
                 val bank = bankStore.load()
                 val state = supplierStore.read()
-                bank to state
+                // Read with the rest of the startup work: the entry check it gates runs
+                // in the same launch, and a switch read afterwards would come too late.
+                val updates = updatePreferences.read()
+                Triple(bank, state, updates)
             }
         }
-        loaded.onSuccess { (bank, storeState) ->
+        loaded.onSuccess { startup ->
+            val (bank, storeState, updateState) = startup
             loadedBank = bank.loaded
             knownSuppliers = storeState.suppliers
             // A prefill that arrived while the store was still loading must survive it.
@@ -600,6 +652,7 @@ class FingerprintViewModel(
                 it.withBank(bank).copy(
                     isLoading = false,
                     loadError = null,
+                    autoCheckBank = updateState.autoCheckBank,
                     suppliers = storeState.suppliers.map { item ->
                         SupplierOption(item.id, item.name)
                     },
@@ -1517,8 +1570,24 @@ class FingerprintViewModel(
      * the user did not ask for. Detection itself stays offline either way.
      */
     fun refreshBankOnEntry() {
+        // The switch is the whole point: off means this panel does not talk to the release
+        // endpoint unless the user presses 「检查更新」. Checked here rather than at the
+        // call site so every entry path honours it.
+        if (!_uiState.value.autoCheckBank) return
         entryCheckPending = true
         startBankCheck(silent = true)
+    }
+
+    /**
+     * Turns the panel's automatic entry check on or off, and remembers the choice.
+     *
+     * The state flips first: the write is a disk hop, and a switch that waits for it would
+     * look stuck. A failed write is not reported — the switch already moved, and the only
+     * consequence is that the old choice comes back on the next launch.
+     */
+    fun setAutoCheckBank(enabled: Boolean) {
+        _uiState.update { it.copy(autoCheckBank = enabled) }
+        preferenceJob = viewModelScope.launch { updatePreferences.setAutoCheckBank(enabled) }
     }
 
     private fun startBankCheck(silent: Boolean) {
@@ -1591,6 +1660,9 @@ class FingerprintViewModel(
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {
+            // A failed check is a finished check: the row has to show when it last ran and
+            // that it failed, because the snackbar carrying the reason is transient.
+            _uiState.update { it.copy(bankCheckedAtMillis = clock(), bankCheckFailed = true) }
             if (!silent) showMessage(error.message ?: "检查更新失败", isError = true)
         } finally {
             _uiState.update {
@@ -1600,10 +1672,13 @@ class FingerprintViewModel(
     }
 
     private fun applyCheckResult(check: BankUpdateCheck, silent: Boolean) {
+        // Every branch here is a *finished* check, so when it ran and that it did not fail
+        // are recorded once, above them, instead of in each one.
+        _uiState.update { it.copy(bankCheckedAtMillis = clock(), bankCheckFailed = false) }
         when (check) {
             is BankUpdateCheck.Available -> {
                 _uiState.update {
-                    it.copy(availableBankUpdate = check.manifest, bankRequiringNewerApp = null)
+                    it.copy(availableBankUpdate = check.manifest, bankNeedsNewerApp = null)
                 }
                 if (!silent) {
                     showMessage(
@@ -1616,17 +1691,20 @@ class FingerprintViewModel(
 
             BankUpdateCheck.UpToDate -> {
                 _uiState.update {
-                    it.copy(availableBankUpdate = null, bankRequiringNewerApp = null)
+                    it.copy(availableBankUpdate = null, bankNeedsNewerApp = null)
                 }
                 if (!silent) showMessage("检测包已是最新", isError = false)
             }
 
             is BankUpdateCheck.NeedsNewerApp -> {
                 _uiState.update {
-                    it.copy(availableBankUpdate = null, bankRequiringNewerApp = check.manifest)
+                    it.copy(
+                        availableBankUpdate = null,
+                        bankNeedsNewerApp = check.requiredVersionCode,
+                    )
                 }
                 if (!silent) {
-                    showMessage("发布的检测包需要更高版本的 App，请先更新应用", isError = true)
+                    showMessage("线上检测包需要更新版本的 App 才能使用", isError = true)
                 }
             }
         }
@@ -1640,9 +1718,14 @@ class FingerprintViewModel(
         // offer for the very package this install is about to make current.
         standDownBackgroundCheck()
         bankUpdateJob = viewModelScope.launch {
-            _uiState.update { it.copy(isInstallingBank = true) }
+            _uiState.update { it.copy(isInstallingBank = true, bankDownloadProgress = null) }
             try {
-                val bytes = bankUpdateClient.download(manifest)
+                // Progress is reported from the fetch itself: a 3 MB body arrives in dozens
+                // of chunks, and the window between "pressed" and "installed" is otherwise
+                // silent for as long as the connection is slow.
+                val bytes = bankUpdateClient.download(manifest) { progress ->
+                    _uiState.update { it.copy(bankDownloadProgress = progress) }
+                }
                 when (val result = withContext(ioDispatcher) { bankStore.install(bytes) }) {
                     is BankInstallResult.Installed -> {
                         val loaded = withContext(ioDispatcher) { bankStore.load() }
@@ -1662,7 +1745,9 @@ class FingerprintViewModel(
             } catch (error: Throwable) {
                 showMessage(error.message ?: "安装检测包失败", isError = true)
             } finally {
-                _uiState.update { it.copy(isInstallingBank = false) }
+                // Cleared here rather than after the download: a bar left at 62% next to a
+                // failure message would read as a download still running.
+                _uiState.update { it.copy(isInstallingBank = false, bankDownloadProgress = null) }
             }
         }
     }
@@ -1789,7 +1874,8 @@ class FingerprintViewModel(
                     secretStore = KeystoreSecretStore(applicationContext),
                     relayApiFactory = { RelayApi() },
                     bankStore = FingerprintBankStore(AndroidBankFileSystem(applicationContext)),
-                    bankUpdateClient = BankUpdateClient(fetcher = OkHttpBankFetcher()),
+                    bankUpdateClient = BankUpdateClient(fetcher = OkHttpFetcher()),
+                    updatePreferences = UpdatePreferences(applicationContext),
                     appVersionCode = installedVersionCode(applicationContext),
                     historyStore = FingerprintHistoryStore(AndroidHistoryFileSystem(applicationContext)),
                 ) as T

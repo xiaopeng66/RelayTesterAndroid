@@ -1,6 +1,7 @@
 package com.relaytester.app
 
-import com.relaytester.app.core.fingerprint.BankFetcher
+import com.relaytester.app.core.update.HttpFetcher
+import com.relaytester.app.core.fingerprint.BankFormatTooNewException
 import com.relaytester.app.core.fingerprint.BankManifest
 import com.relaytester.app.core.fingerprint.BankManifestParser
 import com.relaytester.app.core.fingerprint.BankUpdateCheck
@@ -28,7 +29,7 @@ class BankUpdateTest {
     /** The digest of the package in use; null would stand for "nothing installed". */
     private fun digestOf(bytes: ByteArray) = sha256Hex(bytes)
 
-    private fun client(fetcher: BankFetcher) = BankUpdateClient(fetcher = fetcher)
+    private fun client(fetcher: HttpFetcher) = BankUpdateClient(fetcher = fetcher)
 
     @Test
     fun `a manifest that describes a package parses`() {
@@ -40,19 +41,46 @@ class BankUpdateTest {
         assertEquals(shippedBankModelCount(), manifest.modelCount)
         assertEquals(patched.size.toLong(), manifest.sizeBytes)
         assertEquals(sha256Hex(patched), manifest.sha256)
-        assertEquals(FakeBankFetcher.BANK_URL, manifest.url)
+        assertEquals(FakeHttpFetcher.BANK_URL, manifest.url)
         assertEquals(0L, manifest.minAppVersionCode)
     }
 
     @Test
     fun `a manifest from an older or unknown format version is refused`() {
-        for (version in listOf(1, 4, 99)) {
+        // The two directions are not the same fact. Too old is a publisher problem, so it
+        // stays a plain failure; too new means *this app* is old, and the type is what
+        // lets the panel answer that with an app-update prompt instead of a format number.
+        val tooOld = runCatching {
+            BankManifestParser.parse(manifestJson(fixtureBankBytes(), formatVersion = 1))
+        }.exceptionOrNull()
+        assertTrue("格式版本 1 未被拒绝", tooOld is BankUpdateException)
+        assertTrue("格式过旧不该被当成 App 太旧", tooOld !is BankFormatTooNewException)
+
+        for (version in listOf(4, 99)) {
             val failure = runCatching {
                 BankManifestParser.parse(manifestJson(fixtureBankBytes(), formatVersion = version))
             }.exceptionOrNull()
 
-            assertTrue("格式版本 $version 未被拒绝", failure is BankUpdateException)
+            assertTrue("格式版本 $version 未被拒绝", failure is BankFormatTooNewException)
         }
+    }
+
+    @Test
+    fun `an unreadable format still carries the app version it asks for`() {
+        // The requirement is read before the format range is judged, so the number
+        // survives a shape whose other fields cannot be parsed at all.
+        val failure = runCatching {
+            BankManifestParser.parse(
+                manifestJson(
+                    fixtureBankBytes(),
+                    formatVersion = BankManifestParser.MAX_SUPPORTED_FORMAT + 1,
+                    minAppVersionCode = 10_600L,
+                ),
+            )
+        }.exceptionOrNull() as BankFormatTooNewException
+
+        assertEquals(BankManifestParser.MAX_SUPPORTED_FORMAT + 1, failure.formatVersion)
+        assertEquals(10_600L, failure.requiredVersionCode)
     }
 
     @Test
@@ -112,7 +140,7 @@ class BankUpdateTest {
     @Test
     fun `a check reports a different package as available`() = runBlocking {
         val patched = bankWithBuiltAt(patchStamp)
-        val fetcher = FakeBankFetcher().apply { publish(patched, builtAt = patchStamp) }
+        val fetcher = FakeHttpFetcher().apply { publish(patched, builtAt = patchStamp) }
 
         val result = client(fetcher).check(digestOf(fixtureBankBytes()), appVersionCode = 10_400L)
 
@@ -123,7 +151,7 @@ class BankUpdateTest {
     @Test
     fun `a check reports the published package as current when the digest matches`() = runBlocking {
         val shipped = fixtureBankBytes()
-        val fetcher = FakeBankFetcher().apply { publish(shipped) }
+        val fetcher = FakeHttpFetcher().apply { publish(shipped) }
 
         val result = client(fetcher).check(digestOf(shipped), appVersionCode = 10_400L)
 
@@ -135,7 +163,7 @@ class BankUpdateTest {
         // Nothing installed means the panel cannot score at all, so whatever is
         // published is an install rather than an update.
         val shipped = fixtureBankBytes()
-        val fetcher = FakeBankFetcher().apply { publish(shipped) }
+        val fetcher = FakeHttpFetcher().apply { publish(shipped) }
 
         val result = client(fetcher).check(localSha256 = null, appVersionCode = 10_400L)
 
@@ -145,12 +173,52 @@ class BankUpdateTest {
     @Test
     fun `a check refuses a package that needs a newer app`() = runBlocking {
         val patched = bankWithBuiltAt(patchStamp)
-        val fetcher = FakeBankFetcher().apply { publish(patched, builtAt = patchStamp) }
+        val fetcher = FakeHttpFetcher().apply { publish(patched, builtAt = patchStamp) }
         fetcher.manifestBody = manifestJson(patched, minAppVersionCode = 10_500L)
 
         val result = client(fetcher).check(digestOf(fixtureBankBytes()), appVersionCode = 10_400L)
 
-        assertTrue(result is BankUpdateCheck.NeedsNewerApp)
+        // The payload, not just the type: the panel prints the version code it must reach.
+        assertEquals(BankUpdateCheck.NeedsNewerApp(10_500L), result)
+    }
+
+    @Test
+    fun `a check turns an unreadable package format into an app requirement`() = runBlocking {
+        // Reported from a device: a build older than this one answered this exact manifest
+        // with 「更新清单的格式版本 3 不受支持」 — a format number, and nothing to do about
+        // it — even though the manifest stated the app version that would fix it.
+        //
+        // The stated requirement is one the app already meets on purpose. With a requirement
+        // above the installed version the client's own version gate would answer the same way,
+        // and this test would be pinning that gate instead of the format branch: a build that
+        // accepted the unreadable format would still pass. Only the format being unreadable
+        // can produce the answer below.
+        val patched = bankWithBuiltAt(patchStamp)
+        val fetcher = FakeHttpFetcher().apply { publish(patched, builtAt = patchStamp) }
+        fetcher.manifestBody = manifestJson(
+            patched,
+            formatVersion = BankManifestParser.MAX_SUPPORTED_FORMAT + 1,
+            minAppVersionCode = 10_500L,
+        )
+
+        val result = client(fetcher).check(digestOf(fixtureBankBytes()), appVersionCode = 10_505L)
+
+        assertEquals(BankUpdateCheck.NeedsNewerApp(10_500L), result)
+    }
+
+    @Test
+    fun `an unreadable format that states no requirement still reports the app`() = runBlocking {
+        // Knowing the app is too old is still true when the publisher omitted the number;
+        // 0 is how the panel is told "say it without a version code".
+        val fetcher = FakeHttpFetcher().apply { publish(fixtureBankBytes()) }
+        fetcher.manifestBody = manifestJson(
+            fixtureBankBytes(),
+            formatVersion = BankManifestParser.MAX_SUPPORTED_FORMAT + 1,
+        )
+
+        val result = client(fetcher).check(digestOf(fixtureBankBytes()), appVersionCode = 10_505L)
+
+        assertEquals(BankUpdateCheck.NeedsNewerApp(0L), result)
     }
 
     @Test
@@ -158,7 +226,7 @@ class BankUpdateTest {
         // Nothing to install, so there is nothing for the app-version gate to refuse: an
         // "update your app" prompt here would be noise.
         val shipped = fixtureBankBytes()
-        val fetcher = FakeBankFetcher().apply { publish(shipped) }
+        val fetcher = FakeHttpFetcher().apply { publish(shipped) }
         fetcher.manifestBody = manifestJson(shipped, minAppVersionCode = 10_500L)
 
         val result = client(fetcher).check(digestOf(shipped), appVersionCode = 10_400L)
@@ -169,10 +237,10 @@ class BankUpdateTest {
     @Test
     fun `a download that does not match its digest is refused`() = runBlocking {
         val patched = bankWithBuiltAt(patchStamp)
-        val fetcher = FakeBankFetcher().apply {
+        val fetcher = FakeHttpFetcher().apply {
             publish(patched, builtAt = patchStamp)
             // The server hands over something else than the manifest promised.
-            bankBytes = bankWithBuiltAt("2026-10-01T00:00:00.000000+00:00")
+            body = bankWithBuiltAt("2026-10-01T00:00:00.000000+00:00")
         }
         val manifest = BankManifestParser.parse(fetcher.manifestBody)
 
@@ -184,7 +252,7 @@ class BankUpdateTest {
     @Test
     fun `a download of the wrong size is refused`() = runBlocking {
         val patched = bankWithBuiltAt(patchStamp)
-        val fetcher = FakeBankFetcher().apply { publish(patched, builtAt = patchStamp) }
+        val fetcher = FakeHttpFetcher().apply { publish(patched, builtAt = patchStamp) }
         val manifest = BankManifestParser.parse(fetcher.manifestBody)
             .copy(sizeBytes = patched.size.toLong() + 1)
 
@@ -196,7 +264,7 @@ class BankUpdateTest {
     @Test
     fun `a download that matches its manifest is returned`() = runBlocking {
         val patched = bankWithBuiltAt(patchStamp)
-        val fetcher = FakeBankFetcher().apply { publish(patched, builtAt = patchStamp) }
+        val fetcher = FakeHttpFetcher().apply { publish(patched, builtAt = patchStamp) }
         val manifest = BankManifestParser.parse(fetcher.manifestBody)
 
         val bytes = client(fetcher).download(manifest)
@@ -207,7 +275,7 @@ class BankUpdateTest {
 
     @Test
     fun `a check reports a network failure instead of pretending nothing is published`() = runBlocking {
-        val fetcher = FakeBankFetcher(failure = IOException("连接中断"))
+        val fetcher = FakeHttpFetcher(failure = IOException("连接中断"))
 
         val failure = runCatching { client(fetcher).check(digestOf(fixtureBankBytes()), 10_400L) }
             .exceptionOrNull()
@@ -217,7 +285,7 @@ class BankUpdateTest {
 
     @Test
     fun `the check only asks the configured manifest url`() = runBlocking {
-        val fetcher = FakeBankFetcher().apply { publish(fixtureBankBytes()) }
+        val fetcher = FakeHttpFetcher().apply { publish(fixtureBankBytes()) }
 
         client(fetcher).check(digestOf(fixtureBankBytes()), appVersionCode = 10_400L)
 

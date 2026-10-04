@@ -1,6 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+    <!--
+      The app updates itself: it downloads a release APK and hands it to the system
+      installer. Android requires this permission for that, and the user still has to allow
+      "install unknown apps" for this app before anything is installed.
+    -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
         android:allowBackup="false"
@@ -22,5 +28,21 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+          The downloaded APK is handed to the system installer through a content URI: the
+          installer runs in another process, and a file:// path across processes has been
+          refused since Android 7. The authority is derived from the application id so the
+          debug and release builds do not claim the same one.
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.updates"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/update_file_paths" />
+        </provider>
     </application>
 </manifest>

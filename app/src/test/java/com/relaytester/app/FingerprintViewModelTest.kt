@@ -1,5 +1,6 @@
 package com.relaytester.app
 
+import com.relaytester.app.core.fingerprint.BankManifestParser
 import com.relaytester.app.core.fingerprint.BankSource
 import com.relaytester.app.core.fingerprint.BankUpdateClient
 import com.relaytester.app.core.fingerprint.sha256Hex
@@ -15,6 +16,7 @@ import com.relaytester.app.core.network.RelayApi
 import com.relaytester.app.core.security.SecretStore
 import com.relaytester.app.core.storage.SupplierStore
 import com.relaytester.app.core.storage.SupplierStoreState
+import com.relaytester.app.core.storage.UpdatePreferencesState
 import com.relaytester.app.feature.fingerprint.ChallengeProgress
 import com.relaytester.app.feature.fingerprint.ChallengeState
 import com.relaytester.app.feature.fingerprint.DetectionMode
@@ -84,7 +86,8 @@ class FingerprintViewModelTest {
         },
         relayApiFactory = { throw AssertionError("本测试不应发起网络请求") },
         bankStore = MemoryBankFileSystem().store(),
-        bankUpdateClient = BankUpdateClient(fetcher = FakeBankFetcher()),
+        bankUpdateClient = BankUpdateClient(fetcher = FakeHttpFetcher()),
+        updatePreferences = MemoryUpdatePreferences(),
         skipRestore = true,
     ).apply {
         // The real panel only shows itself once the bank is loaded; these tests skip the
@@ -105,8 +108,10 @@ class FingerprintViewModelTest {
         /** The main test dispatcher keeps a startup read deterministic; IO would not. */
         ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
         bankFiles: MemoryBankFileSystem = MemoryBankFileSystem(),
-        bankFetcher: FakeBankFetcher = FakeBankFetcher(),
+        bankFetcher: FakeHttpFetcher = FakeHttpFetcher(),
         appVersionCode: Long = 10_400L,
+        updatePreferences: MemoryUpdatePreferences = MemoryUpdatePreferences(),
+        clock: () -> Long = { FIXED_NOW_MILLIS },
     ): FingerprintViewModel = FingerprintViewModel(
         supplierStore = store,
         secretStore = object : SecretStore {
@@ -117,9 +122,11 @@ class FingerprintViewModelTest {
         relayApiFactory = { api },
         bankStore = bankFiles.store(),
         bankUpdateClient = BankUpdateClient(fetcher = bankFetcher),
+        updatePreferences = updatePreferences,
         appVersionCode = appVersionCode,
         skipRestore = skipRestore,
         ioDispatcher = ioDispatcher,
+        clock = clock,
     ).apply {
         // A skipped restore still loads the bank, and no test may race that.
         if (skipRestore) runBlocking { awaitIdle() }
@@ -130,7 +137,7 @@ class FingerprintViewModelTest {
         api: RelayApi,
         parallel: Boolean = true,
         models: List<String> = listOf("test-model"),
-        bankFetcher: FakeBankFetcher = FakeBankFetcher(),
+        bankFetcher: FakeHttpFetcher = FakeHttpFetcher(),
     ): FingerprintViewModel = apiViewModel(api, bankFetcher = bankFetcher).apply {
         selectSupplier("sup-1")
         // Ticked one at a time, exactly as the checkboxes do; the tick order is what
@@ -153,8 +160,9 @@ class FingerprintViewModelTest {
         api: RelayApi,
         models: List<String> = listOf("test-model"),
         bankFiles: MemoryBankFileSystem = MemoryBankFileSystem(),
-        bankFetcher: FakeBankFetcher = FakeBankFetcher(),
+        bankFetcher: FakeHttpFetcher = FakeHttpFetcher(),
         appVersionCode: Long = 10_400L,
+        updatePreferences: MemoryUpdatePreferences = MemoryUpdatePreferences(),
     ): FingerprintViewModel = apiViewModel(
         api = api,
         store = store,
@@ -163,6 +171,7 @@ class FingerprintViewModelTest {
         bankFiles = bankFiles,
         bankFetcher = bankFetcher,
         appVersionCode = appVersionCode,
+        updatePreferences = updatePreferences,
     ).apply {
         models.forEach { toggleModelSelection(it) }
         selectMode(DetectionMode.API)
@@ -1317,7 +1326,7 @@ class FingerprintViewModelTest {
 
     @Test
     fun `a device with no package is told to download one`() {
-        val fetcher = FakeBankFetcher().apply { publish(fixtureBankBytes()) }
+        val fetcher = FakeHttpFetcher().apply { publish(fixtureBankBytes()) }
         val subject = readyApiViewModelFor(
             SingleSupplierStore(testSupplier()),
             FakeCompletionApi(goldenCase().answers),
@@ -1334,7 +1343,7 @@ class FingerprintViewModelTest {
         assertEquals(BankSource.NOT_PROVISIONED, state.bankSource)
         // The panel is useless without a package, so entering it asks once by itself —
         // and only once: the manifest request is the whole of its unprompted networking.
-        assertEquals(listOf(FakeBankFetcher.MANIFEST_URL), fetcher.urls)
+        assertEquals(listOf(FakeHttpFetcher.MANIFEST_URL), fetcher.urls)
         assertNotNull("未安装时必须把下载入口摆出来", state.availableBankUpdate)
         assertNull("自动检查不上气泡，下载入口在卡片上", state.message)
     }
@@ -1381,7 +1390,7 @@ class FingerprintViewModelTest {
 
     @Test
     fun `entering the panel looks for a newer package even when one is installed`() {
-        val fetcher = FakeBankFetcher().apply {
+        val fetcher = FakeHttpFetcher().apply {
             publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp)
         }
         val subject = readyApiViewModelFor(
@@ -1395,14 +1404,14 @@ class FingerprintViewModelTest {
         subject.refreshBankOnEntry()
         runBlocking { subject.awaitIdle() }
 
-        assertEquals(listOf(FakeBankFetcher.MANIFEST_URL), fetcher.urls)
+        assertEquals(listOf(FakeHttpFetcher.MANIFEST_URL), fetcher.urls)
         assertEquals(patchStamp, subject.uiState.value.availableBankUpdate?.builtAt)
         assertNull("自动检查只把按钮摆出来，不弹气泡", subject.uiState.value.message)
     }
 
     @Test
     fun `an entry check that fails does not greet the user with an error`() {
-        val fetcher = FakeBankFetcher(failure = IOException("网络不可用"))
+        val fetcher = FakeHttpFetcher(failure = IOException("网络不可用"))
         val subject = readyApiViewModelFor(
             SingleSupplierStore(testSupplier()),
             FakeCompletionApi(goldenCase().answers),
@@ -1413,7 +1422,7 @@ class FingerprintViewModelTest {
         subject.refreshBankOnEntry()
         runBlocking { subject.awaitIdle() }
 
-        assertEquals(listOf(FakeBankFetcher.MANIFEST_URL), fetcher.urls)
+        assertEquals(listOf(FakeHttpFetcher.MANIFEST_URL), fetcher.urls)
         assertNull("用户没点的检查失败了不该弹错", subject.uiState.value.message)
         assertNull(subject.uiState.value.availableBankUpdate)
         assertFalse(subject.uiState.value.isCheckingBankUpdate)
@@ -1427,7 +1436,7 @@ class FingerprintViewModelTest {
         val store = MutableSupplierStore(listOf(testSupplier(models = listOf("m-one"))))
         val gate = CompletableDeferred<Unit>()
         store.gate = gate
-        val fetcher = FakeBankFetcher().apply { publish(fixtureBankBytes()) }
+        val fetcher = FakeHttpFetcher().apply { publish(fixtureBankBytes()) }
         val subject = apiViewModel(
             api = FakeCompletionApi(goldenCase().answers),
             store = store,
@@ -1445,7 +1454,7 @@ class FingerprintViewModelTest {
         gate.complete(Unit)
         runBlocking { subject.awaitIdle() }
 
-        assertEquals("读取落地后必须补上这次检查，且只补一次", listOf(FakeBankFetcher.MANIFEST_URL), fetcher.urls)
+        assertEquals("读取落地后必须补上这次检查，且只补一次", listOf(FakeHttpFetcher.MANIFEST_URL), fetcher.urls)
         assertNotNull("未安装时必须把下载入口摆出来", subject.uiState.value.availableBankUpdate)
     }
 
@@ -1467,7 +1476,7 @@ class FingerprintViewModelTest {
     fun `a round starts even while the entry check is still in flight`() {
         val api = FakeCompletionApi(goldenCase().answers)
         val gate = CompletableDeferred<Unit>()
-        val fetcher = FakeBankFetcher().apply {
+        val fetcher = FakeHttpFetcher().apply {
             publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp)
             this.gate = gate
         }
@@ -1505,7 +1514,7 @@ class FingerprintViewModelTest {
     @Test
     fun `a round is refused while the package install is in flight`() {
         val api = FakeCompletionApi(goldenCase().answers)
-        val fetcher = FakeBankFetcher().apply { publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp) }
+        val fetcher = FakeHttpFetcher().apply { publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp) }
         val subject = readyApiViewModel(api, bankFetcher = fetcher)
         runBlocking { subject.awaitIdle() }
 
@@ -1529,10 +1538,64 @@ class FingerprintViewModelTest {
     }
 
     @Test
+    fun `an install in flight shows how far the download got`() {
+        // A 3 MB body on a slow connection is a long silent wait otherwise: the button
+        // says "installing" and nothing moves.
+        val fetcher = FakeHttpFetcher().apply { publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp) }
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFetcher = fetcher,
+        )
+        runBlocking { subject.awaitIdle() }
+        subject.checkBankUpdate()
+        runBlocking { subject.awaitIdle() }
+        assertNull("还没开始下载就没有进度行", subject.uiState.value.bankDownloadProgress)
+
+        val gate = CompletableDeferred<Unit>()
+        fetcher.gate = gate
+        subject.installBankUpdate()
+
+        val parked = subject.uiState.value.bankDownloadProgress
+        assertNotNull("下载在飞时进度行必须在", parked)
+        assertEquals("分母来自包的声明大小", bankWithBuiltAt(patchStamp).size.toLong(), parked?.totalBytes)
+        assertEquals(0f, parked?.fraction)
+
+        gate.complete(Unit)
+        runBlocking { subject.awaitIdle() }
+        assertNull("装完进度行必须收起来", subject.uiState.value.bankDownloadProgress)
+        assertFalse(subject.uiState.value.isInstallingBank)
+    }
+
+    @Test
+    fun `a failed download takes its progress row with it`() {
+        // A bar left sitting at 0% next to a failure message reads as a download that is
+        // still running, which is the one thing it is not.
+        val fetcher = FakeHttpFetcher().apply { publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp) }
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFetcher = fetcher,
+        )
+        runBlocking { subject.awaitIdle() }
+        subject.checkBankUpdate()
+        runBlocking { subject.awaitIdle() }
+
+        fetcher.failure = IOException("connection reset")
+        subject.installBankUpdate()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertNull("失败之后不得留着进度行", state.bankDownloadProgress)
+        assertFalse(state.isInstallingBank)
+        assertTrue("失败要说出来", state.isMessageError)
+    }
+
+    @Test
     fun `a check the user pressed takes over the entry check instead of queueing behind it`() {
         val api = FakeCompletionApi(goldenCase().answers)
         val gate = CompletableDeferred<Unit>()
-        val fetcher = FakeBankFetcher().apply { publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp) }
+        val fetcher = FakeHttpFetcher().apply { publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp) }
         // mainDispatcher 作 IO：静默检查会在清单请求里确定性停住，取位一次算一次，
         // 不然「谁发了几次请求」变成调度竞速，断言会闪。
         val subject = readyApiViewModelFor(
@@ -1557,7 +1620,7 @@ class FingerprintViewModelTest {
         assertEquals(
             "让位之后按下的检查才是第二次清单请求",
             2,
-            fetcher.urls.count { it == FakeBankFetcher.MANIFEST_URL },
+            fetcher.urls.count { it == FakeHttpFetcher.MANIFEST_URL },
         )
         assertNotNull("用户按下的检查必须汇报结果", subject.uiState.value.message)
         assertFalse(subject.uiState.value.isCheckingBankUpdate)
@@ -1568,7 +1631,7 @@ class FingerprintViewModelTest {
     @Test
     fun `reentering during a silent bank check keeps one request for manual takeover`() {
         val gate = CompletableDeferred<Unit>()
-        val fetcher = FakeBankFetcher().apply {
+        val fetcher = FakeHttpFetcher().apply {
             publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp)
             this.gate = gate
         }
@@ -1579,13 +1642,13 @@ class FingerprintViewModelTest {
         )
         subject.refreshBankOnEntry()
         assertTrue(subject.uiState.value.isCheckingBankInBackground)
-        assertEquals(listOf(FakeBankFetcher.MANIFEST_URL), fetcher.urls)
+        assertEquals(listOf(FakeHttpFetcher.MANIFEST_URL), fetcher.urls)
 
         try {
             // A second entry must keep the first check reachable rather than launch
             // another request and replace the job that manual takeover needs to cancel.
             subject.refreshBankOnEntry()
-            assertEquals("重复进入只保留原来的静默清单请求", listOf(FakeBankFetcher.MANIFEST_URL), fetcher.urls)
+            assertEquals("重复进入只保留原来的静默清单请求", listOf(FakeHttpFetcher.MANIFEST_URL), fetcher.urls)
             assertTrue(subject.uiState.value.isCheckingBankInBackground)
             assertFalse(subject.uiState.value.isCheckingBankUpdate)
             assertNull(subject.uiState.value.message)
@@ -1609,7 +1672,7 @@ class FingerprintViewModelTest {
         val bare = apiViewModel(
             api = api,
             bankFiles = MemoryBankFileSystem(installed = null),
-            bankFetcher = FakeBankFetcher(),
+            bankFetcher = FakeHttpFetcher(),
         ).apply {
             selectSupplier("sup-1")
             toggleModelSelection("test-model")
@@ -1631,7 +1694,7 @@ class FingerprintViewModelTest {
     @Test
     fun `a check offers the published bank and installing it switches the panel over`() {
         val patched = bankWithBuiltAt(patchStamp)
-        val fetcher = FakeBankFetcher().apply { publish(patched, builtAt = patchStamp) }
+        val fetcher = FakeHttpFetcher().apply { publish(patched, builtAt = patchStamp) }
         val files = MemoryBankFileSystem()
         val subject = readyApiViewModelFor(
             SingleSupplierStore(testSupplier()),
@@ -1668,7 +1731,7 @@ class FingerprintViewModelTest {
             skipRestore = false,
             ioDispatcher = mainDispatcher,
             bankFiles = files,
-            bankFetcher = FakeBankFetcher().apply { publish(patched, builtAt = patchStamp) },
+            bankFetcher = FakeHttpFetcher().apply { publish(patched, builtAt = patchStamp) },
         )
         runBlocking { subject.awaitIdle() }
         subject.checkBankUpdate()
@@ -1686,7 +1749,7 @@ class FingerprintViewModelTest {
 
     @Test
     fun `a check that finds the same bank keeps the card clean`() {
-        val fetcher = FakeBankFetcher().apply { publish(fixtureBankBytes()) }
+        val fetcher = FakeHttpFetcher().apply { publish(fixtureBankBytes()) }
         val subject = readyApiViewModelFor(
             SingleSupplierStore(testSupplier()),
             FakeCompletionApi(goldenCase().answers),
@@ -1705,10 +1768,10 @@ class FingerprintViewModelTest {
 
     @Test
     fun `an install that fails verification leaves the working bank alone`() {
-        val fetcher = FakeBankFetcher().apply {
+        val fetcher = FakeHttpFetcher().apply {
             publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp)
             // The server hands over something other than the manifest promised.
-            bankBytes = bankWithBuiltAt("2026-10-01T00:00:00.000000+00:00")
+            body = bankWithBuiltAt("2026-10-01T00:00:00.000000+00:00")
         }
         val files = MemoryBankFileSystem()
         val subject = readyApiViewModelFor(
@@ -1734,7 +1797,7 @@ class FingerprintViewModelTest {
 
     @Test
     fun `an install without a check does nothing`() {
-        val fetcher = FakeBankFetcher().apply { publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp) }
+        val fetcher = FakeHttpFetcher().apply { publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp) }
         val subject = readyApiViewModelFor(
             SingleSupplierStore(testSupplier()),
             FakeCompletionApi(goldenCase().answers),
@@ -1754,7 +1817,7 @@ class FingerprintViewModelTest {
         val subject = readyApiViewModelFor(
             SingleSupplierStore(testSupplier()),
             FakeCompletionApi(goldenCase().answers),
-            bankFetcher = FakeBankFetcher(failure = IOException("连接中断")),
+            bankFetcher = FakeHttpFetcher(failure = IOException("连接中断")),
         )
         runBlocking { subject.awaitIdle() }
 
@@ -1770,7 +1833,7 @@ class FingerprintViewModelTest {
     @Test
     fun `a published bank that needs a newer app is refused`() {
         val patched = bankWithBuiltAt(patchStamp)
-        val fetcher = FakeBankFetcher().apply {
+        val fetcher = FakeHttpFetcher().apply {
             publish(patched, builtAt = patchStamp)
             manifestBody = manifestJson(patched, builtAt = patchStamp, minAppVersionCode = 10_500L)
         }
@@ -1797,7 +1860,7 @@ class FingerprintViewModelTest {
         // from the automatic per-entry check — someone who never presses the manual
         // button would otherwise see a panel that silently offers nothing.
         val patched = bankWithBuiltAt(patchStamp)
-        val fetcher = FakeBankFetcher().apply {
+        val fetcher = FakeHttpFetcher().apply {
             publish(patched, builtAt = patchStamp)
             manifestBody = manifestJson(patched, builtAt = patchStamp, minAppVersionCode = 10_500L)
         }
@@ -1813,10 +1876,146 @@ class FingerprintViewModelTest {
         runBlocking { subject.awaitIdle() }
 
         val state = subject.uiState.value
-        assertNotNull("静默检查也必须把「先更新应用」摆出来", state.bankRequiringNewerApp)
-        assertEquals(10_500L, state.bankRequiringNewerApp?.minAppVersionCode)
+        assertNotNull("静默检查也必须把「先更新应用」摆出来", state.bankNeedsNewerApp)
+        assertEquals(10_500L, state.bankNeedsNewerApp)
         assertNull("装不上的包不得出现更新按钮", state.availableBankUpdate)
         assertNull("静默检查不弹气泡", state.message)
+    }
+
+    @Test
+    fun `the silent entry check explains an unreadable format as an app update`() {
+        // Reported from a device: the panel answered a format-3 manifest with
+        // 「更新清单的格式版本 3 不受支持」 — a format number, and nothing the user could
+        // do — even though the manifest stated the app version that would fix it. The
+        // requirement has to reach the panel even though the rest of the manifest cannot
+        // be read at all, and it has to reach it through the automatic entry check.
+        val patched = bankWithBuiltAt(patchStamp)
+        val fetcher = FakeHttpFetcher().apply {
+            publish(patched, builtAt = patchStamp)
+            manifestBody = manifestJson(
+                patched,
+                builtAt = patchStamp,
+                formatVersion = BankManifestParser.MAX_SUPPORTED_FORMAT + 1,
+                minAppVersionCode = 10_600L,
+            )
+        }
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFetcher = fetcher,
+            appVersionCode = 10_505L,
+        )
+        runBlocking { subject.awaitIdle() }
+
+        subject.refreshBankOnEntry()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertEquals(10_600L, state.bankNeedsNewerApp)
+        assertNull("读不了的格式不得留下两台提示", state.availableBankUpdate)
+        assertNull("静默检查不弹气泡", state.message)
+    }
+
+    @Test
+    fun `a finished check leaves a timestamp the card can print`() {
+        // The entry check used to be invisible: it either produced an offer or left no
+        // trace at all, so "checked, nothing new" and "never checked" looked the same.
+        val fetcher = FakeHttpFetcher().apply { publish(fixtureBankBytes()) }
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFetcher = fetcher,
+        )
+        runBlocking { subject.awaitIdle() }
+        assertNull("构造本身不是一次检查", subject.uiState.value.bankCheckedAtMillis)
+
+        subject.refreshBankOnEntry()
+        runBlocking { subject.awaitIdle() }
+
+        assertEquals(FIXED_NOW_MILLIS, subject.uiState.value.bankCheckedAtMillis)
+        assertFalse(subject.uiState.value.bankCheckFailed)
+    }
+
+    @Test
+    fun `a check that could not reach the endpoint still leaves a timestamp`() {
+        // The reason is a snackbar and the snackbar goes away, so without this the row
+        // would fall back to "尚未检查" and the failure would look like it never happened.
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFetcher = FakeHttpFetcher().apply { failure = IOException("connection refused") },
+        )
+        runBlocking { subject.awaitIdle() }
+
+        subject.refreshBankOnEntry()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertEquals(FIXED_NOW_MILLIS, state.bankCheckedAtMillis)
+        assertTrue("静默检查也要记下它失败了", state.bankCheckFailed)
+        assertNull("静默检查不上气泡", state.message)
+    }
+
+    @Test
+    fun `a check that succeeds clears the earlier failure`() {
+        val fetcher = FakeHttpFetcher().apply { failure = IOException("connection refused") }
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFetcher = fetcher,
+        )
+        runBlocking { subject.awaitIdle() }
+        subject.refreshBankOnEntry()
+        runBlocking { subject.awaitIdle() }
+        assertTrue(subject.uiState.value.bankCheckFailed)
+
+        fetcher.failure = null
+        fetcher.publish(fixtureBankBytes())
+        subject.refreshBankOnEntry()
+        runBlocking { subject.awaitIdle() }
+
+        assertFalse("第二次成功之后不能再报失败", subject.uiState.value.bankCheckFailed)
+    }
+
+    @Test
+    fun `the automatic check is off when the stored switch says so`() {
+        val fetcher = FakeHttpFetcher().apply { publish(fixtureBankBytes()) }
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFetcher = fetcher,
+            updatePreferences = MemoryUpdatePreferences(UpdatePreferencesState(autoCheckBank = false)),
+        )
+        runBlocking { subject.awaitIdle() }
+        assertFalse("启动读到的开关要落到面板上", subject.uiState.value.autoCheckBank)
+
+        subject.refreshBankOnEntry()
+        runBlocking { subject.awaitIdle() }
+        assertEquals("关掉之后进面板不得联网", emptyList<String>(), fetcher.urls)
+
+        // The button is still the way in, and it is the same request.
+        subject.checkBankUpdate()
+        runBlocking { subject.awaitIdle() }
+        assertEquals(listOf(FakeHttpFetcher.MANIFEST_URL), fetcher.urls)
+    }
+
+    @Test
+    fun `flipping the switch is written down`() {
+        val preferences = MemoryUpdatePreferences()
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFetcher = FakeHttpFetcher().apply { publish(fixtureBankBytes()) },
+            updatePreferences = preferences,
+        )
+        runBlocking { subject.awaitIdle() }
+        assertTrue("默认开", subject.uiState.value.autoCheckBank)
+
+        subject.setAutoCheckBank(false)
+        runBlocking { subject.awaitIdle() }
+
+        assertFalse(subject.uiState.value.autoCheckBank)
+        assertFalse("开关要落盘，否则重启就变回来", preferences.state.autoCheckBank)
     }
 
     @Test
@@ -1824,7 +2023,7 @@ class FingerprintViewModelTest {
         // The flag describes the currently published manifest, not a permanent state:
         // once the publisher ships something this app can parse, the hint must go.
         val patched = bankWithBuiltAt(patchStamp)
-        val fetcher = FakeBankFetcher().apply { publish(patched, builtAt = patchStamp) }
+        val fetcher = FakeHttpFetcher().apply { publish(patched, builtAt = patchStamp) }
         val subject = readyApiViewModelFor(
             SingleSupplierStore(testSupplier()),
             FakeCompletionApi(goldenCase().answers),
@@ -1836,7 +2035,7 @@ class FingerprintViewModelTest {
             manifestJson(patched, builtAt = patchStamp, minAppVersionCode = 10_500L)
         subject.refreshBankOnEntry()
         runBlocking { subject.awaitIdle() }
-        assertNotNull(subject.uiState.value.bankRequiringNewerApp)
+        assertNotNull(subject.uiState.value.bankNeedsNewerApp)
 
         fetcher.manifestBody =
             manifestJson(patched, builtAt = patchStamp, minAppVersionCode = 10_400L)
@@ -1844,7 +2043,7 @@ class FingerprintViewModelTest {
         runBlocking { subject.awaitIdle() }
 
         val state = subject.uiState.value
-        assertNull("能装的包一发布，「先更新应用」的提示必须消失", state.bankRequiringNewerApp)
+        assertNull("能装的包一发布，「先更新应用」的提示必须消失", state.bankNeedsNewerApp)
         assertNotNull("可安装的更新照常摆出按钮", state.availableBankUpdate)
     }
 
@@ -1856,7 +2055,7 @@ class FingerprintViewModelTest {
             FakeCompletionApi(goldenCase().answers),
             bankFiles = files,
             // Removing is followed by a check, so the fake has to answer like a publisher.
-            bankFetcher = FakeBankFetcher().apply {
+            bankFetcher = FakeHttpFetcher().apply {
                 publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp)
             },
         )
@@ -1877,7 +2076,7 @@ class FingerprintViewModelTest {
 
     @Test
     fun `deleting the package leaves the download one tap away`() {
-        val fetcher = FakeBankFetcher().apply {
+        val fetcher = FakeHttpFetcher().apply {
             publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp)
         }
         val subject = readyApiViewModelFor(
@@ -1897,14 +2096,14 @@ class FingerprintViewModelTest {
         assertNotNull("删除后「下载检测包」必须马上回来", state.availableBankUpdate)
         assertEquals(
             "删除成功只重查一次清单",
-            listOf(FakeBankFetcher.MANIFEST_URL),
+            listOf(FakeHttpFetcher.MANIFEST_URL),
             fetcher.urls,
         )
     }
 
     @Test
     fun `a delete that failed does not re-check the manifest`() {
-        val fetcher = FakeBankFetcher().apply {
+        val fetcher = FakeHttpFetcher().apply {
             publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp)
         }
         val subject = readyApiViewModelFor(
@@ -1948,7 +2147,7 @@ class FingerprintViewModelTest {
     @Test
     fun `a check is refused while a round is running`() {
         val api = GatedCompletionApi(goldenCase().answers)
-        val fetcher = FakeBankFetcher().apply { publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp) }
+        val fetcher = FakeHttpFetcher().apply { publish(bankWithBuiltAt(patchStamp), builtAt = patchStamp) }
         val subject = readyApiViewModel(
             api,
             parallel = false,
@@ -2372,6 +2571,14 @@ private class ThrowingCompletionApi(private val boom: Throwable) : RelayApi() {
 
 /** Generous ceiling: only a genuinely stuck batch may hit it. */
 private const val BATCH_SETTLE_TIMEOUT_MS = 10_000L
+
+/**
+ * The clock every view model in this file runs on.
+ *
+ * A fixed instant, so a check's timestamp is the same value in the assertion as on the
+ * card; 2026-10-03T14:32+08:00, which is what a panel test reads as "今天 14:32".
+ */
+private const val FIXED_NOW_MILLIS = 1_791_009_120_000L
 
 /** One recorded golden case: the three answers and the model they must rank first. */
 private data class GoldenCase(val answers: List<String>, val top1: String)
