@@ -1,5 +1,6 @@
 package com.relaytester.app.core.update
 
+import android.os.Build
 import androidx.compose.runtime.Immutable
 import com.relaytester.app.core.fingerprint.sha256Hex
 import java.io.File
@@ -72,8 +73,12 @@ object AppUpdateManifestParser {
             throw AppUpdateException("更新信息里的安装包大小不合理（$sizeBytes 字节）")
         }
         val apkUrl = root.string("apkUrl", "安装包地址")
-        if (!apkUrl.startsWith("http://") && !apkUrl.startsWith("https://")) {
-            throw AppUpdateException("更新信息里的安装包地址必须是 HTTP(S)")
+        // Refused here rather than at download time: the digest in this same document is what
+        // would vouch for the bytes, so a feed that names another host can vouch for
+        // anything. See [UpdateHosts] for why the check is a parsed HTTPS allow-list and not
+        // a `startsWith`.
+        if (UpdateHosts.httpsOrNull(apkUrl) == null) {
+            throw AppUpdateException("更新信息里的安装包地址必须是发布站点的 HTTPS 地址")
         }
         return AppUpdateManifest(
             formatVersion = formatVersion,
@@ -84,7 +89,11 @@ object AppUpdateManifestParser {
             sizeBytes = sizeBytes,
             sha256 = root.digest("sha256"),
             minSdk = root.optInt("minSdk", 0),
-            notesUrl = root.optString("notesUrl"),
+            // Dropped rather than fatal when it is not an allowed HTTPS address: this is the
+            // release-notes link, a cosmetic field, and failing the whole feed over it would
+            // trade an update for a missing hyperlink. Dropping it also means a feed cannot
+            // hand the app an `intent:` or `file:` URL to launch.
+            notesUrl = root.optString("notesUrl").takeIf { UpdateHosts.httpsOrNull(it) != null }.orEmpty(),
             publishedAt = root.optString("publishedAt"),
         )
     }
@@ -137,6 +146,15 @@ class AppUpdateClient(
     private val fetcher: HttpFetcher,
     private val manifestUrl: String = AppUpdateDefaults.MANIFEST_URL,
     private val maxManifestBytes: Int = MAX_MANIFEST_BYTES,
+    /**
+     * The device's API level.
+     *
+     * Injected rather than read straight from [Build]: the feed states the API level its APK
+     * needs, and a JVM unit test runs with `SDK_INT` 0 — reading the field here would make
+     * the guard below untestable in exactly the place it is worth asserting. A level of 0
+     * means "the platform did not say", and the guard stands down.
+     */
+    private val sdkInt: () -> Int = { Build.VERSION.SDK_INT },
 ) {
     /**
      * Compares the published build with the one running.
@@ -153,18 +171,29 @@ class AppUpdateClient(
         if (manifest.packageName != packageName) {
             return AppUpdateCheck.NotForThisPackage(manifest.packageName)
         }
-        return if (manifest.versionCode > installedVersionCode) {
-            AppUpdateCheck.Available(manifest)
-        } else {
-            AppUpdateCheck.UpToDate
+        if (manifest.versionCode <= installedVersionCode) {
+            return AppUpdateCheck.UpToDate
         }
+        // Only a build that would actually be offered is judged against the API level. A
+        // feed whose APK needs a newer Android than this device runs is refused up front:
+        // otherwise the user spends a download to be told by the system installer that the
+        // package cannot be parsed.
+        val level = sdkInt()
+        if (level > 0 && manifest.minSdk > level) {
+            throw AppUpdateException("线上版本需要 Android API ${manifest.minSdk} 及以上（本机 $level），装不了")
+        }
+        return AppUpdateCheck.Available(manifest)
     }
 
     /**
-     * Downloads [manifest]'s APK into [target], checking size and digest first.
+     * Downloads [manifest]'s APK into [target].
      *
-     * The bytes are verified *after* they are on disk and the file is deleted if they do
-     * not match, so a truncated or tampered download never survives to be installed.
+     * The size and digest are handed to the fetcher as a [DownloadExpectation], so they are
+     * checked while the bytes are still a `.part` file and the target name — the one the
+     * system installer is handed — never refers to bytes that failed. The check is repeated
+     * here as well: [HttpFetcher] is an interface, and a double that ignores the expectation
+     * must not be able to slip a mismatch through. That second pass streams the file rather
+     * than reading it into the heap.
      */
     suspend fun download(
         manifest: AppUpdateManifest,
@@ -175,14 +204,14 @@ class AppUpdateClient(
             url = manifest.apkUrl,
             target = target,
             maxBytes = AppUpdateManifestParser.MAX_APK_BYTES,
+            expectation = DownloadExpectation(sizeBytes = manifest.sizeBytes, sha256 = manifest.sha256),
             onProgress = onProgress,
         )
         if (downloaded.length() != manifest.sizeBytes) {
             downloaded.delete()
             throw AppUpdateException("下载的安装包大小与更新信息不符（${downloaded.length()} ≠ ${manifest.sizeBytes}）")
         }
-        val digest = sha256Hex(downloaded.readBytes())
-        if (!digest.equals(manifest.sha256, ignoreCase = true)) {
+        if (!sha256Hex(downloaded).equals(manifest.sha256, ignoreCase = true)) {
             downloaded.delete()
             throw AppUpdateException("下载的安装包校验失败（SHA-256 不匹配）")
         }

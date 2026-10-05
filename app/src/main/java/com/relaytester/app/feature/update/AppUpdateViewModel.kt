@@ -1,5 +1,6 @@
 package com.relaytester.app.feature.update
 
+import android.content.ActivityNotFoundException
 import android.content.Context
 import androidx.compose.runtime.Immutable
 import androidx.core.content.pm.PackageInfoCompat
@@ -16,6 +17,7 @@ import com.relaytester.app.core.update.AppUpdateClient
 import com.relaytester.app.core.update.AppUpdateManifest
 import com.relaytester.app.core.update.DownloadProgress
 import com.relaytester.app.core.update.OkHttpFetcher
+import java.io.File
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
@@ -281,7 +283,11 @@ class AppUpdateViewModel(
         // asked, not about how the last answer went. The in-memory copy is written first, so
         // a failing write cannot leave the timer thinking this check never happened.
         lastCheckAtMillis = clock()
-        withContext(ioDispatcher) { preferences.setLastAppCheckAt(clock()) }
+        // A failed write is not reported — the in-memory stamp above already keeps the wake
+        // arithmetic honest — but it must not escape either: an uncaught exception in
+        // viewModelScope reaches the default handler and takes the app down, which is a far
+        // worse way to say "the timestamp did not persist".
+        runCatching { withContext(ioDispatcher) { preferences.setLastAppCheckAt(clock()) } }
     }
 
     private fun applyCheckResult(check: AppUpdateCheck, silent: Boolean) {
@@ -335,21 +341,79 @@ class AppUpdateViewModel(
             try {
                 // The file is named after the version code, so a re-download of the same
                 // build overwrites its own part file rather than a different build's.
+                val target = installer.targetFile(manifest.versionCode)
+                withContext(ioDispatcher) { pruneDownloadCache(target) }
                 val apk = withContext(ioDispatcher) {
-                    client.download(manifest, installer.targetFile(manifest.versionCode)) { progress ->
+                    client.download(manifest, target) { progress ->
                         _uiState.update { it.copy(downloadProgress = progress) }
                     }
                 }
-                installer.install(apk)
-                showMessage("已下载 ${manifest.versionName}，请在系统的安装界面确认", isError = false)
+                if (!withContext(ioDispatcher) { installer.isSignedLikeThisApp(apk) }) {
+                    // The system installer would reject this too, but only after the download
+                    // is already spent, and it fails with a message about the package rather
+                    // than about where it came from. Checking first costs one manifest read.
+                    apk.delete()
+                    showMessage("下载的安装包签名与本应用不一致，已丢弃", isError = true)
+                    return@launch
+                }
+                handToInstaller(apk, manifest)
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Throwable) {
+                // Download-phase failures already carry a message written for this screen
+                // (the fetcher and the client both throw Chinese text); anything unexpected
+                // still has to leave the panel with a reason rather than silence.
                 showMessage(error.message ?: "下载安装包失败", isError = true)
             } finally {
                 _uiState.update { it.copy(isDownloading = false, downloadProgress = null) }
             }
         }
+    }
+
+    /**
+     * Hands a verified download to the system installer and reports how it went.
+     *
+     * Kept apart from the download so the two failure modes get different words: a download
+     * that failed has an explanation of its own, while a hand-off that failed is a *download
+     * that succeeded* — the user should be told the APK is on the device, not that the
+     * update failed. A generic throwable keeps the platform's own text as the tail rather
+     * than letting an English system string stand alone in a Chinese panel.
+     */
+    private fun handToInstaller(apk: File, manifest: AppUpdateManifest) {
+        try {
+            installer.install(apk)
+            showMessage("已下载 ${manifest.versionName}，请在系统的安装界面确认", isError = false)
+        } catch (error: ActivityNotFoundException) {
+            // The file stays put on purpose: the install can still be finished from a file
+            // manager, and the system installer is a different app that may have been
+            // disabled rather than absent.
+            showMessage("没有找到可以安装应用的界面，安装包已下载到缓存目录", isError = true)
+        } catch (error: SecurityException) {
+            showMessage("系统拒绝了安装请求，请检查「安装未知应用」权限", isError = true)
+        } catch (error: Throwable) {
+            val detail = error.message?.takeIf { it.isNotBlank() }?.let { "：$it" }.orEmpty()
+            showMessage("安装包已下载，但交给系统安装界面失败$detail", isError = true)
+        }
+    }
+
+    /**
+     * Removes the leftovers of earlier downloads from the update cache.
+     *
+     * [keep] is the file about to be written. The APK that was installed is deliberately not
+     * deleted right after the hand-off: the installer is a separate process reading the
+     * content URI asynchronously, so removing the file the moment it was handed over is a
+     * race against the install. Cleaning up before the *next* download is safe — nothing is
+     * reading then — and it is what stops one leftover per version code from accumulating.
+     */
+    private fun pruneDownloadCache(keep: File) {
+        val directory = keep.parentFile ?: return
+        // One prefix covers both leftovers: a stale APK and a `.part` file are both named
+        // after the update file they belong to, so anything else in the directory is not
+        // this chain's to delete.
+        val stale = directory.listFiles()?.filter {
+            it.name != keep.name && it.name.startsWith(AndroidApkInstaller.UPDATE_FILE_PREFIX)
+        } ?: return
+        for (file in stale) file.delete()
     }
 
     /**

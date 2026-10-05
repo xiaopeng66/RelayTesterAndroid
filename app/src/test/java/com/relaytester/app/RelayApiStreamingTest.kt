@@ -185,6 +185,57 @@ class RelayApiStreamingTest {
     }
 
     @Test
+    fun `a stream that never terminates is cut off at the ceiling instead of growing forever`() {
+        // A relay that answers `text/event-stream` and then simply keeps talking — no [DONE],
+        // no close. Before the ceiling existed this appended into one string until the process
+        // ran out of memory, and nothing upstream of it could notice: the read timeout is per
+        // read, and deltas keep arriving.
+        WireServer { out ->
+            out.write(
+                (
+                    "HTTP/1.1 200 OK\r\n" +
+                        "Content-Type: text/event-stream\r\n" +
+                        "Connection: close\r\n\r\n"
+                    ).toByteArray(),
+            )
+            val filler = "1 ".repeat(60)
+            repeat(4_000) { out.write(chatChunk(filler).toByteArray()) }
+        }.use { server ->
+            val result = stream(server.port)
+
+            assertTrue("应当因过大而失败，实际 $result", result is ApiResult.Failure)
+            val error = (result as ApiResult.Failure).error
+            assertTrue("失败原因要说清是流太大：${error.message}", error.message.contains("流式响应过大"))
+            assertTrue("过大的流不是网络故障", error.message.isNotBlank())
+        }
+    }
+
+    @Test
+    fun `a single line with no newline is not buffered without a bound`() {
+        // The other unbounded read: bytes with no terminator. Framing alone cannot bound this
+        // (it is waiting for a newline), so the bound is on the bytes and applies here too.
+        WireServer { out ->
+            out.write(
+                (
+                    "HTTP/1.1 200 OK\r\n" +
+                        "Content-Type: text/event-stream\r\n" +
+                        "Connection: close\r\n\r\n"
+                    ).toByteArray(),
+            )
+            // More than the reader's ceiling, in one unterminated line: the reader has to
+            // give up mid-line, which is the case a newline-oriented bound cannot cover.
+            val blob = "x".repeat(8_192)
+            repeat(40) { out.write(blob.toByteArray()) }
+        }.use { server ->
+            val result = stream(server.port)
+
+            assertTrue("应当因过大而失败，实际 $result", result is ApiResult.Failure)
+            val error = (result as ApiResult.Failure).error
+            assertTrue("失败原因要说清是流太大：${error.message}", error.message.contains("流式响应过大"))
+        }
+    }
+
+    @Test
     fun `a malformed event is skipped instead of failing the request`() {
         WireServer(
             sse(
@@ -265,13 +316,34 @@ class RelayApiStreamingTest {
     }
 }
 
-/** Consumes one request up to the blank line that ends its headers. */
-private fun InputStream.readRequestHead() {
-    var tail = 0
-    while (true) {
-        val byte = read()
-        if (byte < 0) return
-        tail = (tail shl 8) or byte
-        if (tail == 0x0D0A0D0A) return
+    /**
+     * Consumes one request, headers and declared body.
+     *
+     * The body matters even though no case looks at it: a socket closed while received data
+     * is still unread sends RST rather than FIN, so the client's end-of-stream read would
+     * fail with "connection reset" and hide whatever the case was actually testing.
+     */
+    private fun InputStream.readRequestHead() {
+        var tail = 0
+        val head = StringBuilder()
+        while (true) {
+            val byte = read()
+            if (byte < 0) return
+            tail = (tail shl 8) or byte
+            head.append(byte.toChar())
+            if (tail == 0x0D0A0D0A) break
+        }
+        val length = Regex("(?i)content-length:\\s*(\\d+)")
+            .find(head)
+            ?.groupValues
+            ?.get(1)
+            ?.toIntOrNull()
+            ?: return
+        val buffer = ByteArray(4_096)
+        var remaining = length
+        while (remaining > 0) {
+            val read = read(buffer, 0, minOf(buffer.size, remaining))
+            if (read < 0) return
+            remaining -= read
+        }
     }
-}

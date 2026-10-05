@@ -66,8 +66,11 @@ private fun RelayTesterApp() {
         }
         val appUpdateViewModel: AppUpdateViewModel = viewModel(factory = appUpdateViewModelFactory)
         var destinationName by rememberSaveable { mutableStateOf(AppDestination.MODEL_TEST.name) }
-        var showConfigurationBackup by remember { mutableStateOf(false) }
-        var showUpdates by remember { mutableStateOf(false) }
+        // Saveable like the tab above: both dialogs read their content from view models that
+        // outlive the activity, so surviving a rotation reopens the same card instead of
+        // dropping what the user had on screen.
+        var showConfigurationBackup by rememberSaveable { mutableStateOf(false) }
+        var showUpdates by rememberSaveable { mutableStateOf(false) }
         val destination = AppDestination.entries.firstOrNull { it.name == destinationName }
             ?: AppDestination.MODEL_TEST
         val appUpdateState by appUpdateViewModel.uiState.collectAsStateWithLifecycle()

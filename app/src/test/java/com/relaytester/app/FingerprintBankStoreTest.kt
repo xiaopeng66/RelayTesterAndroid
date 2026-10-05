@@ -7,6 +7,9 @@ import com.relaytester.app.core.fingerprint.BankSource
 import com.relaytester.app.core.fingerprint.FingerprintBank
 import com.relaytester.app.core.fingerprint.FingerprintBankStore
 import com.relaytester.app.core.fingerprint.sha256Hex
+import com.relaytester.app.core.fingerprint.NumberFeatures
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -372,6 +375,123 @@ class FingerprintBankStoreTest {
             bytes[8 + index] = 1.toByte()
         }
         return bytes
+    }
+
+    @Test
+    fun `a reference tensor with a non-finite scale is rejected at the parse`() {
+        // The scales are the package's only raw IEEE floats — every weight block is
+        // fixed-point — so this is where a damaged or crafted file can put a NaN into the
+        // maths. Left in, every kNN distance becomes NaN and the scorer refuses each round
+        // with "排名计算产生无效数值，请刷新后重试": true, but it names the scoring and points
+        // at nothing the user can refresh away.
+        for (scale in listOf(Float.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY)) {
+            val error = assertThrows(IllegalArgumentException::class.java) {
+                BankReader(referenceTensor(scales = floatArrayOf(scale))).quantizedReferences()
+            }
+
+            assertTrue(
+                "非有限缩放 $scale 未被拒绝：${error.message}",
+                error.message.orEmpty().contains("非法数值"),
+            )
+        }
+    }
+
+    @Test
+    fun `a reference tensor with no rows is rejected instead of dividing by zero`() {
+        // The other route to the same NaN: the kNN term averages the nearest rows, and with
+        // none the average is 0/0. `nearest` does not check, so the package has to be the
+        // thing that refuses.
+        val error = assertThrows(IllegalArgumentException::class.java) {
+            BankReader(referenceTensor(scales = floatArrayOf())).quantizedReferences()
+        }
+
+        assertTrue("没有行的张量未被拒绝：${error.message}", error.message.orEmpty().contains("没有行"))
+    }
+
+    @Test
+    fun `a finite reference tensor is still built`() {
+        // The control for both rejections above: the shape a real package has must survive,
+        // and its row norm — the value the NaN would have poisoned — must come out finite.
+        val references = BankReader(referenceTensor(scales = floatArrayOf(1.5f))).quantizedReferences()
+
+        assertEquals(1, references.single().rows)
+        assertTrue(references.single().rowNorms.all { it.isFinite() })
+    }
+
+    /** `[bits=8][columns=1][models=1][rows][scales…][one code byte per row]`, then padding. */
+    private fun referenceTensor(scales: FloatArray): ByteArray {
+        val buffer = ByteBuffer.allocate(64).order(ByteOrder.LITTLE_ENDIAN)
+        buffer.putInt(8)
+        buffer.putInt(1)
+        buffer.putInt(1)
+        buffer.putInt(scales.size)
+        scales.forEach { buffer.putFloat(it) }
+        repeat(scales.size) { buffer.put(0) }
+        return buffer.array()
+    }
+
+    @Test
+    fun `a package with no models at all is rejected`() {
+        // Every dimension check is satisfied by empty arrays, so this package would parse
+        // and then rank nothing: the round ends on `order.first()` with an internal
+        // "List is empty." in the panel. The package is the thing that is wrong.
+        val error = assertThrows(IllegalArgumentException::class.java) {
+            FingerprintBank.fromPackageBytes(zeroModelPackage())
+        }
+
+        assertTrue("零模型包未被拒绝：${error.message}", error.message.orEmpty().contains("没有模型"))
+    }
+
+    /**
+     * A well-formed package whose model count is zero: full-width parameter and feature
+     * blocks (the dimensions are absolute, so they have to be present) and nothing per
+     * model. Built by hand because no package the app can download has this shape.
+     */
+    private fun zeroModelPackage(): ByteArray {
+        val hellinger = NumberFeatures.DIMENSION
+        val ordered = 74
+        val buffer = ByteBuffer.allocate(16 * 1024).order(ByteOrder.LITTLE_ENDIAN)
+        fun writeMagic() = buffer.put("LMFPA003".toByteArray(Charsets.US_ASCII))
+        fun rawFloats(count: Int) = repeat(count) { buffer.putInt(0) }
+        fun block(size: Int) {
+            buffer.putInt(size)
+            rawFloats(size)
+            rawFloats(size)
+        }
+        fun params() {
+            buffer.putInt(2)
+            block(hellinger)
+            block(ordered)
+        }
+        fun featureBank(width: Int) {
+            buffer.putInt(width)
+            rawFloats(width)
+            rawFloats(width)
+            buffer.putInt(0) // no nuisance basis
+            buffer.putInt(0) // no centroids
+        }
+
+        writeMagic()
+        buffer.putInt(0) // source digest
+        buffer.putInt(0) // built-at stamp
+        buffer.putInt(0) // reference digest
+        buffer.putInt(0) // model count
+        buffer.putDouble(1.0) // tau
+        buffer.putDouble(100.0) // recommended answers
+        buffer.putDouble(80.0) // minimum valid numbers
+        params() // head parameters
+        buffer.putInt(0) // LDA rows
+        buffer.putInt(0) // LDA columns
+        buffer.putInt(0) // LDA bias
+        params() // full-feature parameters
+        featureBank(hellinger)
+        featureBank(ordered)
+        buffer.putInt(0) // no environment templates
+        buffer.putInt(8) // reference codes: 8-bit
+        buffer.putInt(0) // columns
+        buffer.putInt(0) // models
+
+        return buffer.array().copyOf(buffer.position())
     }
 
     @Test

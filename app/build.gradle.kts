@@ -8,7 +8,13 @@ plugins {
  * A signing secret, looked up outside the source tree: the Gradle property (a
  * `gradle.properties` in the project or in ~/.gradle, neither of which is committed), the
  * JVM system property (`-Drelaytester.storePassword=…`), or the environment
- * (`RELAYTESTER_STORE_PASSWORD`).
+ * (`RELAYTESTER_STOREPASSWORD`).
+ *
+ * The environment name is the property name uppercased with every `.` replaced by `_`, so
+ * `relaytester.storePassword` becomes `RELAYTESTER_STOREPASSWORD` — there is no underscore
+ * between STORE and PASSWORD. Set the variable under exactly that name: a near-miss such as
+ * `RELAYTESTER_STORE_PASSWORD` is simply absent, and the signing config then gets a null
+ * password.
  *
  * Null when this machine has no signing secrets, so a debug build still works; building the
  * published variant then fails on the missing property name instead of on a keystore error.
@@ -74,9 +80,18 @@ android {
         // switch per feed. The detection package's card finally says what the silent entry
         // check is doing, and an unreadable package format is reported as an app update with
         // the version code to reach instead of a format number.
-        versionCode = 10_600
-        versionName = "1.6.0"
+        // 10700 is the review round: the update chain pins every download and every redirect
+        // hop to the release hosts over HTTPS, verifies size and SHA-256 on the part file
+        // before the rename and checks the APK against this app's signing certificate;
+        // stored credentials report when they can no longer be decrypted, corrupted storage
+        // is surfaced instead of silently dropped, and the streaming and balance paths get
+        // their missing ceilings and deadlines.
+        versionCode = 10_700
+        versionName = "1.7.0"
         ndk {
+            // arm64 only: the published update ships one APK, and every device the app is
+            // meant for is arm64. The 32-bit and x86 ABIs would each add a copy of the two
+            // QuickJS libraries for devices this build never targets.
             abiFilters += "arm64-v8a"
         }
     }

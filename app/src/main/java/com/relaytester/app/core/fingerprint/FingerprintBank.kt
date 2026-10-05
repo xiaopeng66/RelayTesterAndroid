@@ -266,6 +266,10 @@ class FingerprintBank private constructor(
          * assembled from two upstream revisions breaks one of these.
          */
         private fun validate(ids: List<String>, weights: DetectorWeights, modelCount: Int) {
+            // A package with no models satisfies every dimension check below (empty arrays
+            // satisfy all of them) and then ranks nothing: the round would end on
+            // `order.first()` with an internal "List is empty." in the panel.
+            require(modelCount > 0) { "指纹检测包没有模型" }
             require(weights.headParams.size == 2 && weights.fullParams.size == 2) {
                 "指纹检测包的特征标准化块数量不正确"
             }

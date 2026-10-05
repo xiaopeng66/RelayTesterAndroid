@@ -187,6 +187,11 @@ fun TesterScreen(
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
+    // Deliberately `remember`, unlike the flags below: this payload holds the credentials
+    // the user just typed, and `rememberSaveable` writes to the platform's saved instance
+    // state (a file the system keeps for restore). Losing the confirmation on a rotation
+    // is the cheaper mistake — the export can be asked for again; a leaked secret cannot
+    // be un-leaked.
     var pendingExport by remember { mutableStateOf<ExportPayload?>(null) }
     var showModelCatalog by rememberSaveable { mutableStateOf(false) }
     var configurationSupplierId by rememberSaveable { mutableStateOf<String?>(null) }

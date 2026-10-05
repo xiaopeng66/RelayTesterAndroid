@@ -204,7 +204,15 @@ internal class BankReader(private val bytes: ByteArray) {
         return List(models) {
             val rows = u32()
             requireCapacity(rows, 4)
+            // Both of these turn every kNN distance into NaN: with no rows the mean of the
+            // closest ones is 0/0, and a scale that is not a number multiplies the whole row
+            // by it. The scorer would then refuse the round with "排名计算产生无效数值，请刷新后
+            // 重试" — true, but it names the scoring instead of the package, and says it again
+            // on every attempt. These are the package's only raw IEEE floats; every other
+            // weight is fixed-point and finite by construction.
+            require(rows > 0) { "指纹检测包的参考张量没有行" }
             val scales = float32(rows)
+            require(scales.all { it.isFinite() }) { "指纹检测包的参考张量含有非法数值（NaN 或无穷大）" }
             val payload = rows.toLong() * columns.toLong() * width
             require(payload <= Int.MAX_VALUE) { "指纹检测包参考张量过大" }
             val data = bytes(payload.toInt())

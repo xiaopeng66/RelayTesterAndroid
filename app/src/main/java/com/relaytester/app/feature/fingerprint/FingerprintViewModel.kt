@@ -372,6 +372,13 @@ class FingerprintViewModel(
     private val _uiState = MutableStateFlow(FingerprintUiState())
     val uiState = _uiState
 
+    // Everything mutable below — this handle, retryJobs, roundAnswers, roundCredentials,
+    // entryCheckPending — is touched only from coroutines started by `viewModelScope.launch`
+    // with no dispatcher (the main thread) and from completion handlers of those same jobs,
+    // which the platform also runs on the caller's thread. Slow work is pushed into
+    // `withContext(ioDispatcher)` and nothing is assigned inside it; the only cross-thread
+    // publication is `_uiState`, a MutableStateFlow. A `launch(ioDispatcher)` added here
+    // would break that, so it has to bring its own confinement with it.
     private var runJob: Job? = null
 
     /**

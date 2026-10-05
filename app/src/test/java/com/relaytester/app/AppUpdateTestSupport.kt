@@ -9,8 +9,19 @@ import org.json.JSONObject
 /** The name the published release APK carries; what a check compares against. */
 internal const val RELEASE_PACKAGE = "com.relaytester.app"
 
-/** The URL the app-release feed is published under, as the manifest would carry it. */
-internal const val APP_APK_URL = "https://example.test/app/RelayTester-1.6.0.apk"
+/**
+ * The URL the app-release feed is published under, as the manifest would carry it.
+ *
+ * The real host on purpose: the parser only accepts an HTTPS address on a release host (see
+ * `UpdateHosts`), so a fixture on a made-up domain would be testing the refusal path in every
+ * test that is not about the refusal.
+ */
+internal const val APP_APK_URL =
+    "https://github.com/xiaopeng66/RelayTesterAndroid/releases/download/v1.6.0/RelayTester-1.6.0-android.apk"
+
+/** The release page the feed points at for the notes. */
+internal const val APP_NOTES_URL =
+    "https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.6.0"
 
 /**
  * An app-release manifest body, as `publish_release_apk.py` would write it.
@@ -30,7 +41,7 @@ internal fun appManifestJson(
     sizeBytes: Long = apkBytes.size.toLong(),
     sha256: String = sha256Hex(apkBytes),
     minSdk: Int = 26,
-    notesUrl: String = "https://example.test/notes/1.6.0",
+    notesUrl: String = APP_NOTES_URL,
     publishedAt: String = "2026-10-04T09:00:00+00:00",
     omit: Set<String> = emptySet(),
 ): String = JSONObject().apply {
@@ -67,6 +78,8 @@ internal class FakeApkInstaller(
     var canInstall: Boolean = true,
     /** When set, handing the file to the installer throws it. */
     var installFails: Throwable? = null,
+    /** What [isSignedLikeThisApp] answers; true means the APK matches this app's signer. */
+    var signatureMatches: Boolean = true,
 ) : ApkInstaller {
     /** The directory downloads land in; see [root]. */
     private lateinit var root: File
@@ -92,6 +105,14 @@ internal class FakeApkInstaller(
     override fun openInstallPermissionSettings() {
         permissionPrompts++
         permissionPromptFails?.let { throw it }
+    }
+
+    /** Every APK whose signature was checked, in order. */
+    val signatureChecks = mutableListOf<File>()
+
+    override fun isSignedLikeThisApp(apk: File): Boolean {
+        signatureChecks += apk
+        return signatureMatches
     }
 
     override fun install(apk: File) {

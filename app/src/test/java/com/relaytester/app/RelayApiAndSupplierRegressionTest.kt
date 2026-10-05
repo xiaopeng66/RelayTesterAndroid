@@ -8,6 +8,8 @@ import com.relaytester.app.core.model.ModelSource
 import com.relaytester.app.core.model.RelayProtocol
 import com.relaytester.app.core.model.SupplierProfile
 import com.relaytester.app.core.model.TestSettings
+import com.relaytester.app.core.network.BalanceScriptException
+import com.relaytester.app.core.network.runScriptWithDeadline
 import com.relaytester.app.core.network.BalanceApi
 import com.relaytester.app.core.network.REDIRECT_CODES
 import com.relaytester.app.core.network.RelayBaseUrl
@@ -17,11 +19,13 @@ import com.relaytester.app.core.storage.SupplierStore
 import com.relaytester.app.core.storage.SupplierStoreState
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
+import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -121,6 +125,66 @@ class RelayApiAndSupplierRegressionTest {
 
         assertNotNull(decoded)
         assertFalse(decoded!!.isTestingDisabled)
+    }
+
+    // ---- Damage in the stored blob is reported, not swallowed -------------
+
+    @Test
+    fun aBlobThatCannotBeParsedIsReportedInsteadOfLookingLikeAFreshInstall() {
+        // Truncated or overwritten by something that is not this app. The old read returned
+        // an empty state with no signal, so the first save would have replaced the file —
+        // and the user's suppliers with it — without anyone knowing it happened.
+        val decoded = SupplierStore.decodeRawForTest("{ not json at all")
+
+        assertTrue("必须报告解析失败", decoded.decodeFailed)
+    }
+
+    @Test
+    fun aSectionWithTheWrongJsonTypeIsReported() {
+        // The rest of the blob is fine, so this is the partial-loss shape: everything except
+        // the damaged section comes back and the app has to say that something is missing.
+        val encoded = SupplierStore.encodeStateForTest(
+            SupplierStoreState(
+                suppliers = listOf(supplier(id = "kept", disabled = false)),
+                activeSupplierId = "kept",
+            ),
+        )
+        val damaged = JSONObject(encoded).put("balanceTemplates", "not an array")
+
+        val decoded = SupplierStore.decodeStateForTest(damaged)
+
+        assertEquals("能读的部分照常载入", 1, decoded.suppliers.size)
+        assertTrue("必须报告有段落损坏", decoded.decodeFailed)
+    }
+
+    @Test
+    fun aSupplierListWhoseEntriesAllFailedIsReported() {
+        // Shape is right, content is not: every entry lost its id. Same outcome as a
+        // damaged section from the user's point of view — their suppliers are gone.
+        val damaged = JSONObject()
+            .put(
+                "suppliers",
+                JSONArray().put(JSONObject().put("name", "nameless")).put(JSONObject().put("baseUrl", "https://x")),
+            )
+
+        assertTrue(SupplierStore.decodeStateForTest(damaged).decodeFailed)
+    }
+
+    @Test
+    fun anOrdinaryBlobAndAFreshInstallAreNotReportedAsDamaged() {
+        // The other side of the rule: a false alarm on every launch would train the user to
+        // ignore the one that matters. Empty arrays and absent optional sections are normal.
+        val state = SupplierStoreState(
+            suppliers = listOf(supplier(id = "one", disabled = false)),
+            activeSupplierId = "one",
+        )
+        val decoded = SupplierStore.decodeStateForTest(JSONObject(SupplierStore.encodeStateForTest(state)))
+        val fresh = SupplierStore.decodeRawForTest("{}")
+        val blank = SupplierStore.decodeRawForTest("")
+
+        assertFalse("正常配置不得误报", decoded.decodeFailed)
+        assertFalse("新装（无内容）不得误报", fresh.decodeFailed)
+        assertFalse("空串按新装处理", blank.decodeFailed)
     }
 
     // ---- Balance endpoint resolution -------------------------------------
@@ -260,6 +324,46 @@ class RelayApiAndSupplierRegressionTest {
         )
 
         assertNull("静态校验不得执行脚本", message)
+    }
+
+    @Test
+    fun aScriptThatNeverReturnsDoesNotHoldTheQueryForever() {
+        // The sandbox has no interrupt — the library exposes no stop hook, no instruction
+        // budget and no memory ceiling — so without a deadline a script that never returns
+        // parks the balance query on its IO thread for the life of the process, with the panel
+        // sitting on "查询中" and nothing to cancel. The deadline is exercised through the seam
+        // the evaluator uses, because the QuickJS native library does not load in this JVM
+        // test source set; the hanging work has the shape a token filter cannot catch.
+        val error = assertThrows(BalanceScriptException::class.java) {
+            runScriptWithDeadline(timeoutMs = 100) {
+                Thread.sleep(10_000)
+                "never"
+            }
+        }
+
+        assertTrue("超时必须被报出来：${error.message}", error.message.orEmpty().contains("超时"))
+    }
+
+    @Test
+    fun theDeadlineStillDeliversWhatFinishedInTime() {
+        // Three sides of the same rule: an answer that arrives inside the deadline comes back
+        // unchanged, a script error keeps the message written for the user, and a foreign
+        // failure (a stack overflow, a native allocation failure) is replaced by one that
+        // says something the user could act on.
+        assertEquals("ok", runScriptWithDeadline(timeoutMs = 1_000) { "ok" })
+
+        val scriptError = assertThrows(BalanceScriptException::class.java) {
+            runScriptWithDeadline(timeoutMs = 1_000) { throw BalanceScriptException("脚本缺少 request.url") }
+        }
+        assertEquals("脚本缺少 request.url", scriptError.message)
+
+        val foreign = assertThrows(BalanceScriptException::class.java) {
+            runScriptWithDeadline(timeoutMs = 1_000) { throw StackOverflowError("List is empty.") }
+        }
+        assertTrue(
+            "外部异常的内部文案不得外泄：${foreign.message}",
+            !foreign.message.orEmpty().contains("List is empty"),
+        )
     }
 
     @Test

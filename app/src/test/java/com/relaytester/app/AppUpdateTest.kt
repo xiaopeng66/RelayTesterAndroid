@@ -46,7 +46,7 @@ class AppUpdateTest {
         assertEquals(apk.size.toLong(), manifest.sizeBytes)
         assertEquals(sha256Hex(apk), manifest.sha256)
         assertEquals(26, manifest.minSdk)
-        assertEquals("https://example.test/notes/1.6.0", manifest.notesUrl)
+        assertEquals(APP_NOTES_URL, manifest.notesUrl)
     }
 
     @Test
@@ -110,9 +110,50 @@ class AppUpdateTest {
         // as one would fail later with a worse message.
         for (url in listOf("app/RelayTester.apk", "file:///sdcard/RelayTester.apk")) {
             assertEquals(
-                "更新信息里的安装包地址必须是 HTTP(S)",
+                "更新信息里的安装包地址必须是发布站点的 HTTPS 地址",
                 parserFailure(appManifestJson(apk, apkUrl = url)).message,
             )
+        }
+    }
+
+    @Test
+    fun `an address that is not a release host is refused`() {
+        // The digest travels in the same document as the address, so a feed that could name
+        // any host could vouch for anything. Clear text is refused with it: there the bytes
+        // and the digest are both on the wire for a middleman to rewrite together.
+        val refused = listOf(
+            "https://example.test/app/RelayTester.apk",
+            "http://github.com/xiaopeng66/RelayTesterAndroid/releases/download/v1.6.0/a.apk",
+            "https://github.com.evil.test/app/RelayTester.apk",
+            "https://github.com@evil.test/app/RelayTester.apk",
+        )
+        for (url in refused) {
+            assertEquals(
+                "这个地址本该被拒绝：$url",
+                "更新信息里的安装包地址必须是发布站点的 HTTPS 地址",
+                parserFailure(appManifestJson(apk, apkUrl = url)).message,
+            )
+        }
+    }
+
+    @Test
+    fun `an address on an allowed host that is not the release path still parses`() {
+        // The allow-list is about the host, not the path: the path is whatever the publisher
+        // wrote, and pinning it here would break the next layout change of the release page.
+        val manifest = AppUpdateManifestParser.parse(
+            appManifestJson(apk, apkUrl = "https://objects.githubusercontent.com/some/asset.apk"),
+        )
+        assertEquals("https://objects.githubusercontent.com/some/asset.apk", manifest.apkUrl)
+    }
+
+    @Test
+    fun `a notes link that is not a release address is dropped, not fatal`() {
+        // The notes link is cosmetic; failing the whole feed over it would trade an update
+        // for a missing hyperlink. Dropping it also keeps a feed from launching anything.
+        for (bad in listOf("intent://scan/#Intent;scheme=zxing;end", "file:///etc/hosts", "http://github.com/x")) {
+            val manifest = AppUpdateManifestParser.parse(appManifestJson(apk, notesUrl = bad))
+            assertEquals("这个说明链接本该被丢掉：$bad", "", manifest.notesUrl)
+            assertEquals(10_600L, manifest.versionCode)
         }
     }
 
@@ -202,6 +243,45 @@ class AppUpdateTest {
         val fetcher = FakeHttpFetcher().apply { publishApp(apk) }
         client(fetcher).check(10_505L, RELEASE_PACKAGE)
         assertEquals(listOf(AppUpdateDefaults.MANIFEST_URL), fetcher.urls)
+    }
+
+    @Test
+    fun `a build that needs a newer android is refused before any bytes are spent`() = runBlocking {
+        // The feed states the API its APK needs. Downloading three megabytes to be told by
+        // the system installer that the package cannot be parsed is the user's data spent on
+        // something the app already knew.
+        val fetcher = FakeHttpFetcher().apply {
+            serve("app-latest.json", appManifestJson(apk, versionCode = 10_600L, minSdk = 33))
+        }
+        val failure = runCatching {
+            AppUpdateClient(fetcher = fetcher, sdkInt = { 26 }).check(10_505L, RELEASE_PACKAGE)
+        }.exceptionOrNull() as? AppUpdateException
+
+        assertTrue("需要更高 Android 的包没有被挡住：$failure", failure != null)
+        assertTrue("提示里没有说要哪个 API：${failure?.message}", failure?.message.orEmpty().contains("33"))
+        assertTrue("提示里没有说本机是哪个 API：${failure?.message}", failure?.message.orEmpty().contains("26"))
+    }
+
+    @Test
+    fun `a build the device can run is still offered`() = runBlocking {
+        val fetcher = FakeHttpFetcher().apply {
+            serve("app-latest.json", appManifestJson(apk, versionCode = 10_600L, minSdk = 33))
+        }
+        val result = AppUpdateClient(fetcher = fetcher, sdkInt = { 35 }).check(10_505L, RELEASE_PACKAGE)
+
+        assertTrue("设备跑得动的包被挡住了：$result", result is AppUpdateCheck.Available)
+    }
+
+    @Test
+    fun `an up to date feed is not judged against the device api level`() = runBlocking {
+        // Nothing would be installed, so what the published APK requires is not this
+        // device's problem — reporting it would turn "已是最新" into an error.
+        val fetcher = FakeHttpFetcher().apply {
+            serve("app-latest.json", appManifestJson(apk, versionCode = 10_600L, minSdk = 33))
+        }
+        val result = AppUpdateClient(fetcher = fetcher, sdkInt = { 26 }).check(10_600L, RELEASE_PACKAGE)
+
+        assertTrue("同一个版本代码却按 API 要求报错：$result", result is AppUpdateCheck.UpToDate)
     }
 
     @Test

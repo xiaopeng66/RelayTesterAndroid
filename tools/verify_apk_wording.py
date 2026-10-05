@@ -126,22 +126,31 @@ def strings_from_apk(path):
     return ascii_words | utf8_words | {joined}
 
 
-def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else (
-        "app/build/outputs/apk/optimized/app-optimized.apk"
-    )
+def verify(path, verbose=True):
+    """Raise SystemExit when [path] does not match the wording invariants above."""
     haystack = strings_from_apk(path)
     joined = next(iter(h for h in haystack if len(h) > 10000), "")
     missing = [t for t in FINAL if t not in haystack and t not in joined]
     present_retired = [t for t in RETIRED if t in haystack or t in joined]
-    for text in FINAL:
-        print(("OK   " if text not in missing else "MISS ") + text)
-    for text in RETIRED:
-        print(("GONE " if text not in present_retired else "STILL") + " (retired) " + text)
+    if verbose:
+        for text in FINAL:
+            print(("OK   " if text not in missing else "MISS ") + text)
+        for text in RETIRED:
+            print(("GONE " if text not in present_retired else "STILL") + " (retired) " + text)
     if missing:
         raise SystemExit("APK 缺少最终文案：%r" % missing)
     if present_retired:
         raise SystemExit("APK 仍含被替换的旧文案：%r" % present_retired)
+    # One line rather than none: the publisher calls this in the middle of its own output,
+    # and a gate that says nothing is indistinguishable from one that was never run.
+    print("wording: 最终文案 %d 条齐备，退役文案 %d 条均不存在" % (len(FINAL), len(RETIRED)))
+
+
+def main():
+    path = sys.argv[1] if len(sys.argv) > 1 else (
+        "app/build/outputs/apk/optimized/app-optimized.apk"
+    )
+    verify(path)
     print("\nAPK wording matches the final source: %d present, %d retired absent" % (
         len(FINAL), len(RETIRED)))
     return 0

@@ -434,8 +434,30 @@ class FingerprintBankStore(
 }
 
 /** Lowercase hex SHA-256 of [bytes], used to compare a download with its manifest. */
-internal fun sha256Hex(bytes: ByteArray): String {
-    val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
+internal fun sha256Hex(bytes: ByteArray): String =
+    hexDigest(MessageDigest.getInstance("SHA-256").digest(bytes))
+
+/**
+ * Lowercase hex SHA-256 of [file], read in chunks.
+ *
+ * The APK is tens of megabytes and already on disk; digesting it through `readBytes()` would
+ * put a whole second copy in the heap for a number that can be computed as it streams.
+ */
+internal fun sha256Hex(file: File): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    file.inputStream().use { input ->
+        val buffer = ByteArray(64 * 1024)
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            digest.update(buffer, 0, read)
+        }
+    }
+    return hexDigest(digest.digest())
+}
+
+/** Lowercase hex of a finished digest; shared with the streaming download's own digest. */
+internal fun hexDigest(digest: ByteArray): String {
     val out = StringBuilder(digest.size * 2)
     for (byte in digest) {
         val value = byte.toInt() and 0xFF

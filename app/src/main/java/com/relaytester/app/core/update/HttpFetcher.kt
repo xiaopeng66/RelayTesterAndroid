@@ -1,9 +1,13 @@
 package com.relaytester.app.core.update
 
+import com.relaytester.app.core.fingerprint.hexDigest
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
+import java.security.DigestOutputStream
+import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.suspendCancellableCoroutine
 import okhttp3.Call
@@ -38,16 +42,32 @@ interface HttpFetcher {
      *
      * Separate from [fetch] because an APK is tens of megabytes: holding one in memory to
      * then write it out would double the peak, and the panel would have nothing to show
-     * until the last byte arrived. The bytes go to `target.part` first and are renamed
-     * once the whole body has arrived, so the target name never refers to a half file.
+     * until the last byte arrived. The bytes go to `target.part` first (never to the target
+     * itself), [expectation] is checked against the part file, and only then is it renamed —
+     * so the name the system installer is handed never refers to bytes that failed a check.
      */
     suspend fun downloadTo(
         url: String,
         target: File,
         maxBytes: Long,
+        expectation: DownloadExpectation? = null,
         onProgress: (DownloadProgress) -> Unit = {},
     ): File
 }
+
+/**
+ * What a download has to turn out to be.
+ *
+ * Checked on the part file *before* the rename, so a truncated or tampered download cannot
+ * even briefly occupy the target name: the install is handed that name, and a process kill in
+ * the window between "renamed" and "verified" would otherwise leave the wrong bytes there.
+ */
+data class DownloadExpectation(
+    /** Null when the feed did not state a size. */
+    val sizeBytes: Long? = null,
+    /** Null when the feed did not state a digest; compared case-insensitively. */
+    val sha256: String? = null,
+)
 
 /**
  * [HttpFetcher] over OkHttp.
@@ -57,14 +77,17 @@ interface HttpFetcher {
  * The call is enqueued rather than run on the calling thread so cancelling the work
  * actually closes the connection.
  *
- * Plain OkHttp, on purpose: **not** [com.relaytester.app.core.network.HttpRedirects], whose
- * same-origin rule refuses the cross-host hop GitHub makes when serving a release asset.
- * That rule exists to keep an API key from being replayed to another host; nothing here
- * carries a credential.
+ * Redirects are followed *by hand*: OkHttp's own follower would take the request to whatever
+ * host a 3xx names, and these downloads come from a feed whose URL field an attacker can
+ * edit. Each hop is put through [UpdateHosts] — HTTPS only, release hosts only, at most
+ * [UpdateHosts.MAX_UPDATE_REDIRECT_HOPS] of them — which is what a same-origin rule cannot
+ * express here, because GitHub's asset hop legitimately changes host.
  */
 class OkHttpFetcher(
     private val client: OkHttpClient = OkHttpClient.Builder()
         .retryOnConnectionFailure(true)
+        .followRedirects(false)
+        .followSslRedirects(false)
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .callTimeout(90, TimeUnit.SECONDS)
@@ -79,21 +102,112 @@ class OkHttpFetcher(
             .url(url)
             .header("Accept", "application/json, application/octet-stream")
             .build()
-        val call = client.newCall(request)
         return suspendCancellableCoroutine { continuation ->
-            continuation.invokeOnCancellation { call.cancel() }
-            call.enqueue(object : Callback {
-                override fun onFailure(call: Call, error: IOException) {
-                    continuation.complete(
-                        Result.failure(UpdateNetworkException("网络请求失败：${error.message ?: "连接中断"}")),
-                    )
-                }
-
-                override fun onResponse(call: Call, response: Response) {
-                    continuation.complete(runCatching { response.use { readBody(it, maxBytes, onProgress) } })
-                }
-            })
+            // A CancellableContinuation holds exactly one cancellation handler: asking for a
+            // second is refused, and the refusal would be thrown on OkHttp's callback thread —
+            // taking the process down instead of failing the download. One handler for the
+            // whole chain, then, and each hop swaps the call it cancels.
+            val inFlight = AtomicReference<Call?>(null)
+            continuation.invokeOnCancellation { inFlight.get()?.cancel() }
+            follow(continuation, inFlight, request, hop = 0) { response -> readBody(response, maxBytes, onProgress) }
         }
+    }
+
+    override suspend fun downloadTo(
+        url: String,
+        target: File,
+        maxBytes: Long,
+        expectation: DownloadExpectation?,
+        onProgress: (DownloadProgress) -> Unit,
+    ): File {
+        val request = Request.Builder()
+            .url(url)
+            .header("Accept", "application/octet-stream")
+            .build()
+        return suspendCancellableCoroutine { continuation ->
+            val inFlight = AtomicReference<Call?>(null)
+            continuation.invokeOnCancellation { inFlight.get()?.cancel() }
+            follow(continuation, inFlight, request, hop = 0) { response ->
+                writeBody(response, target, maxBytes, expectation, onProgress)
+            }
+        }
+    }
+
+    /**
+     * Runs [request], following an allowed redirect, and hands the final response to [finish].
+     *
+     * The response is closed by whoever consumes it (`finish` runs inside `use`), and a hop
+     * that is refused closes the redirect reply before failing, so no connection is leaked on
+     * the refusal paths.
+     */
+    private fun <T> follow(
+        continuation: CancellableContinuation<T>,
+        inFlight: AtomicReference<Call?>,
+        request: Request,
+        hop: Int,
+        finish: (Response) -> T,
+    ) {
+        val call = client.newCall(request)
+        // The handler registered by the caller cancels whatever this chain currently has on
+        // the wire; replacing it here is what makes the second hop cancellable too.
+        inFlight.set(call)
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, error: IOException) {
+                continuation.complete(
+                    Result.failure(UpdateNetworkException("网络请求失败：${error.message ?: "连接中断"}")),
+                )
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                when (val next = nextHop(request, response, hop)) {
+                    is Hop.Final -> continuation.complete(runCatching { response.use(finish) })
+
+                    is Hop.Next -> {
+                        response.close()
+                        // A cancelled download has already been reported; starting another
+                        // request would only be answered into a dead continuation.
+                        if (continuation.isActive) {
+                            follow(
+                                continuation,
+                                inFlight,
+                                request.newBuilder().url(next.url).build(),
+                                hop + 1,
+                                finish,
+                            )
+                        }
+                    }
+
+                    is Hop.Refused -> {
+                        response.close()
+                        continuation.complete(Result.failure(UpdateNetworkException(next.message)))
+                    }
+                }
+            }
+        })
+    }
+
+    /** What to do with a reply: consume it, chase it, or refuse to chase it. */
+    private sealed interface Hop {
+        data class Final(val response: Response) : Hop
+        data class Next(val url: String) : Hop
+        data class Refused(val message: String) : Hop
+    }
+
+    private fun nextHop(request: Request, response: Response, hop: Int): Hop {
+        if (!response.isRedirect) return Hop.Final(response)
+        if (hop >= UpdateHosts.MAX_UPDATE_REDIRECT_HOPS) {
+            return Hop.Refused("更新地址跳转次数过多，已停止")
+        }
+        val location = response.header("Location") ?: return Hop.Refused("更新地址跳转缺少目标")
+        // Resolved against the reply's own URL, so a relative Location works and a missing or
+        // malformed one is a refusal rather than a guess.
+        val target = response.request.url.resolve(location) ?: return Hop.Refused("更新地址跳转的目标无法解析")
+        if (target.scheme != "https" || !UpdateHosts.allows(target.host)) {
+            // The downgrade case lives here too: an https URL redirected at an http one would
+            // put the download on the wire in the clear.
+            return Hop.Refused("更新地址被跳转到不允许的站点（${target.host}）")
+        }
+        return Hop.Next(target.toString())
     }
 
     private fun readBody(
@@ -129,39 +243,11 @@ class OkHttpFetcher(
         return out.toByteArray()
     }
 
-    override suspend fun downloadTo(
-        url: String,
-        target: File,
-        maxBytes: Long,
-        onProgress: (DownloadProgress) -> Unit,
-    ): File {
-        val request = Request.Builder()
-            .url(url)
-            .header("Accept", "application/octet-stream")
-            .build()
-        val call = client.newCall(request)
-        return suspendCancellableCoroutine { continuation ->
-            continuation.invokeOnCancellation { call.cancel() }
-            call.enqueue(object : Callback {
-                override fun onFailure(call: Call, error: IOException) {
-                    continuation.complete(
-                        Result.failure(UpdateNetworkException("网络请求失败：${error.message ?: "连接中断"}")),
-                    )
-                }
-
-                override fun onResponse(call: Call, response: Response) {
-                    continuation.complete(
-                        runCatching { response.use { writeBody(it, target, maxBytes, onProgress) } },
-                    )
-                }
-            })
-        }
-    }
-
     private fun writeBody(
         response: Response,
         target: File,
         maxBytes: Long,
+        expectation: DownloadExpectation?,
         onProgress: (DownloadProgress) -> Unit,
     ): File {
         if (!response.isSuccessful) {
@@ -173,40 +259,64 @@ class OkHttpFetcher(
             throw UpdateNetworkException("文件过大（$declared 字节）")
         }
         target.parentFile?.mkdirs()
-        // A part file rather than the target itself: the caller may be about to hand the
-        // target name to the system installer, and it must never name a partial download.
         val part = File(target.parentFile, "${target.name}.part")
+        // The digest is taken as the bytes land rather than by re-reading the file: the file
+        // is tens of megabytes, and the check has to happen while the name is still `.part`.
+        val digest = MessageDigest.getInstance("SHA-256")
         try {
-            part.outputStream().use { out ->
-                try {
-                    copyWithProgress(
-                        source = body.byteStream(),
-                        sink = out,
-                        maxBytes = maxBytes,
-                        declaredBytes = declared,
-                        onProgress = onProgress,
-                        tooLarge = {
-                            UpdateNetworkException("安装包过大（超过 ${maxBytes / 1024 / 1024} MB）")
-                        },
-                    )
-                } catch (error: IOException) {
-                    // The same wording the in-memory path gives: a connection dropped
-                    // mid-body lands here, and OkHttp words that "unexpected end of
-                    // stream" — which is not a sentence to put in front of a user. Opening
-                    // the part file is outside this catch, so a disk that refuses is not
-                    // reported as a broken connection.
-                    throw UpdateNetworkException("下载中断（${error.message ?: "连接中断"}）", error)
+            part.outputStream().use { fileOut ->
+                DigestOutputStream(fileOut, digest).use { out ->
+                    try {
+                        copyWithProgress(
+                            source = body.byteStream(),
+                            sink = out,
+                            maxBytes = maxBytes,
+                            declaredBytes = declared,
+                            onProgress = onProgress,
+                            tooLarge = {
+                                UpdateNetworkException("安装包过大（超过 ${maxBytes / 1024 / 1024} MB）")
+                            },
+                        )
+                    } catch (error: IOException) {
+                        // The same wording the in-memory path gives: a connection dropped
+                        // mid-body lands here, and OkHttp words that "unexpected end of
+                        // stream" — which is not a sentence to put in front of a user.
+                        throw UpdateNetworkException("下载中断（${error.message ?: "连接中断"}）", error)
+                    }
                 }
             }
         } catch (error: Throwable) {
             part.delete()
             throw error
         }
+        verify(part, digest, expectation)
         if (!part.renameTo(target)) {
             part.delete()
             throw UpdateNetworkException("无法保存安装包")
         }
         return target
+    }
+
+    /**
+     * Checks the finished part file against [expectation], deleting it on a mismatch.
+     *
+     * A `delete()` that fails is not reported separately: the download is already a failure
+     * and the file is inside the app's own cache, where the next download for the same build
+     * overwrites it.
+     */
+    private fun verify(part: File, digest: MessageDigest, expectation: DownloadExpectation?) {
+        if (expectation == null) return
+        val written = part.length()
+        val size = expectation.sizeBytes
+        if (size != null && written != size) {
+            part.delete()
+            throw UpdateNetworkException("下载的安装包大小与更新信息不符（$written ≠ $size）")
+        }
+        val sha = expectation.sha256
+        if (sha != null && !hexDigest(digest.digest()).equals(sha, ignoreCase = true)) {
+            part.delete()
+            throw UpdateNetworkException("下载的安装包校验失败（SHA-256 不匹配）")
+        }
     }
 
     private fun <T> CancellableContinuation<T>.complete(result: Result<T>) {

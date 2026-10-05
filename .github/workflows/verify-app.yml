@@ -1,0 +1,153 @@
+# Runs the app's own gates on every push and pull request.
+#
+# The other two workflows publish the detection package; neither builds or tests the app,
+# so before this file a compile error, a failing unit test, a lint error or a shrunk-away
+# class could reach `main` unseen — every gate lived on someone's laptop. This job is the
+# missing automatic half: the same commands the release is gated on locally.
+#
+# What it runs, and why only this:
+#   * `:app:testDebugUnitTest` — the 30-odd JVM test classes, including the release
+#     regression and wording suites. Debug rather than optimized because the tests do not
+#     depend on the variant and debug needs no signing key; the *release* variant only
+#     differs by R8, and R8 is covered by building it in the tag/manual step below.
+#   * `:app:lint` — Android Lint's first-run baseline report is clean, so it can be a gate.
+#   * `:app:assembleDebug` as part of the same invocation: it is what the tests compile
+#     against, so it costs nothing extra.
+#
+# Deliberately absent: `assembleOptimized` (needs the release keystore, which is not in CI
+# and must not be), the wording gate (it needs a built *release* APK), and any publish step.
+#
+# Security shape, same posture as the publishing workflows:
+#   * read-only: `contents: read`, no secrets, no PAT — nothing here can write to the
+#     repository or reach a release;
+#   * no third-party actions: the checkout is plain `git`, and the JDK/SDK come from the
+#     runner image (see the notes in update-detection-package.yml for the reasoning);
+#   * a fork's pull request runs here too, which is the point — it is read-only, so there
+#     is nothing for it to abuse beyond the runner's own CPU.
+#
+# Operational notes:
+#   * the Android SDK on the runner may not carry platform 36 yet; the SDK step installs
+#     exactly what `compileSdk`/`buildToolsVersion` need, and fails loudly if it cannot;
+#   * `concurrency` cancels a superseded run of the same branch, so a burst of pushes does
+#     not queue up Gradle jobs behind each other.
+
+name: Verify the app
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-app-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests-and-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out this commit
+        # Plain git rather than a checkout action: `$GITHUB_REF` is `refs/heads/…` on a
+        # push and `refs/pull/<n>/merge` on a pull request, and both are fetchable by name
+        # with only the runner's own git. No action tag to trust or to move under us.
+        run: |
+          set -euo pipefail
+          git init --quiet .
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git fetch --quiet --depth 1 origin "$GITHUB_REF"
+          git checkout --quiet FETCH_HEAD
+          test -f app/build.gradle.kts
+
+      - name: Pick a JDK 17+
+        # AGP 8.13 needs 17 or newer. The runner image ships several; anything at 17 or
+        # above builds this project, so the first candidate that reports a usable version
+        # wins, and a missing JDK fails here rather than inside Gradle.
+        run: |
+          set -euo pipefail
+          for home in "$JAVA_HOME" /usr/lib/jvm/temurin-21-jdk-amd64 /usr/lib/jvm/temurin-17-jdk-amd64 /usr/lib/jvm/msopenjdk-17-amd64 /usr/lib/jvm/java-17-openjdk-amd64; do
+            [ -n "${home:-}" ] || continue
+            [ -x "$home/bin/java" ] || continue
+            version=$("$home/bin/java" -version 2>&1 | head -1)
+            echo "candidate $home: $version"
+            case "$version" in
+              *'"17'*|*'"18'*|*'"19'*|*'"20'*|*'"21'*|*'"22'*|*'"23'*|*'"24'*|*'"25'*)
+                echo "JAVA_HOME=$home" >> "$GITHUB_ENV"
+                echo "using $home"
+                exit 0
+                ;;
+            esac
+          done
+          echo "找不到 17 及以上的 JDK，无法构建" >&2
+          exit 1
+
+      - name: Android SDK 36
+        # compileSdk 36 and build-tools 36.0.0 are what the build asks for. The runner image
+        # usually has the SDK but not always this platform, so the missing pieces are
+        # installed from the image's own sdkmanager — and their licences accepted first,
+        # which is what a non-interactive install otherwise stalls on.
+        run: |
+          set -euo pipefail
+          sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [ -z "$sdk" ] || [ ! -d "$sdk" ]; then
+            echo "运行镜像没有 Android SDK（ANDROID_SDK_ROOT/ANDROID_HOME 均未设置）" >&2
+            exit 1
+          fi
+          manager=""
+          for candidate in \
+            "$sdk/cmdline-tools/latest/bin/sdkmanager" \
+            "$sdk/cmdline-tools/bin/sdkmanager" \
+            "$sdk/tools/bin/sdkmanager"; do
+            if [ -x "$candidate" ]; then manager="$candidate"; break; fi
+          done
+          if [ -n "$manager" ]; then
+            yes | "$manager" --sdk_root="$sdk" --licenses > /dev/null 2>&1 || true
+            "$manager" --sdk_root="$sdk" --install \
+              "platforms;android-36" "build-tools;36.0.0" "platform-tools" > /dev/null
+          else
+            echo "没有 sdkmanager；改用镜像里已有的 SDK（若缺 platform 36，构建会在此后失败）" >&2
+          fi
+          test -d "$sdk/platforms/android-36" || {
+            echo "platforms/android-36 仍不存在，无法编译 compileSdk 36" >&2
+            exit 1
+          }
+          echo "ANDROID_SDK_ROOT=$sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
+
+      - name: Unit tests and lint
+        # `--no-daemon` because each job is one-shot; the wrapper is used as-is so CI runs
+        # the same Gradle the wrapper pins (and verifies, via distributionSha256Sum).
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest :app:lint
+          python3 - <<'PY'
+          import glob, sys, xml.etree.ElementTree as ET
+          total = failures = errors = 0
+          for path in glob.glob("app/build/test-results/testDebugUnitTest/*.xml"):
+              root = ET.parse(path).getroot()
+              total += int(root.get("tests"))
+              failures += int(root.get("failures"))
+              errors += int(root.get("errors"))
+          if total == 0:
+              sys.exit("没有找到任何单元测试结果，测试任务可能根本没跑")
+          print(f"unit tests: {total} 项，失败 {failures}，错误 {errors}")
+          if failures or errors:
+              sys.exit(1)
+          PY
+
+      - name: Upload reports when something failed
+        if: failure()
+        # `actions/upload-artifact` is GitHub's own action; it is the one exception here,
+        # because a failing run whose reports vanish is a failing run nobody can diagnose.
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports
+          path: |
+            app/build/reports/lint-results-debug.html
+            app/build/reports/tests/testDebugUnitTest
+          if-no-files-found: ignore
+          retention-days: 7

@@ -16,6 +16,7 @@ import com.relaytester.app.core.model.TestSettings
 import com.relaytester.app.core.model.TestStatus
 import com.relaytester.app.core.network.BalanceApi
 import com.relaytester.app.core.network.RelayApi
+import com.relaytester.app.core.security.SecretRead
 import com.relaytester.app.core.security.SecretStore
 import com.relaytester.app.core.storage.SupplierStore
 import com.relaytester.app.core.storage.SupplierStoreState
@@ -63,6 +64,85 @@ class TesterPersistenceRaceTest {
     @After
     fun tearDown() {
         Dispatchers.resetMain()
+    }
+
+    // ---- a credential that cannot be decrypted is not an empty credential -------------
+
+    @Test
+    fun `a stored key that no longer decrypts is reported instead of looking empty`() = runTest {
+        withHarness(
+            secrets = MemorySecrets(unreadable = setOf("api-old")),
+            ready = { h -> h.vm.uiState.first { !it.isInitializing && it.message != null } },
+        ) { h ->
+            val state = h.vm.uiState.value
+            assertEquals("", state.draft?.apiKey.orEmpty())
+            assertTrue("解密失败没有说明原因：${state.message}", state.message.orEmpty().contains("无法解密"))
+            assertTrue("解密失败不是错误态", state.isMessageError)
+        }
+    }
+
+    @Test
+    fun `a balance token that no longer decrypts is reported on the balance panel`() = runTest {
+        withHarness(
+            secrets = MemorySecrets(unreadable = setOf("pat-old")),
+            ready = { h -> h.vm.balanceUiState.first { !it.isInitializing && it.message != null } },
+        ) { h ->
+            val balance = h.vm.balanceUiState.value
+            assertEquals("", balance.credentials.accessToken)
+            assertTrue(
+                "解密失败没有说明原因：${balance.message}",
+                balance.message.orEmpty().contains("无法解密"),
+            )
+            // The API key was readable, so the tester panel must not have been blamed.
+            assertNull("另一个面板被误报：${h.vm.uiState.value.message}", h.vm.uiState.value.message)
+        }
+    }
+
+    @Test
+    fun `exporting a backup stops when a stored credential cannot be decrypted`() = runTest {
+        withHarness(
+            secrets = MemorySecrets(unreadable = setOf("api-old")),
+            // The export refuses to run while anything is initializing, and an unreadable
+            // credential never fills a field, so the wait is on both panels being idle.
+            ready = { h ->
+                h.vm.uiState.first { !it.isInitializing && !it.isSecretsHydrating && it.message != null }
+                h.vm.balanceUiState.first { !it.isInitializing && !it.isSecretsHydrating }
+            },
+        ) { h ->
+            h.vm.createConfigurationBackup(password = "fixture-password", encrypted = false)
+            awaitReal {
+                h.vm.configurationBackupUiState.first { !it.isBusy && it.message != null }
+            }
+
+            val backupState = h.vm.configurationBackupUiState.value
+            assertTrue("读不出凭据却没有报错：${backupState.message}", backupState.isMessageError)
+            assertTrue(
+                "报错没说清是凭据读不出来：${backupState.message}",
+                backupState.message.orEmpty().contains("无法解密"),
+            )
+            assertTrue(
+                "报错没有点出供应商名字：${backupState.message}",
+                backupState.message.orEmpty().contains("Original"),
+            )
+            // The dangerous outcome is a file that claims to be a backup while the credentials
+            // in it are empty, so the payload must not exist at all.
+            assertNull("读不出凭据却还是给出了备份文件", backupState.exportPayload)
+        }
+    }
+
+    @Test
+    fun `a healthy store still exports the credentials it holds`() = runTest {
+        withHarness { h ->
+            h.vm.createConfigurationBackup(password = "fixture-password", encrypted = false)
+            awaitReal {
+                h.vm.configurationBackupUiState.first { !it.isBusy && it.exportPayload != null }
+            }
+            val payload = h.vm.configurationBackupUiState.value.exportPayload
+            assertTrue(
+                "健康凭据没有进入备份",
+                String(payload!!.encryptedBytes, Charsets.UTF_8).contains("fixture-old-api"),
+            )
+        }
     }
 
     @Test
@@ -223,13 +303,18 @@ class TesterPersistenceRaceTest {
         }
     }
 
-    private suspend fun TestScope.withHarness(block: suspend (Harness) -> Unit) {
-        val h = Harness()
+    private suspend fun TestScope.withHarness(
+        secrets: MemorySecrets = MemorySecrets(),
+        /** What the test waits for before it may drive the view model. */
+        ready: suspend (Harness) -> Unit = { h ->
+            h.vm.uiState.first { !it.isInitializing && it.draft?.apiKey == "fixture-old-api" }
+            h.vm.balanceUiState.first { !it.isInitializing && it.credentials.accessToken == "fixture-old-pat" }
+        },
+        block: suspend (Harness) -> Unit,
+    ) {
+        val h = Harness(secrets)
         try {
-            awaitReal {
-                h.vm.uiState.first { !it.isInitializing && it.draft?.apiKey == "fixture-old-api" }
-                h.vm.balanceUiState.first { !it.isInitializing && it.credentials.accessToken == "fixture-old-pat" }
-            }
+            awaitReal { ready(h) }
             block(h)
         } finally {
             h.close()
@@ -247,8 +332,8 @@ class TesterPersistenceRaceTest {
         withTimeoutOrNull(300) { block() }
     }
 
-    private class Harness {
-        val secrets = MemorySecrets()
+    private class Harness(secrets: MemorySecrets = MemorySecrets()) {
+        val secrets = secrets
         val store = GatedStore(initialState())
         val api = GatedApi()
         private val lifecycle = ViewModelStore()
@@ -302,7 +387,13 @@ class TesterPersistenceRaceTest {
     }
 
     /** Keeps creation/deletion side effects, substituting only the blocking Keystore. */
-    private class MemorySecrets : SecretStore {
+    private class MemorySecrets(
+        /**
+         * Ids whose record exists but no longer decrypts — what a reset Keystore looks like
+         * from the outside. Everything else behaves like a healthy store.
+         */
+        private val unreadable: Set<String> = emptySet(),
+    ) : SecretStore {
         private val values = ConcurrentHashMap<String, String>().apply {
             put("api-old", "fixture-old-api")
             put("pat-old", "fixture-old-pat")
@@ -326,6 +417,14 @@ class TesterPersistenceRaceTest {
         }
 
         override fun get(secretId: String): String? = values[secretId]
+
+        override fun read(secretId: String): SecretRead =
+            if (secretId in unreadable) {
+                SecretRead.Unreadable("测试构造：密钥库已被重置")
+            } else {
+                values[secretId]?.let(SecretRead::Found) ?: SecretRead.Absent
+            }
+
         override fun delete(secretId: String) { values.remove(secretId) }
         fun releaseAll() { gates.values.forEach { it.release.countDown() } }
     }

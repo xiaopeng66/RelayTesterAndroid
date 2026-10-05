@@ -9,6 +9,7 @@ import com.relaytester.app.core.fingerprint.FingerprintBankStore
 import com.relaytester.app.core.fingerprint.sha256Hex
 import com.relaytester.app.core.storage.UpdatePreferences
 import com.relaytester.app.core.storage.UpdatePreferencesState
+import com.relaytester.app.core.update.DownloadExpectation
 import com.relaytester.app.core.update.DownloadProgress
 import java.io.File
 import java.io.IOException
@@ -308,7 +309,7 @@ internal class MemoryBankFileSystem(
 internal fun manifestJson(
     bankBytes: ByteArray,
     builtAt: String = "2026-09-30T05:12:31+00:00",
-    url: String = "https://example.test/bank/lite-bank.bin",
+    url: String = FakeHttpFetcher.BANK_URL,
     modelCount: Int = FingerprintBank.fromPackageBytes(bankBytes).modelCount,
     minAppVersionCode: Long = 0L,
     sha256: String = sha256Hex(bankBytes),
@@ -399,8 +400,13 @@ internal class FakeHttpFetcher(
         url: String,
         target: File,
         maxBytes: Long,
+        expectation: DownloadExpectation?,
         onProgress: (DownloadProgress) -> Unit,
     ): File {
+        // The expectation is deliberately not enforced here: this double answers with whatever
+        // a test told it to serve, which is exactly how a caller that does its own checking
+        // gets exercised. The real fetcher's own enforcement is covered against a socket in
+        // `OkHttpFetcherTest`.
         val bytes = fetch(url, maxBytes.toInt(), onProgress)
         target.parentFile?.mkdirs()
         target.writeBytes(bytes)
@@ -414,7 +420,9 @@ internal class FakeHttpFetcher(
     }
 
     companion object {
-        const val BANK_URL = "https://example.test/bank/lite-bank.bin"
+        /** The real host: the parser only accepts a release host, as `UpdateHosts` explains. */
+        const val BANK_URL =
+            "https://github.com/xiaopeng66/RelayTesterAndroid/releases/download/bank/lite-bank.bin"
         val MANIFEST_URL: String get() = BankUpdateDefaults.MANIFEST_URL
     }
 }

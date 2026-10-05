@@ -33,6 +33,13 @@ data class SupplierStoreState(
     /** Model-name filters are shared by every supplier. */
     val modelFilterKeyword: String = "",
     val quickFilterTerms: List<String> = emptyList(),
+    /**
+     * The stored blob did not decode cleanly: it was not JSON, a section had the wrong
+     * shape, or every supplier entry was unreadable. Whatever failed is simply absent from
+     * this state, so the caller has to say so — otherwise the next save rewrites the file
+     * without it and the loss becomes permanent.
+     */
+    val decodeFailed: Boolean = false,
 )
 
 open class SupplierStore(private val context: Context?) {
@@ -161,7 +168,15 @@ open class SupplierStore(private val context: Context?) {
     }
 
     private fun deserialize(raw: String?, activeSupplierId: String?): SupplierStoreState {
-        val root = runCatching { JSONObject(raw ?: "{}") }.getOrDefault(JSONObject())
+        val text = raw ?: "{}"
+        val parsed = runCatching { JSONObject(text) }.getOrNull()
+        val root = parsed ?: JSONObject()
+        // Written by the app itself, this blob is always an object whose sections are
+        // arrays; a fresh install has no blob at all. So text that will not parse, a
+        // section with another JSON type, or a supplier list whose entries all failed to
+        // decode are all damage — and it is damage nothing else can see once the sections
+        // below have quietly produced their empty defaults.
+        val sectionsLost = SECTIONS.any { key -> root.has(key) && root.optJSONArray(key) == null }
         val suppliers = runCatching {
             val array = root.optJSONArray("suppliers") ?: JSONArray()
             buildList {
@@ -258,6 +273,11 @@ open class SupplierStore(private val context: Context?) {
             balanceSnapshots = snapshots,
             modelFilterKeyword = modelFilterKeyword,
             quickFilterTerms = quickFilterTerms,
+            decodeFailed = (parsed == null && text.isNotBlank()) ||
+                sectionsLost ||
+                // A section that held entries and yielded none means every entry was
+                // unreadable — the shape an incompatible writer leaves behind.
+                (suppliers.isEmpty() && (root.optJSONArray("suppliers")?.length() ?: 0) > 0),
         )
     }
 
@@ -421,6 +441,14 @@ open class SupplierStore(private val context: Context?) {
         val SUPPLIERS_KEY: Preferences.Key<String> = stringPreferencesKey("suppliers_json")
         val ACTIVE_SUPPLIER_KEY: Preferences.Key<String> = stringPreferencesKey("active_supplier_id")
 
+        /** The array-valued sections this serializer writes, checked for shape on read. */
+        private val SECTIONS = listOf(
+            "suppliers",
+            "balanceTemplates",
+            "modelCatalog",
+            "balanceSnapshots",
+        )
+
         /**
          * Test seams for the JSON round trip. They expose the same private
          * serializer the app uses so a unit test can prove a field survives
@@ -431,6 +459,10 @@ open class SupplierStore(private val context: Context?) {
 
         fun decodeStateForTest(root: JSONObject): SupplierStoreState =
             SupplierStore(null).decodeForTest(root)
+
+        /** Decodes raw stored text, for the damage cases a JSONObject cannot express. */
+        fun decodeRawForTest(raw: String): SupplierStoreState =
+            SupplierStore(null).deserialize(raw, activeSupplierId = null)
 
         fun decodeSupplierForTest(source: JSONObject): SupplierProfile? =
             SupplierStore(null).decodeSupplierForTest(source)

@@ -5,7 +5,24 @@
   cleartext is opt-in: it happens only when the user types an explicit
   http:// prefix. API keys sent over cleartext are visible to the network,
   which is why HTTPS remains the default for every other input.
+
+  This allowance is for addresses the *user* types. Anything the app fetches on
+  its own behalf — the update feed's APK and the detection package — is not
+  covered by it: those URLs are required to be https on a release host at parse
+  time (see UpdateHosts), and the domain-config below makes the platform refuse
+  cleartext to those hosts as well, so a future code path that forgot the check
+  still cannot downgrade a download the feed also supplies the digest for.
+  Lint's InsecureBaseConfiguration warning covers the base-config clause; that
+  clause is deliberate and this is the stricter half.
 -->
 <network-security-config>
     <base-config cleartextTrafficPermitted="true" />
+    <!-- A more specific rule wins over base-config, so these four are https-only even
+         though the user-typed relay endpoints above still may be plain http. -->
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="true">github.com</domain>
+        <domain includeSubdomains="true">objects.githubusercontent.com</domain>
+        <domain includeSubdomains="true">release-assets.githubusercontent.com</domain>
+        <domain includeSubdomains="true">github-releases.githubusercontent.com</domain>
+    </domain-config>
 </network-security-config>

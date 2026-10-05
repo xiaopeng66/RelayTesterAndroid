@@ -2,8 +2,8 @@
 
 Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询工具，面向经常使用中转站 / API 代理服务的用户。它不依赖外部服务器，直接从手机向用户配置的 API 站点发起请求。
 
-- 当前版本：1.6.0
-- 下载地址：[GitHub Release v1.6.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.6.0)
+- 当前版本：1.7.0
+- 下载地址：[GitHub Release v1.7.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.7.0)
 - 安装包：包名 `com.relaytester.app`，约 2.82 MB；模型指纹检测包按需下载，不占安装包体积
 - 支持系统：Android 8.0 及以上
 
@@ -50,11 +50,12 @@ Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询�
 
 ## 发行版本
 
-- 最新：[v1.6.0 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.6.0) · [发行说明](release-notes/RELEASE_NOTES_1.6.0.md)
-  - `RelayTester-v1.6.0-android.apk` · `2,958,267` 字节 · SHA-256 `dee706ec89ee3e32db4b7603b35d1e3113466904ace7ace42547ad0c4bab1b23`
+- 最新：[v1.7.0 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.7.0) · [发行说明](release-notes/RELEASE_NOTES_1.7.0.md)
+  - `RelayTester-v1.7.0-android.apk` · `2,974,695` 字节 · SHA-256 `21fe9fd4786ed8accabbf2d52ad6836e18c8ba6f4b6fa590ccf6873e991546ba`
 
 历史版本（每个版本的说明页写明了该版当前安装包的字节数与 SHA-256）：
 
+- [v1.6.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.6.0) · [发行说明](release-notes/RELEASE_NOTES_1.6.0.md)
 - [v1.5.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.5.0) · [发行说明](release-notes/RELEASE_NOTES_1.5.0.md)
 - [v1.4.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.4.0) · [发行说明](release-notes/RELEASE_NOTES_1.4.0.md)
 - [v1.3.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.3.0) · [发行说明](release-notes/RELEASE_NOTES_1.3.0.md)

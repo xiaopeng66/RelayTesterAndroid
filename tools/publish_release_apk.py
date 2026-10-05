@@ -18,6 +18,12 @@ version name, so a tag comparison would call a 10502 install up to date.
 
 Both assets are downloaded again afterwards and compared byte for byte.
 
+Before anything is uploaded, the artifact has to pass four gates that a self-consistent
+feed cannot substitute for: it must be signed by the release certificate, carry this app's
+package name, still hold the wording the source says, and (compared against the live feed)
+not move the advertised version code backwards. The README's line for this version is
+rewritten to the numbers being published, because it went stale once already.
+
 Usage:
     python tools/publish_release_apk.py --dry-run   # print what would be published
     python tools/publish_release_apk.py --check     # verify the published assets match
@@ -45,12 +51,28 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import publish_bank  # noqa: E402 - the sibling module, on the path added just above
+import verify_apk_wording  # noqa: E402 - same, the wording invariants for the shipped APK
+import verify_native_alignment  # noqa: E402 - same, the 16 KB page pairing for its .so files
 
 REPO = "xiaopeng66/RelayTesterAndroid"
 API = "https://api.github.com"
 PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GRADLE = os.path.join(PROJECT, "app/build.gradle.kts")
+README = os.path.join(PROJECT, "README.md")
 TOKEN_FILES = ["E:/AI/Zcode/tmp/.ghtoken"]
+
+# The package name an APK must carry to be publishable as this app's update source. The feed
+# is required to carry the name inside the artifact (see apk_identity), so a debug build would
+# publish a feed that no installed app can accept — the update channel would go quiet rather
+# than fail loudly.
+APP_PACKAGE = "com.relaytester.app"
+
+# The release key's certificate, as `apksigner verify --print-certs` reports it. Hard-coded on
+# purpose: it is the one fact that cannot be derived from the artifact being checked, and this
+# is the release tool, not the app — a key rotation is a deliberate act that updates this line
+# together with the keystore.
+RELEASE_CERT_SHA256 = "05c3e56705aa8c420523f999d950ce74482c42f4376ac88918db10e9451d69de"
+
 
 # The app feed's own pre-release. Separate from `bank` so the daily detection-package job
 # and the manual APK publish can never delete each other's assets.
@@ -189,8 +211,8 @@ def verify_notes_identity(notes_bytes, apk_bytes, notes_path):
     )
 
 
-def aapt2_path():
-    """The aapt2 to read the APK with, from whichever SDK this machine declares."""
+def sdk_roots():
+    """Every SDK root this machine declares, most explicit first."""
     roots = [os.environ[name] for name in ("ANDROID_SDK_ROOT", "ANDROID_HOME") if os.environ.get(name)]
     properties = os.path.join(PROJECT, "local.properties")
     if os.path.isfile(properties):
@@ -199,8 +221,13 @@ def aapt2_path():
                 if line.strip().startswith("sdk.dir="):
                     # A Java properties file escapes the colon on Windows (E\:/sdk).
                     roots.append(line.strip().split("=", 1)[1].replace("\\:", ":").replace("\\\\", "\\"))
-    executable = "aapt2.exe" if os.name == "nt" else "aapt2"
-    for root in roots:
+    return roots
+
+
+def build_tools_tool(name):
+    """The newest build-tools copy of [name] (`aapt2`, `apksigner`) this machine has."""
+    suffixes = [".bat", ".exe", ""] if os.name == "nt" else ["", ".exe", ".bat"]
+    for root in sdk_roots():
         build_tools = os.path.join(root, "build-tools")
         if not os.path.isdir(build_tools):
             continue
@@ -209,10 +236,168 @@ def aapt2_path():
             key=lambda value: [int(part) for part in re.findall(r"\d+", value)],
         )
         for version in reversed(versions):
-            candidate = os.path.join(build_tools, version, executable)
-            if os.path.isfile(candidate):
-                return candidate
-    raise SystemExit("找不到 aapt2：设置 ANDROID_SDK_ROOT，或在 local.properties 里写 sdk.dir")
+            for suffix in suffixes:
+                candidate = os.path.join(build_tools, version, name + suffix)
+                if os.path.isfile(candidate):
+                    return candidate
+    raise SystemExit(
+        f"找不到 {name}：设置 ANDROID_SDK_ROOT，或在 local.properties 里写 sdk.dir"
+    )
+
+
+def aapt2_path():
+    """The aapt2 to read the APK with, from whichever SDK this machine declares."""
+    return build_tools_tool("aapt2")
+
+
+def apksigner_path():
+    """The apksigner to read the APK's signer with."""
+    return build_tools_tool("apksigner")
+
+
+def verify_apk_signature(apk_path):
+    """Stop unless the APK is signed by the release certificate.
+
+    Nothing downstream can catch this. The feed's size and digest are derived from whatever
+    bytes are handed to this script, so they stay self-consistent for an unsigned or
+    debug-signed artifact; the download-back check compares bytes with bytes; and the notes
+    check compares the notes with the same bytes. Every one of those gates passes on an APK
+    no installed device will accept, and the update channel then fails silently for everyone
+    (the installer refuses it, or the package-name check in the app does). The signature is
+    the one property that has to come from the key rather than from the file, so it is the
+    one checked against a value this script carries itself.
+    """
+    result = subprocess.run(
+        [apksigner_path(), "verify", "--print-certs", apk_path],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        output = (result.stdout + result.stderr).strip()
+        raise SystemExit(f"apksigner 判定这个 APK 不可安装（{os.path.basename(apk_path)}）：{output[:300]!r}")
+    digests = {value.lower() for value in re.findall(r"SHA-256 digest:\s*([0-9a-fA-F]{64})", result.stdout)}
+    if not digests:
+        raise SystemExit(f"apksigner 没有报出签名证书摘要：{result.stdout[:200]!r}")
+    if RELEASE_CERT_SHA256 not in digests:
+        raise SystemExit(
+            "这个 APK 的签名证书不是发布证书，已在任何上传之前停下：\n"
+            f"  期望发布证书：{RELEASE_CERT_SHA256}\n"
+            f"  实际证书    ：{', '.join(sorted(digests))}\n"
+            "  用发布密钥重新构建 optimized 变体，或（换了密钥的话）同步更新本脚本里的指纹。"
+        )
+    print(f"signature: 由发布证书签名（{RELEASE_CERT_SHA256[:12]}）")
+
+
+def verify_release_identity(identity, apk_path):
+    """Stop unless the artifact is this app's own package.
+
+    A debug build carries a different package name; the feed would carry it too, and every
+    installed device would reject the update before downloading anything — the channel stops
+    without an error anyone can see. The name is checked against a constant here rather than
+    against the build file because the point is to notice a *different* artifact, which the
+    build file cannot say.
+    """
+    if identity["packageName"] != APP_PACKAGE:
+        raise SystemExit(
+            f"{os.path.basename(apk_path)} 的包名是 {identity['packageName']!r}，"
+            f"不是发布包名 {APP_PACKAGE!r}；它不能作为更新源发布"
+        )
+    print(f"identity: 包名 {identity['packageName']}，版本代码 {identity['versionCode']}")
+
+
+README_APK_RE = re.compile(
+    r"(`RelayTester-v([0-9.]+)-android\.apk`\s*·\s*`)([\d,]+)"
+    r"(`\s*字节\s*·\s*SHA-256\s*`)([0-9a-fA-F]{64})(`)"
+)
+
+
+def sync_readme_digest(apk_bytes, release_version):
+    """Rewrite README's line for this version so it names the bytes being published.
+
+    A rebuild moves the digest while the source stays put (the Android build is not
+    byte-reproducible), so a number written by hand is stale after the next one — which is
+    how this line came to disagree with the release notes, the artifact and the live feed all
+    at once. The release notes are *checked* and stop the run; the README is *rewritten*,
+    because it is prose this step already owns and a stale line there misleads a reader who
+    verifies a download against the file he was given. Only the two numbers move.
+    """
+    actual_size = len(apk_bytes)
+    actual_digest = sha256(apk_bytes)
+    with open(README, encoding="utf-8") as handle:
+        text = handle.read()
+
+    matches = [match for match in README_APK_RE.finditer(text) if match.group(2) == release_version]
+    if not matches:
+        print(f"readme: 没有 {release_version} 的安装包行，未改动（若已在别处说明，可忽略）")
+        return
+    if len(matches) > 1:
+        raise SystemExit(f"README.md 里有 {len(matches)} 处 {release_version} 的安装包行，无法判断改哪一处")
+
+    match = matches[0]
+    if match.group(3).replace(",", "") == str(actual_size) and match.group(5).lower() == actual_digest:
+        print(f"readme: 已与产物一致（{actual_size} 字节 {actual_digest[:12]}）")
+        return
+    replacement = (
+        f"{match.group(1)}{actual_size:,}{match.group(4)}{actual_digest}{match.group(6)}"
+    )
+    with open(README, "w", encoding="utf-8", newline="") as handle:
+        handle.write(text[: match.start()] + replacement + text[match.end():])
+    print(
+        f"readme: 已改写为本次产物（{match.group(3)} → {actual_size:,} 字节，"
+        f"{match.group(5)[:12]} → {actual_digest[:12]}）；记得把 README.md 一并提交"
+    )
+
+
+def published_app_version_code(token):
+    """The version code the live feed advertises, or None when there is nothing to compare.
+
+    A missing release, a missing asset or an unreadable body all mean "unknown" rather than
+    "older": the caller must not refuse a publish because the network hiccuped.
+    """
+    release = publish_bank.release_by_tag(token, APP_TAG)
+    if release is None:
+        return None
+    assets = {asset["name"]: asset for asset in release["assets"]}
+    if APP_ASSET not in assets:
+        return None
+    try:
+        body = publish_bank.download(
+            assets[APP_ASSET]["browser_download_url"], cache_bust=True, attempts=1
+        )
+        value = json.loads(body).get("versionCode")
+    except (urllib.error.URLError, ValueError, KeyError, TypeError) as error:
+        print(f"读线上清单失败，跳过版本代码比较：{error}")
+        return None
+    return int(value) if value is not None else None
+
+
+def verify_monotonic_version_code(token, version_code, allow_nonmonotonic):
+    """Stop when the feed would move *backwards*.
+
+    Going backwards is the failure worth catching: devices already on a higher code compare
+    `feed > installed`, see false, and report "up to date" forever — the channel stops as
+    surely as if the feed were empty, and nothing says so. Publishing the *same* code again
+    is this repository's normal release model (one public version per number, rebuilt in
+    place), so equality is allowed and only a decrease is refused.
+    """
+    published = published_app_version_code(token)
+    if published is None:
+        print("monotonic: 线上还没有可比对的清单")
+        return
+    if version_code < published:
+        if allow_nonmonotonic:
+            print(f"monotonic: 本次 {version_code} 低于线上 {published}，按 --allow-nonmonotonic 继续")
+            return
+        raise SystemExit(
+            f"本次要发布的版本代码 {version_code} 低于线上清单的 {published}，已停止：\n"
+            "  发布后线上版本会倒退，已经升级的设备会把更新判成「已是最新」，更新通道静默失效。\n"
+            "  确认这是有意为之，再加 --allow-nonmonotonic 重跑。"
+        )
+    relation = "相同（同号重建，允许）" if version_code == published else "更高"
+    print(f"monotonic: 线上 {published} → 本次 {version_code}（{relation}）")
+
 
 
 def apk_identity(apk_path):
@@ -269,7 +454,8 @@ def build_app_manifest(identity, apk_bytes, tag, name, notes_url):
     }
 
 
-def verify_app_manifest(release_tag, manifest_bytes, manifest, attempts=6, wait_seconds=5.0):
+def verify_app_manifest(release_tag, manifest_bytes, manifest, attempts=6, wait_seconds=5.0,
+                        tolerate_published_at=False):
     """Download the feed back and check it is byte for byte the document this run built.
 
     The byte comparison is the load-bearing check: it is what makes a stale CDN copy, or a
@@ -277,6 +463,12 @@ def verify_app_manifest(release_tag, manifest_bytes, manifest, attempts=6, wait_
     only used to restate a mismatch in field terms when the bytes *do* match but a field
     does not — which cannot happen while the bytes compared against are the ones built here,
     so that loop is a guard for a future refactor, not this run's evidence.
+
+    [tolerate_published_at] is for `--check` only. A check run rebuilds the document locally,
+    so its `publishedAt` is the moment of the check, never the moment the feed went up; the
+    byte comparison can therefore never hold on that field. With it on, the documents are
+    compared field by field and everything except the timestamp still has to be identical —
+    a changed digest is still a failure, named by field.
     """
     assets = {asset["name"]: asset for asset in release_tag["assets"]}
     if APP_ASSET not in assets:
@@ -284,6 +476,7 @@ def verify_app_manifest(release_tag, manifest_bytes, manifest, attempts=6, wait_
     url = assets[APP_ASSET]["browser_download_url"]
     seen = None
     last_error = None
+    last_differing = None
     for attempt in range(attempts):
         try:
             # Cache-busted and single-try per read: this loop owns the attempt count, and a
@@ -306,14 +499,58 @@ def verify_app_manifest(release_tag, manifest_bytes, manifest, attempts=6, wait_
                 f"包名 {online['packageName']}，sha256 {online['sha256'][:12]}）"
             )
             return online
+        if tolerate_published_at:
+            online, differing = differing_only_in_published_at(fetched, manifest)
+            if online is not None:
+                print(
+                    f"verified: {APP_ASSET} 除 publishedAt 外与本地逐字段一致"
+                    f"（线上 {online.get('publishedAt')}；版本代码 {online['versionCode']}，"
+                    f"sha256 {online['sha256'][:12]}）"
+                )
+                return online
+            if differing is not None:
+                last_differing = differing
+                print(f"线上清单与本地的差异字段：{'、'.join(differing)}")
         seen = len(fetched)
         if attempt + 1 < attempts:
             time.sleep(wait_seconds)
     if seen is None:
         raise SystemExit(f"清单回读校验未能完成（重试 {attempts} 次）：{last_error}")
+    if last_differing:
+        # The field names are the whole diagnosis: "487 字节 vs 487 字节" cannot tell a stale
+        # copy from a digest that was rebuilt, and the difference is usually one field.
+        raise SystemExit(
+            f"清单回读校验失败（重试 {attempts} 次）：本地 {len(manifest_bytes)} 字节，"
+            f"线上 {seen} 字节；不同的字段：{'、'.join(last_differing)}",
+        )
     raise SystemExit(
         f"清单回读校验失败（重试 {attempts} 次）：本地 {len(manifest_bytes)} 字节，线上 {seen} 字节",
     )
+
+
+def differing_only_in_published_at(fetched, manifest):
+    """Compare a fetched feed with [manifest], ignoring `publishedAt`.
+
+    Returns `(online, None)` when that timestamp is the only difference — the parsed live
+    document, which the caller accepts. Returns `(None, fields)` when the body parses but
+    other fields differ, naming them so the failure is diagnosable. Returns `(None, None)`
+    when the body is not a JSON object at all (that is a stale or broken asset, not a field
+    mismatch, and belongs to the retry loop rather than to a field list).
+    """
+    try:
+        online = json.loads(fetched)
+    except ValueError:
+        return None, None
+    if not isinstance(online, dict):
+        return None, None
+    local = {key: value for key, value in manifest.items() if key != "publishedAt"}
+    live = {key: value for key, value in online.items() if key != "publishedAt"}
+    if live != local:
+        fields = sorted(
+            key for key in set(live) | set(local) if live.get(key) != local.get(key)
+        )
+        return None, (fields if fields else ["（字段集合不同）"])
+    return online, None
 
 
 def main():
@@ -321,6 +558,11 @@ def main():
     parser.add_argument("--apk", help="要发布的 APK，默认取 optimized 构建产物")
     parser.add_argument("--dry-run", action="store_true", help="只打印，不联网")
     parser.add_argument("--check", action="store_true", help="只校验线上与本地是否一致")
+    parser.add_argument(
+        "--allow-nonmonotonic",
+        action="store_true",
+        help="允许把低于线上清单的版本代码发出去（默认拒绝，因为会让更新通道静默失效）",
+    )
     args = parser.parse_args()
 
     tag = "v" + version()
@@ -339,9 +581,19 @@ def main():
     # before anything is uploaded, like the feed below it.
     verify_notes_identity(notes_bytes, apk_bytes, notes_path)
 
+    # Three gates that no downstream check can substitute for: the APK has to be signed by
+    # the release key, carry this app's package name, and hold the wording the source says.
+    # All three read the artifact being published, all three run before anything is uploaded.
+    verify_apk_signature(apk_path)
+    verify_apk_wording.verify(apk_path, verbose=False)
+    # A fourth, about the binary rather than the text: a library built for 4 KB pages cannot
+    # load on a 16 KB device, and no test on this machine can see that (its page size is 4 KB).
+    verify_native_alignment.check(apk_path)
+
     # Built before anything is uploaded: a feed that cannot be derived (no aapt2, an APK
     # that is not an APK) has to stop the run while the release is still untouched.
     identity = apk_identity(apk_path)
+    verify_release_identity(identity, apk_path)
     manifest = build_app_manifest(
         identity,
         apk_bytes,
@@ -357,6 +609,10 @@ def main():
     if args.dry_run:
         return 0
 
+    # Local and network-independent: the README names the artifact that exists on disk, so it
+    # is corrected before the release is touched. A `--dry-run` deliberately writes nothing.
+    sync_readme_digest(apk_bytes, version())
+
     token = read_token()
     release = release_of(token, tag)
     if release is None:
@@ -366,8 +622,15 @@ def main():
         app_release = publish_bank.release_by_tag(token, APP_TAG)
         if app_release is None:
             raise SystemExit(f"{APP_TAG} release 不存在")
-        verify_app_manifest(app_release, manifest_bytes, manifest)
+        # `publishedAt` is the one field a check run cannot reproduce: it records when the
+        # feed went up, and a locally rebuilt document carries the time of the check. Every
+        # other field — the digest above all — is still compared exactly; see the helper.
+        verify_app_manifest(app_release, manifest_bytes, manifest, tolerate_published_at=True)
         return 0
+
+    # Read-back of the live feed, so a release built from a stale APK cannot move the version
+    # code backwards. Read-only, and the only gate here that needs the network.
+    verify_monotonic_version_code(token, identity["versionCode"], args.allow_nonmonotonic)
 
     for asset in release["assets"]:
         if asset["name"] == name:

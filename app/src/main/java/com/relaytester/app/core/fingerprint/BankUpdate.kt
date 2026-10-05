@@ -3,6 +3,7 @@ package com.relaytester.app.core.fingerprint
 import androidx.compose.runtime.Immutable
 import com.relaytester.app.core.update.DownloadProgress
 import com.relaytester.app.core.update.HttpFetcher
+import com.relaytester.app.core.update.UpdateHosts
 import org.json.JSONObject
 
 /**
@@ -96,8 +97,11 @@ object BankManifestParser {
             throw BankUpdateException("更新清单的模型数量不合理（$modelCount）")
         }
         val url = root.string("url", "下载地址")
-        if (!url.startsWith("http://") && !url.startsWith("https://")) {
-            throw BankUpdateException("更新清单的下载地址必须是 HTTP(S)")
+        // Same rule as the app's own feed, for the same reason: the digest travels in this
+        // document, so the address has to be tied to the release hosts rather than taken on
+        // trust. See [UpdateHosts].
+        if (UpdateHosts.httpsOrNull(url) == null) {
+            throw BankUpdateException("更新清单的下载地址必须是发布站点的 HTTPS 地址")
         }
         return BankManifest(
             formatVersion = formatVersion,

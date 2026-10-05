@@ -34,8 +34,10 @@ import com.relaytester.app.core.model.mergeModelFilterTerms
 import com.relaytester.app.core.model.normalizeQuickFilterTerms
 import com.relaytester.app.core.model.parseModelFilterTerms
 import com.relaytester.app.core.network.BalanceApi
+import com.relaytester.app.core.network.redactSecrets
 import com.relaytester.app.core.network.RelayApi
 import com.relaytester.app.core.security.KeystoreSecretStore
+import com.relaytester.app.core.security.SecretRead
 import com.relaytester.app.core.security.SecretStore
 import com.relaytester.app.core.storage.SupplierStore
 import com.relaytester.app.core.storage.SupplierStoreState
@@ -1214,7 +1216,7 @@ class TesterViewModel(
                     it.copy(
                         unifiedTestingKeys = nextTestingKeys,
                         isUnifiedTesting = nextTestingKeys.isNotEmpty(),
-                        message = error.message ?: "统一连接测试中断",
+                        message = (error.message ?: "统一连接测试中断").redactSecrets(),
                         isMessageError = true,
                     )
                 }
@@ -2977,29 +2979,55 @@ class TesterViewModel(
         _balanceUiState.update { it.copy(message = message, isMessageError = isError) }
     }
 
-    private fun createConfigurationBackupSnapshot(): ConfigurationBackup = ConfigurationBackup(
-        createdAt = System.currentTimeMillis(),
-        activeSupplierId = activeSupplierId,
-        suppliers = profiles.map { profile ->
-            ConfigurationBackupSupplier(
-                id = profile.id,
-                name = profile.name,
-                baseUrl = profile.baseUrl,
-                protocol = profile.protocol,
-                apiKey = profile.apiKeySecretId?.let(secretStore::get).orEmpty(),
-                models = profile.models,
-                testSettings = profile.testSettings,
-                balanceTemplateId = profile.balanceTemplateId,
-                balanceAccessToken = profile.balanceAccessTokenSecretId?.let(secretStore::get).orEmpty(),
-                balanceUserId = profile.balanceUserId,
-                isTestingDisabled = profile.isTestingDisabled,
+    private fun createConfigurationBackupSnapshot(): ConfigurationBackup {
+        // A credential slot that exists but cannot be decrypted is not an empty credential:
+        // writing "" into the file would export a supplier the user believes is complete, and
+        // the dialog would still say the backup succeeded. The names are collected so the
+        // refusal can say which suppliers need their key typed again.
+        val unreadable = mutableListOf<String>()
+        fun exportableSecret(secretId: String?, supplierName: String): String {
+            if (secretId == null) return ""
+            return when (val read = secretStore.read(secretId)) {
+                is SecretRead.Found -> read.value
+                SecretRead.Absent -> ""
+                is SecretRead.Unreadable -> {
+                    if (supplierName !in unreadable) unreadable += supplierName
+                    ""
+                }
+            }
+        }
+        val snapshot = ConfigurationBackup(
+            createdAt = System.currentTimeMillis(),
+            activeSupplierId = activeSupplierId,
+            suppliers = profiles.map { profile ->
+                ConfigurationBackupSupplier(
+                    id = profile.id,
+                    name = profile.name,
+                    baseUrl = profile.baseUrl,
+                    protocol = profile.protocol,
+                    apiKey = exportableSecret(profile.apiKeySecretId, profile.name),
+                    models = profile.models,
+                    testSettings = profile.testSettings,
+                    balanceTemplateId = profile.balanceTemplateId,
+                    balanceAccessToken = exportableSecret(profile.balanceAccessTokenSecretId, profile.name),
+                    balanceUserId = profile.balanceUserId,
+                    isTestingDisabled = profile.isTestingDisabled,
+                )
+            },
+            balanceTemplates = balanceTemplates.toList(),
+            modelCatalog = modelCatalog.toList(),
+            modelFilterKeyword = _uiState.value.modelFilterKeyword,
+            quickFilterTerms = _uiState.value.quickFilterTerms,
+        )
+        if (unreadable.isNotEmpty()) {
+            throw ConfigurationBackupException(
+                "以下供应商的本机凭据无法解密，备份里会是空的，已停止导出：" +
+                    unreadable.joinToString("、") +
+                    "。请重新输入这些供应商的凭据后再导出"
             )
-        },
-        balanceTemplates = balanceTemplates.toList(),
-        modelCatalog = modelCatalog.toList(),
-        modelFilterKeyword = _uiState.value.modelFilterKeyword,
-        quickFilterTerms = _uiState.value.quickFilterTerms,
-    )
+        }
+        return snapshot
+    }
 
     /**
      * Writes imported secrets first, then atomically commits the DataStore
@@ -3171,6 +3199,13 @@ class TesterViewModel(
             val message = "本地配置暂时无法读取，已进入安全空白状态；原配置未被覆盖"
             showMessage(message, isError = true)
             showBalanceMessage(message, isError = true)
+        } else if (startup.storageDecodeFailed) {
+            // Part of the stored configuration could not be read. What survived is usable,
+            // so the app keeps going — but the user has to know before their next save
+            // rewrites the file without the lost part.
+            val message = "本地配置有部分内容已损坏、未能读入；原文件未被覆盖，请核对供应商与模板后再保存"
+            showMessage(message, isError = true)
+            showBalanceMessage(message, isError = true)
         }
     }
 
@@ -3190,6 +3225,9 @@ class TesterViewModel(
                 activeSupplierId = null,
             )
         }
+        // The blob parsed but part of it did not decode. Nothing has been written on this
+        // path yet, so the stored file is still intact and the user can be told in time.
+        val storageDecodeFailed = stored.decodeFailed
         val restoredProfiles = stored.suppliers.toMutableList()
         val restoredTemplates = stored.balanceTemplates
             .ifEmpty { listOf(BalanceQueryTemplate.newApiDefault()) }
@@ -3227,6 +3265,7 @@ class TesterViewModel(
             modelFilterKeyword = stored.modelFilterKeyword,
             quickFilterTerms = stored.quickFilterTerms,
             storageLoaded = storageLoaded,
+            storageDecodeFailed = storageDecodeFailed,
         )
     }
 
@@ -3264,18 +3303,36 @@ class TesterViewModel(
     private suspend fun loadStartupCredentials(profile: SupplierProfile): StartupCredentials =
         withContext(Dispatchers.IO) {
             coroutineScope {
-                val apiKey = async {
-                    profile.apiKeySecretId?.let(secretStore::get).orEmpty()
-                }
-                val balanceAccessToken = async {
-                    profile.balanceAccessTokenSecretId?.let(secretStore::get).orEmpty()
-                }
+                val apiKey = async { readSecret(profile.apiKeySecretId) }
+                val balanceAccessToken = async { readSecret(profile.balanceAccessTokenSecretId) }
+                val key = apiKey.await()
+                val token = balanceAccessToken.await()
                 StartupCredentials(
-                    apiKey = apiKey.await(),
-                    balanceAccessToken = balanceAccessToken.await(),
+                    apiKey = key.value,
+                    balanceAccessToken = token.value,
+                    apiKeyUnreadable = key.unreadable,
+                    balanceTokenUnreadable = token.unreadable,
                 )
             }
         }
+
+    /**
+     * One credential as the panel needs it: the value to show, and whether the record exists
+     * but could not be decrypted.
+     *
+     * [SecretRead.Unreadable] is the case worth carrying out of the read: the field stays
+     * empty either way, but only one of the two reasons is the user's to fix by typing, and
+     * the other ("the key I saved is gone") has to be said out loud instead of looking like
+     * an empty field he forgot to fill.
+     */
+    private fun readSecret(secretId: String?): CredentialRead {
+        val read = secretId?.let(secretStore::read) ?: return CredentialRead("", false)
+        return when (read) {
+            is SecretRead.Found -> CredentialRead(read.value, false)
+            SecretRead.Absent -> CredentialRead("", false)
+            is SecretRead.Unreadable -> CredentialRead("", true)
+        }
+    }
 
     /** Clears the short initial lock without changing either temporarily empty credential field. */
     private fun finishStartupSecretHydration() {
@@ -3327,6 +3384,16 @@ class TesterViewModel(
                     credentials
                 },
             )
+        }
+        // Said here rather than left to the empty field: a supplier whose stored key no
+        // longer decrypts looks exactly like a supplier whose key was never entered, and the
+        // only honest thing to tell the user is that the saved value is gone. The two panels
+        // are told separately because only one of the two credentials may be affected.
+        if (loadedCredentials.apiKeyUnreadable) {
+            showMessage(UNREADABLE_CREDENTIAL_HINT, isError = true)
+        }
+        if (loadedCredentials.balanceTokenUnreadable) {
+            showBalanceMessage(UNREADABLE_CREDENTIAL_HINT, isError = true)
         }
     }
 
@@ -3637,7 +3704,7 @@ class TesterViewModel(
             _uiState.update {
                 it.copy(
                     isRunning = false,
-                    message = error.message ?: "测试启动失败",
+                    message = (error.message ?: "测试启动失败").redactSecrets(),
                     isMessageError = true,
                 )
             }
@@ -3695,7 +3762,7 @@ class TesterViewModel(
                 _uiState.update {
                     it.copy(
                         isRunning = false,
-                        message = error.message ?: "批量测试中断",
+                        message = (error.message ?: "批量测试中断").redactSecrets(),
                         isMessageError = true,
                     )
                 }
@@ -3773,13 +3840,22 @@ class TesterViewModel(
         val modelFilterKeyword: String,
         val quickFilterTerms: List<String>,
         val storageLoaded: Boolean,
+        /** The stored configuration was readable in part only (see [SupplierStoreState.decodeFailed]). */
+        val storageDecodeFailed: Boolean = false,
     )
 
     /** Short-lived, active-site values read only after the first usable UI frame is published. */
     private data class StartupCredentials(
         val apiKey: String,
         val balanceAccessToken: String,
+        /** The stored API key exists but could not be decrypted. */
+        val apiKeyUnreadable: Boolean = false,
+        /** The stored balance token exists but could not be decrypted. */
+        val balanceTokenUnreadable: Boolean = false,
     )
+
+    /** A credential as the panel needs it: what to show, and whether reading it failed. */
+    private data class CredentialRead(val value: String, val unreadable: Boolean)
 
     /** Plaintext only during the active import transaction; never persisted directly. */
     private data class ImportedConfigurationSupplier(
@@ -3837,6 +3913,16 @@ class TesterViewModel(
         // draft could be saved. Explicit requests resolve saved credentials on
         // demand, so keeping it short improves startup without losing safety.
         private const val STARTUP_SECRET_INTERACTION_BLOCK_MS = 250L
+
+        /**
+         * Shown when a stored credential exists but cannot be decrypted.
+         *
+         * Without it the field is simply empty, which reads as "you never entered one" —
+         * the user then retypes a key he already saved, or clicks 开始测试 and is told to
+         * fill in a field he did fill in. The wording has to name the cause and the fix.
+         */
+        private const val UNREADABLE_CREDENTIAL_HINT =
+            "本机保存的凭据无法解密（系统密钥库可能已被重置），请重新输入后再使用"
 
         fun factory(context: Context): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")

@@ -33,7 +33,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import struct
 import sys
 import time
@@ -48,9 +47,17 @@ RELEASE_NAME = "检测包（应用内更新源）"
 API = "https://api.github.com"
 PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_BANK = os.path.join(PROJECT, "build/lm-fingerprint/lite-bank.bin")
-GRADLE = os.path.join(PROJECT, "app/build.gradle.kts")
 TOKEN_FILES = ["E:/AI/Zcode/tmp/.ghtoken"]
 MAGIC_LENGTH = 8
+# The oldest app that can read a package published from this tree. It is a property of the
+# *package format and the reading code*, not of whatever version the build file happens to
+# be on: the daily detection-package job runs independently of the APK release, so binding
+# this to the working tree's versionCode would advertise a requirement for an app that does
+# not exist yet, and every installed device would be told to update the app before it may
+# use a package it can already read. Raise it only when a package starts using something an
+# older app cannot parse, and raise it to the version that learned to — the current fleet's
+# code, which is 10600.
+MIN_APP_VERSION_CODE = 10_600
 # The manifest's formatVersion is read off the package's own magic rather than being a
 # constant here: two shapes are live while the fleet upgrades (format 2 still carries
 # upstream's removed verifier block, format 3 does not), and a publish that hardcoded
@@ -114,13 +121,8 @@ def read_header(blob):
 
 
 def app_version_code():
-    """The version code the published bank requires; read from the build file."""
-    with open(GRADLE, encoding="utf-8") as handle:
-        text = handle.read()
-    match = re.search(r"versionCode\s*=\s*([0-9_]+)", text)
-    if not match:
-        raise SystemExit("app/build.gradle.kts 里找不到 versionCode")
-    return int(match.group(1).replace("_", ""))
+    """The version code written into the manifest's `minAppVersionCode`."""
+    return MIN_APP_VERSION_CODE
 
 
 def build_manifest(bank_bytes):

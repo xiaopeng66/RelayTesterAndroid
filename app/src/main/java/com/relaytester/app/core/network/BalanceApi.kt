@@ -123,7 +123,11 @@ open class BalanceApi(
         } catch (error: IOException) {
             BalanceQueryResult.Failure("网络连接失败，请检查中转站地址和网络")
         } catch (_: Throwable) {
-            // Deliberately do not surface raw upstream content, URLs, or headers.
+            // Deliberately does not surface raw upstream content, URLs, or headers. Every
+            // cause that has something actionable to say — a credential that cannot go into
+            // a header, an oversized body, a refused redirect, an invalid template — is
+            // classified by a catch above this one, so what is left is a defect, not a
+            // configuration the user can fix. The generic wording is the honest one.
             BalanceQueryResult.Failure("余额查询失败，请检查模板与供应商配置")
         }
     }
@@ -298,6 +302,19 @@ open class BalanceApi(
             // become an empty HTTP header. Omitting it lets deployments that
             // infer the account from the PAT work without a user ID.
             if (resolvedValue.isNotEmpty()) {
+                // Checked after substitution because that is the first place the credential
+                // itself is visible: OkHttp refuses a header value outside the printable
+                // range and its exception quotes the value, and the old path let that throw
+                // and then blamed the template. Tab stays legal, matching OkHttp's rule.
+                if (resolvedValue.any { it != '\t' && it.code !in ASCII_PRINTABLE }) {
+                    throw TemplateException(
+                        if (header.valueTemplate.containsCredentialPlaceholder()) {
+                            "密钥或令牌里有不能放进请求头的字符（换行、全角标点等非 ASCII 字符），请重新粘贴原始内容"
+                        } else {
+                            "请求头 ${header.name.trim()} 的值里有不能放进请求头的字符（换行、全角标点等非 ASCII 字符）"
+                        },
+                    )
+                }
                 builder.header(header.name.trim(), resolvedValue)
             }
         }
@@ -529,6 +546,9 @@ open class BalanceApi(
         )
         const val MAX_RESPONSE_BYTES = 512 * 1024
         const val MAX_FAILURE_MESSAGE_CHARS = 200
+
+        /** OkHttp's own header-value range: tab, then the printable ASCII block. */
+        val ASCII_PRINTABLE = 0x20..0x7e
 
         /** Resolves a template endpoint for the unit-test seam. */
         fun resolveEndpointForTest(

@@ -20,6 +20,9 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.ResponseBody
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okio.Buffer
+import okio.ForwardingSource
+import okio.Source
+import okio.buffer
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -33,6 +36,7 @@ open class RelayApi(
         apiKey: String,
         timeoutSeconds: Int,
     ): ApiResult<List<String>> {
+        apiKeyProblem(apiKey)?.let { return ApiResult.Failure(TestError(ErrorKind.OTHER, it)) }
         val baseUrl = normalizedBaseUrl(profile.baseUrl) ?: return ApiResult.Failure(
             TestError(ErrorKind.OTHER, "Base URL 必须是有效的 HTTP(S) 地址"),
         )
@@ -70,6 +74,7 @@ open class RelayApi(
         maxTokens: Int,
         timeoutSeconds: Int,
     ): ModelTestResult {
+        apiKeyProblem(apiKey)?.let { return failed(model, ErrorKind.OTHER, it) }
         val baseUrl = normalizedBaseUrl(profile.baseUrl)
             ?: return failed(model, ErrorKind.OTHER, "Base URL 必须是有效的 HTTP(S) 地址")
         val endpoint = when (profile.protocol) {
@@ -95,6 +100,23 @@ open class RelayApi(
             val latencyMs = (System.nanoTime() - startedAt) / NANOS_PER_MILLISECOND
             failed(model, errorForThrowable(error), latencyMs = latencyMs)
         }
+    }
+
+    /**
+     * Refuses an API key that cannot legally go into an HTTP header, before OkHttp sees it.
+     *
+     * `Request.Builder.header` validates its value, and the exception it throws quotes the
+     * value — the key — in its message. Building the request happened outside every caller's
+     * `try`, so that message escaped to the result row and the exported JSON. The bad
+     * characters only ever arrive by accident (a full-width punctuation mark, a tab or a
+     * newline picked up while pasting), which is why the check is here and why the message
+     * says what to do rather than naming a header.
+     */
+    internal fun apiKeyProblem(apiKey: String): String? = when {
+        apiKey.isEmpty() -> null
+        apiKey.any { it != '\t' && it.code !in ASCII_PRINTABLE } ->
+            "API Key 里有不能放进请求头的字符（换行、全角标点等非 ASCII 字符），请重新粘贴原始密钥"
+        else -> null
     }
 
     private fun requestBuilder(
@@ -311,6 +333,7 @@ open class RelayApi(
     }
 
     private fun prepareCompletion(profile: SupplierProfile, apiKey: String): CompletionPrep {
+        apiKeyProblem(apiKey)?.let { return CompletionPrep.Refused(TestError(ErrorKind.OTHER, it)) }
         val baseUrl = normalizedBaseUrl(profile.baseUrl) ?: return CompletionPrep.Refused(
             TestError(ErrorKind.OTHER, "Base URL 必须是有效的 HTTP(S) 地址"),
         )
@@ -356,7 +379,11 @@ open class RelayApi(
         onProgress: suspend (String) -> Unit,
     ): String {
         val accumulated = StringBuilder()
-        val source = body.source()
+        // The ceiling lives on the bytes, not on the assembled text: a stream is bounded by
+        // how much of it is read, and bounding that is what also bounds a peer that sends
+        // bytes with no newline at all (which would otherwise be buffered whole while the
+        // reader waited for a terminator). The text cannot outgrow the bytes it came from.
+        val source = BoundedSource(body.source(), MAX_STREAM_BYTES).buffer()
         var lastReported = 0
         while (true) {
             val line = source.readUtf8Line() ?: break
@@ -372,7 +399,9 @@ open class RelayApi(
             accumulated.append(delta)
             // Reported per delta, not per byte: a challenge yields a few hundred small
             // chunks, and one callback per chunk is what keeps the count live without
-            // flooding the UI state.
+            // flooding the UI state. The cost is quadratic in the number of chunks, which is
+            // why the ceiling exists — the cadence is the contract, the ceiling is the bound
+            // that keeps the contract affordable.
             if (accumulated.length > lastReported) {
                 lastReported = accumulated.length
                 onProgress(accumulated.toString())
@@ -582,14 +611,22 @@ open class RelayApi(
         // connection.
         is ResponseTooLargeException -> TestError(
             ErrorKind.INVALID_RESPONSE,
-            "响应体过大（超过 ${MAX_RESPONSE_BYTES / 1024} KB）",
+            error.message ?: "响应体过大",
         )
         // Before the generic IOException: the refusal carries the reason a redirect was
         // not followed, and collapsing it to "网络连接失败" would hide an attack shape.
         is RedirectRefusedException ->
             TestError(ErrorKind.OTHER, error.message?.take(MAX_ERROR_CHARS) ?: "上游重定向被拒绝")
         is IOException -> TestError(ErrorKind.NETWORK, "网络连接失败")
-        else -> TestError(ErrorKind.OTHER, error.message?.take(MAX_ERROR_CHARS) ?: "请求失败")
+        // The catch-all is the one path that carries a *foreign* message: it is whatever the
+        // platform or OkHttp chose to say, and some of those sayings quote the request they
+        // were given — header values included. Redacted before the length cut, because
+        // truncating first can leave a secret's own prefix behind and the pattern then no
+        // longer recognises it.
+        else -> TestError(
+            ErrorKind.OTHER,
+            (error.message ?: "请求失败").redactSecrets().take(MAX_ERROR_CHARS),
+        )
     }
 
     private fun extractErrorMessage(body: String): String = runCatching {
@@ -645,8 +682,43 @@ open class RelayApi(
         val body: String,
     )
 
-    /** An answer larger than [MAX_RESPONSE_BYTES]; the link is fine, the answer is not. */
-    internal class ResponseTooLargeException : IOException("响应体过大")
+    /**
+     * An answer larger than this client will hold; the link is fine, the answer is not.
+     *
+     * The message is carried rather than fixed because two different ceilings throw it — a
+     * buffered body past [MAX_RESPONSE_BYTES] and a stream past [MAX_STREAM_BYTES] — and the
+     * user is owed the ceiling that actually applied.
+     */
+    internal class ResponseTooLargeException(message: String) : IOException(message) {
+        constructor() : this("响应体过大（超过 ${MAX_RESPONSE_BYTES / 1024} KB）")
+    }
+
+    /**
+     * Passes bytes through until [maxBytes] have been read, then refuses.
+     *
+     * A `readUtf8Line()` on an unbounded source is unbounded twice over: a peer that never
+     * sends a newline accumulates in the reader's buffer, and one that never sends `[DONE]`
+     * accumulates in the caller's string. Both are bounded here, at the one place every byte
+     * goes through, so neither the framing (which may not know about a ceiling) nor the
+     * caller has to enforce it. The throw surfaces as an ordinary read failure, which the
+     * caller's `errorForThrowable` already classifies as an answer problem rather than a
+     * broken link.
+     */
+    private class BoundedSource(delegate: Source, private val maxBytes: Long) : ForwardingSource(delegate) {
+        private var bytesRead = 0L
+
+        override fun read(sink: Buffer, byteCount: Long): Long {
+            val count = super.read(sink, byteCount)
+            if (count == -1L) return count
+            bytesRead += count
+            if (bytesRead > maxBytes) {
+                throw ResponseTooLargeException(
+                    "流式响应过大（超过 ${maxBytes / 1024} KB），已停止读取",
+                )
+            }
+            return count
+        }
+    }
 
     private companion object {
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
@@ -657,6 +729,21 @@ open class RelayApi(
         const val MAX_RESPONSE_BYTES = 1_048_576L
         const val READ_CHUNK_BYTES = 8_192L
         const val MAX_ERROR_CHARS = 300
+
+        /**
+         * How many bytes of a streaming answer are read before the read is abandoned.
+         *
+         * The buffered path already refuses a body past [MAX_RESPONSE_BYTES]; the streaming
+         * one had no ceiling at all, so a relay that never sent `[DONE]` — or an endpoint that
+         * answered `text/event-stream` and then streamed something else — grew a string until
+         * the process ran out of memory. 256 KB is far past any real answer (the detection
+         * challenge asks for ~300 numbers, a couple of kilobytes) and well under the buffered
+         * path's ceiling, which also counts the framing this one strips.
+         */
+        const val MAX_STREAM_BYTES = 262_144L
+
+        /** What an HTTP header value may contain: the printable range, plus tab. */
+        val ASCII_PRINTABLE = 0x20..0x7e
 
         /**
          * Codes that mean "this request is malformed", the ones a relay sends when it

@@ -1,5 +1,6 @@
 package com.relaytester.app
 
+import android.content.ActivityNotFoundException
 import com.relaytester.app.core.storage.UpdatePreferencesState
 import com.relaytester.app.core.update.AppUpdateClient
 import com.relaytester.app.feature.update.AppUpdateUiState
@@ -7,6 +8,7 @@ import com.relaytester.app.feature.update.appCheckOutcome
 import com.relaytester.app.ui.components.UpdateCheckOutcome
 import com.relaytester.app.feature.update.AppUpdateViewModel
 import com.relaytester.app.feature.update.InstalledAppVersion
+import java.io.File
 import java.io.IOException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -494,8 +496,78 @@ class AppUpdateViewModelTest {
     }
 
     @Test
-    fun `a download in flight shows how far it got`() {
+    fun `the download is checked against this app's signer before the installer sees it`() {
         val fetcher = FakeHttpFetcher().apply { publishApp(apk, versionCode = 10_600L) }
+        val installer = FakeApkInstaller(signatureMatches = false).at(tempDirectory("app-update-signature"))
+        val subject = viewModel(fetcher = fetcher, installer = installer)
+
+        subject.checkNow()
+        settle(subject)
+        subject.downloadAndInstall()
+        settle(subject)
+
+        assertEquals("签名不符的安装包没被检查", 1, installer.signatureChecks.size)
+        assertEquals("签名不符还是交给了安装器", emptyList<Any>(), installer.installed)
+        assertTrue(subject.uiState.value.isMessageError)
+        assertFalse(subject.uiState.value.isDownloading)
+    }
+
+    @Test
+    fun `a download with the wrong signer leaves no file behind`() {
+        val fetcher = FakeHttpFetcher().apply { publishApp(apk, versionCode = 10_600L) }
+        val installer = FakeApkInstaller(signatureMatches = false).at(tempDirectory("app-update-signature-file"))
+        val subject = viewModel(fetcher = fetcher, installer = installer)
+
+        subject.checkNow()
+        settle(subject)
+        subject.downloadAndInstall()
+        settle(subject)
+
+        val checked = installer.signatureChecks.single()
+        assertFalse("被丢弃的安装包还留在缓存里：${checked.absolutePath}", checked.exists())
+    }
+
+    @Test
+    fun `a matching signature is what reaches the installer`() {
+        val fetcher = FakeHttpFetcher().apply { publishApp(apk, versionCode = 10_600L) }
+        val installer = FakeApkInstaller(signatureMatches = true).at(tempDirectory("app-update-signature-ok"))
+        val subject = viewModel(fetcher = fetcher, installer = installer)
+
+        subject.checkNow()
+        settle(subject)
+        subject.downloadAndInstall()
+        settle(subject)
+
+        assertEquals(1, installer.installed.size)
+        assertFalse(subject.uiState.value.isMessageError)
+    }
+
+    @Test
+    fun `starting a new download clears the leftovers of earlier ones`() {
+        val directory = tempDirectory("app-update-prune")
+        val updates = File(directory, "updates").apply { mkdirs() }
+        // A finished APK and an abandoned part file from earlier versions, plus a file this
+        // chain does not own: the first two are this code's garbage, the third is not.
+        val staleApk = File(updates, "relay-tester-10500.apk").apply { writeBytes(byteArrayOf(1)) }
+        val stalePart = File(updates, "relay-tester-10500.apk.part").apply { writeBytes(byteArrayOf(2)) }
+        val foreign = File(updates, "keep-me.txt").apply { writeBytes(byteArrayOf(3)) }
+        val fetcher = FakeHttpFetcher().apply { publishApp(apk, versionCode = 10_600L) }
+        val installer = FakeApkInstaller().at(directory)
+        val subject = viewModel(fetcher = fetcher, installer = installer)
+
+        subject.checkNow()
+        settle(subject)
+        subject.downloadAndInstall()
+        settle(subject)
+
+        assertFalse("上一版的安装包没被回收：${staleApk.absolutePath}", staleApk.exists())
+        assertFalse("残留的 .part 没被回收：${stalePart.absolutePath}", stalePart.exists())
+        assertTrue("不属于本链的文件被误删：${foreign.absolutePath}", foreign.exists())
+        assertEquals(1, installer.installed.size)
+    }
+
+    @Test
+    fun `a download in flight shows how far it got`() {        val fetcher = FakeHttpFetcher().apply { publishApp(apk, versionCode = 10_600L) }
         val installer = FakeApkInstaller().at(tempDirectory("app-update-flight"))
         val subject = viewModel(fetcher = fetcher, installer = installer)
 
@@ -550,9 +622,45 @@ class AppUpdateViewModelTest {
         subject.downloadAndInstall()
         settle(subject)
 
-        assertEquals("没有处理这个意图的应用", subject.uiState.value.message)
+        // The download succeeded, so the panel says the file is on the device instead of
+        // reporting a download failure; the platform text stays as the tail.
+        val message = subject.uiState.value.message.orEmpty()
+        assertTrue("安装失败没有说清安装包已下载：$message", message.contains("安装包已下载"))
+        assertTrue("系统原文被整句顶掉：$message", message.contains("没有处理这个意图的应用"))
         assertTrue(subject.uiState.value.isMessageError)
         assertFalse(subject.uiState.value.isDownloading)
+    }
+
+    @Test
+    fun `a missing installer app is reported as a missing screen, not a failure`() {
+        val fetcher = FakeHttpFetcher().apply { publishApp(apk, versionCode = 10_600L) }
+        val installer = FakeApkInstaller(installFails = ActivityNotFoundException("nope"))
+            .at(tempDirectory("app-update-no-activity"))
+        val subject = viewModel(fetcher = fetcher, installer = installer)
+
+        subject.checkNow()
+        settle(subject)
+        subject.downloadAndInstall()
+        settle(subject)
+
+        assertEquals("没有找到可以安装应用的界面，安装包已下载到缓存目录", subject.uiState.value.message)
+        assertTrue(subject.uiState.value.isMessageError)
+    }
+
+    @Test
+    fun `a rejected install permission is named as such`() {
+        val fetcher = FakeHttpFetcher().apply { publishApp(apk, versionCode = 10_600L) }
+        val installer = FakeApkInstaller(installFails = SecurityException("denied"))
+            .at(tempDirectory("app-update-security"))
+        val subject = viewModel(fetcher = fetcher, installer = installer)
+
+        subject.checkNow()
+        settle(subject)
+        subject.downloadAndInstall()
+        settle(subject)
+
+        assertEquals("系统拒绝了安装请求，请检查「安装未知应用」权限", subject.uiState.value.message)
+        assertTrue(subject.uiState.value.isMessageError)
     }
 
     @Test

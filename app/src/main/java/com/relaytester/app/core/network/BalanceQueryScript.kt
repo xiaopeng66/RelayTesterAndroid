@@ -1,5 +1,6 @@
 package com.relaytester.app.core.network
 
+import com.quickjs.JSContext
 import com.quickjs.QuickJS
 import org.json.JSONArray
 import org.json.JSONObject
@@ -9,7 +10,10 @@ import org.json.JSONObject
  * Scripts can describe one request and map one JSON response, but do not receive
  * Android objects, network APIs, credentials, or any native callback.
  */
-internal class BalanceQueryScript {
+internal class BalanceQueryScript(
+    /** How long one evaluation may run before the caller walks away; tests shorten it. */
+    private val evaluationTimeoutMs: Long = EVALUATION_TIMEOUT_MS,
+) {
     data class RequestSpec(
         val urlTemplate: String,
         val method: String,
@@ -143,23 +147,28 @@ internal class BalanceQueryScript {
                 __relayStringify(__relayResult);
             """.trimIndent()
         }
-        val runtime = QuickJS.createRuntime()
-        val context = runtime.createContext()
-        return try {
-            val result = context.executeStringScript(program, "relay-balance-script.js")
-                ?.takeIf(String::isNotBlank)
-                ?: throw BalanceScriptException("查询脚本未返回有效结果")
-            if (result.length > MAX_SCRIPT_OUTPUT_CHARS) {
-                throw BalanceScriptException("查询脚本输出超过限制")
+        // The sandbox cannot be interrupted — the library exposes no memory ceiling, no
+        // instruction budget and no stop hook — so a script that never returns would hold the
+        // querying thread for the life of the process: the panel would sit on "查询中" with
+        // no cancel and no message. The evaluation therefore runs under a deadline of its own
+        // (see [runScriptWithDeadline]) instead of on the caller's thread.
+        return runScriptWithDeadline(evaluationTimeoutMs) {
+            var runtime: QuickJS? = null
+            var context: JSContext? = null
+            try {
+                runtime = QuickJS.createRuntime()
+                context = runtime.createContext()
+                val value = context.executeStringScript(program, "relay-balance-script.js")
+                    ?.takeIf(String::isNotBlank)
+                    ?: throw BalanceScriptException("查询脚本未返回有效结果")
+                if (value.length > MAX_SCRIPT_OUTPUT_CHARS) {
+                    throw BalanceScriptException("查询脚本输出超过限制")
+                }
+                value
+            } finally {
+                runCatching { context?.close() }
+                runCatching { runtime?.close() }
             }
-            result
-        } catch (error: BalanceScriptException) {
-            throw error
-        } catch (_: Throwable) {
-            throw BalanceScriptException("查询脚本执行失败，请检查语法与返回字段")
-        } finally {
-            runCatching { context.close() }
-            runCatching { runtime.close() }
         }
     }
 
@@ -180,6 +189,8 @@ internal class BalanceQueryScript {
     }
 
     private companion object {
+        /** Generous next to mapping a ≤512 KB JSON body, and short enough to be a wait. */
+        const val EVALUATION_TIMEOUT_MS = 5_000L
         const val MAX_SCRIPT_CHARS = 16 * 1024
         const val MAX_SCRIPT_OUTPUT_CHARS = 16 * 1024
         const val MAX_HEADERS = 32
@@ -208,3 +219,43 @@ internal class BalanceQueryScript {
 }
 
 internal class BalanceScriptException(message: String) : Exception(message)
+
+/**
+ * Runs [work] on its own thread and returns within [timeoutMs], or refuses once the deadline
+ * has passed.
+ *
+ * The worker cannot be stopped — QuickJS exposes no interrupt — so a script that outlives its
+ * turn leaves one daemon thread running; what it cannot do is keep the caller waiting, or
+ * lose the answer it already produced: `Thread.join` publishes everything the worker wrote
+ * before it finished. A [BalanceScriptException] from [work] keeps its own message, because
+ * those messages are the ones written for the user; any other failure is replaced by one,
+ * since a stack overflow or a native allocation failure says nothing a user could act on.
+ */
+internal fun runScriptWithDeadline(timeoutMs: Long, work: () -> String): String {
+    var result: String? = null
+    var failure: Throwable? = null
+    val worker = Thread(
+        {
+            try {
+                result = work()
+            } catch (error: Throwable) {
+                failure = error
+            }
+        },
+        "relay-balance-script",
+    )
+    worker.isDaemon = true
+    worker.start()
+    worker.join(timeoutMs)
+    if (worker.isAlive) {
+        throw BalanceScriptException("查询脚本执行超时（超过 ${timeoutMs / 1000} 秒），已放弃")
+    }
+    failure?.let { error ->
+        throw if (error is BalanceScriptException) {
+            error
+        } else {
+            BalanceScriptException("查询脚本执行失败，请检查语法与返回字段")
+        }
+    }
+    return result ?: throw BalanceScriptException("查询脚本未返回有效结果")
+}
