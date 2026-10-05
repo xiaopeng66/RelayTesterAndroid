@@ -2,9 +2,9 @@
 
 Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询工具，面向经常使用中转站 / API 代理服务的用户。它不依赖外部服务器，直接从手机向用户配置的 API 站点发起请求。
 
-- 当前版本：1.7.0
-- 下载地址：[GitHub Release v1.7.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.7.0)
-- 安装包：包名 `com.relaytester.app`，约 2.82 MB；模型指纹检测包按需下载，不占安装包体积
+- 当前版本：1.7.1
+- 下载地址：[GitHub Release v1.7.1](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.7.1)
+- 安装包：包名 `com.relaytester.app`，约 2.84 MB；模型指纹检测包按需下载，不占安装包体积
 - 支持系统：Android 8.0 及以上
 
 ## 核心功能
@@ -13,9 +13,9 @@ Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询�
 2. **模型测试**：支持 Chat Completions / Responses / Anthropic Messages 三种协议，可批量并行刷新模型目录、按并发与重试参数批量测试，并实时显示延迟、Token 用量与失败原因。
 3. **高级测试**：可在一个任务里混选多个供应商的模型，支持跨供应商关键词检索、为同一模型配置多个来源并单独重测，站点已下架的模型会被标注「已不存在」。
 4. **余额查询**：可为每个供应商配置独立的查询模板（内置 `new-api`），支持批量并行查询并汇总展示可用余额与套餐。
-5. **模型指纹检测**：让目标模型写出约 300 个 1–355 的整数，与参考库比对来判断实际响应的是哪个模型，用来核对中转站是否暗中替换了模型；参考库（58 个模型 / 13 个家族）以**检测包**形式提供，进入面板时自动查一次更新，下载后按大小与 SHA-256 校验安装，**评分完全离线、不上传回答**。
+5. **模型指纹检测**：让目标模型写出约 300 个 1–355 的整数，与参考库比对来判断实际响应的是哪个模型，用来核对中转站是否暗中替换了模型；参考库（58 个模型 / 13 个家族）以**检测包**形式提供，打开应用时自动查一次更新，下载后按大小与 SHA-256 校验安装，**评分完全离线、不上传回答**。
 6. **配置备份与迁移**：一次性导出全部供应商、模型、参数、余额模板与凭据，支持加密（PBKDF2 + AES-256-GCM）与明文两种格式，导入前先预览摘要。
-7. **应用内更新**：顶栏「关于与更新」显示当前版本与线上版本、下载字节进度，校验体积与 SHA-256 后交给系统安装；查到新版本时顶栏图标亮小红点。
+7. **应用内更新**：顶栏「关于与更新」显示当前版本与线上版本、下载字节进度，校验体积与 SHA-256 后交给系统安装；打开应用时自动检查，查到新版本会自行打开这一页并把「下载并安装」摆在面前，顶栏图标同时亮小红点。
 8. **界面与交互**：原生 Jetpack Compose，浅色 / 深色 Material 3 主题，供应商与余额卡片针对手机竖屏优化。
 
 ## 安全与隐私
@@ -50,11 +50,12 @@ Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询�
 
 ## 发行版本
 
-- 最新：[v1.7.0 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.7.0) · [发行说明](release-notes/RELEASE_NOTES_1.7.0.md)
-  - `RelayTester-v1.7.0-android.apk` · `2,974,695` 字节 · SHA-256 `998fa1d63b97fcdd35556be43c75e6fe7b19abe922e5c690936d12e152d4adb8`
+- 最新：[v1.7.1 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.7.1) · [发行说明](release-notes/RELEASE_NOTES_1.7.1.md)
+  - `RelayTester-v1.7.1-android.apk` · `2,974,695` 字节 · SHA-256 `3688c8bd4aa6a48579284f426d8c76f8e7f209cbf492e357d038fd776bba4c08`
 
 历史版本（每个版本的说明页写明了该版当前安装包的字节数与 SHA-256）：
 
+- [v1.7.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.7.0) · [发行说明](release-notes/RELEASE_NOTES_1.7.0.md)
 - [v1.6.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.6.0) · [发行说明](release-notes/RELEASE_NOTES_1.6.0.md)
 - [v1.5.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.5.0) · [发行说明](release-notes/RELEASE_NOTES_1.5.0.md)
 - [v1.4.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.4.0) · [发行说明](release-notes/RELEASE_NOTES_1.4.0.md)
