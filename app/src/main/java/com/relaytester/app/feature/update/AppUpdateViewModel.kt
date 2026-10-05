@@ -61,10 +61,11 @@ data class AppUpdateUiState(
     /**
      * When the last check finished, if it did not run in this process.
      *
-     * Same split as the detection package's card, for the same reason: the launch check is
-     * throttled by a stamp on disk, so a launch inside the window runs no check and would
-     * otherwise fall back to 「尚未检查」 — which is false, the feed was asked, just not now.
-     * The time is printed without a verdict; [checkedAtMillis] wins whenever it exists.
+     * Same split as the detection package's card, for the same reason: the launch check can
+     * be skipped entirely (the switch is off, another check is in flight, or this is the
+     * second start of the same process) and would otherwise fall back to 「尚未检查」 — which
+     * is false, the feed was asked, just not now. The time is printed without a verdict;
+     * [checkedAtMillis] wins whenever it exists.
      */
     val earlierCheckAtMillis: Long? = null,
     /** True when the last check ended in an error; see the bank card for why it is stored. */
@@ -80,6 +81,14 @@ data class AppUpdateUiState(
     val otherPackage: String? = null,
     /** Whether coming back to the app checks the feed by itself. */
     val autoCheckApp: Boolean = true,
+    /**
+     * Set when a check nobody asked for found an update: the app opens the page by itself.
+     *
+     * A one-shot like [message], and consumed the same way ([consumeAutoOpen]): a launch that
+     * finds a new version has to *show* it, not just be able to say it. The dialog belongs to
+     * the activity, so the view model asks for it rather than opening it.
+     */
+    val autoOpenUpdate: Boolean = false,
     val message: String? = null,
     val isMessageError: Boolean = false,
 )
@@ -128,6 +137,15 @@ class AppUpdateViewModel(
      */
     private var lastCheckAtMillis = 0L
 
+    /**
+     * The version code the page was opened for by itself, so it is opened for each one once.
+     *
+     * A user who dismissed the news has answered it; a later automatic check of the same build
+     * must not pull the page out from under whatever they are doing. A newer build is a new
+     * question, and gets its own offer.
+     */
+    private var autoOpenedVersionCode: Long? = null
+
     /** Suspends until everything this view model started has settled; used by tests. */
     internal suspend fun awaitIdle() {
         checkJob?.join()
@@ -142,14 +160,20 @@ class AppUpdateViewModel(
     }
 
     /**
-     * Reads the switch and, when it is on and the last check is stale, checks once.
+     * Reads the switch and, when it is on, checks once — every time the app comes up.
      *
-     * Called when the app comes up, from a coroutine the caller already has. The throttle
-     * reads a *stored* timestamp: without that, every launch would be "the first check in
-     * a while" and closing the app twice would be two requests.
+     * Called when the app comes up, from a coroutine the caller already has. There is no
+     * window: opening the app is the user asking whether there is a new version, and the row
+     * that says when the last check ran has to move with it. It used to skip everything
+     * inside six hours, which from the outside was a launch that checked nothing at all — the
+     * row kept the previous session's time and no request was ever made.
+     *
+     * [LAUNCH_FLOOR_MILLIS] is not that window coming back. It only spans the same process's
+     * own repeated calls — rotating the device recreates the activity and re-runs this — while
+     * the check for an app that stays open is still the six-hourly one below.
      *
      * Starting the periodic check is part of coming up, not of this check succeeding: an app
-     * launched with the switch off, or inside the window, still has to be watching for the
+     * launched with the switch off, or inside the floor, still has to be watching for the
      * moment the window passes. It is started second for the reason in the body.
      *
      * @return true when a check was actually started.
@@ -175,10 +199,12 @@ class AppUpdateViewModel(
             )
         }
         if (!stored.autoCheckApp) return false
-        val since = clock() - stored.lastAppCheckAt
-        if (stored.lastAppCheckAt > 0 && since < checkIntervalMillis) {
-            return false
-        }
+        // Two calls a second apart are one launch: the activity is recreated — on a rotation,
+        // on a theme change — and this runs again, but「又打开了一次软件」is not what happened.
+        // The in-memory stamp counts as a reference because a check whose write failed is
+        // still a check that was made.
+        val reference = maxOf(stored.lastAppCheckAt, lastCheckAtMillis)
+        if (reference > 0 && clock() - reference < LAUNCH_FLOOR_MILLIS) return false
         if (busy()) return false
         // Tracked like the button's job, so "busy" and the test join see one kind of check.
         checkJob = viewModelScope.launch { check(silent = true) }
@@ -294,7 +320,21 @@ class AppUpdateViewModel(
         _uiState.update { it.copy(checkedAtMillis = clock(), checkFailed = false) }
         when (check) {
             is AppUpdateCheck.Available -> {
-                _uiState.update { it.copy(available = check.manifest, otherPackage = null) }
+                // 自动检查发现新版本：把「关于与更新」自己打开，「下载并安装」就摆在用户面前。
+                // 用户自己按下检查时人已经在那一页上，没有要开的东西；同一个版本在一个进程里
+                // 也只自动开一次——他关掉页面就是回答过了，定时器再查到同一个版本不该把页面
+                // 从他手上拽走。更新的版本是另一个问题，另算一次。
+                val openItself = silent && check.manifest.versionCode != autoOpenedVersionCode
+                if (openItself) autoOpenedVersionCode = check.manifest.versionCode
+                _uiState.update {
+                    it.copy(
+                        available = check.manifest,
+                        otherPackage = null,
+                        // Only ever set here: the flag is the activity's to clear, so a second
+                        // check landing before it ran must not wipe a pending one.
+                        autoOpenUpdate = it.autoOpenUpdate || openItself,
+                    )
+                }
                 // News, so it is worth saying even when nobody asked. This is the whole
                 // point of the launch check: the user is told by the app, not by a release
                 // page they would have to think to visit.
@@ -432,6 +472,16 @@ class AppUpdateViewModel(
         _uiState.update { it.copy(message = null, isMessageError = false) }
     }
 
+    /**
+     * Says the activity has opened the page for [AppUpdateUiState.autoOpenUpdate].
+     *
+     * Cleared by the same rule as [clearMessage]: the view model writes a request once, and
+     * whoever acts on it clears it, so a recomposition or a rotation cannot replay it.
+     */
+    fun consumeAutoOpen() {
+        _uiState.update { it.copy(autoOpenUpdate = false) }
+    }
+
     private fun busy(): Boolean = checkJob?.isActive == true || downloadJob?.isActive == true
 
     private fun showMessage(message: String, isError: Boolean) {
@@ -439,6 +489,16 @@ class AppUpdateViewModel(
     }
 
     companion object {
+        /**
+         * The shortest gap between two wake-ups by the launch check.
+         *
+         * Not the check's window — the window is gone, every launch checks — but the same
+         * process can come up more than once: recreating the activity (a rotation, a theme
+         * change) runs the launch check again, and that is one launch, not two. A minute is
+         * far longer than any recreation and far shorter than any real relaunch.
+         */
+        internal const val LAUNCH_FLOOR_MILLIS = 60_000L
+
         /**
          * The shortest gap between two wakes of the periodic check.
          *

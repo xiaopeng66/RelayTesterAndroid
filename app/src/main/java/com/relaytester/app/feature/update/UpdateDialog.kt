@@ -1,5 +1,6 @@
 package com.relaytester.app.feature.update
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -8,6 +9,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -40,10 +42,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
@@ -282,14 +287,23 @@ private fun AppUpdateCard(
                 }
             }
 
-            // 更新说明是发布页链接：清单里没有说明文本，只有 URL。
-            state.available?.notesUrl?.takeIf { it.isNotBlank() }?.let { url ->
-                TextButton(
-                    onClick = { onOpenNotes(url) },
-                    modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
-                ) {
-                    Icon(Icons.AutoMirrored.Outlined.OpenInNew, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Text("  更新说明", textDecoration = TextDecoration.Underline, maxLines = 1)
+            // 说明文本就在清单里（发布器把发行说明压成纯文本写进去），卡片内直接印；清单里没有
+            // 文本的老版本清单只剩发布页 URL，那种情况退回一枚链接。
+            state.available?.let { manifest ->
+                if (manifest.notes.isNotBlank()) {
+                    UpdateNotesBox(
+                        notes = manifest.notes,
+                        notesUrl = manifest.notesUrl,
+                        onOpenNotes = onOpenNotes,
+                    )
+                } else if (manifest.notesUrl.isNotBlank()) {
+                    TextButton(
+                        onClick = { onOpenNotes(manifest.notesUrl) },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
+                    ) {
+                        Icon(Icons.AutoMirrored.Outlined.OpenInNew, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Text("  更新说明", textDecoration = TextDecoration.Underline, maxLines = 1)
+                    }
                 }
             }
 
@@ -300,6 +314,80 @@ private fun AppUpdateCard(
                 checked = state.autoCheckApp,
                 onCheckedChange = onAutoCheckChange,
             )
+        }
+    }
+}
+
+/**
+ * 说明盒最多占屏幕的这个比例。
+ *
+ * 定比例而不是定 dp，因为要护住的是弹窗自己那条「屏高 90%」的上限：卡片的固定部分
+ * （版本行、状态行、两枚按钮、自动检查开关）大约 400dp，0.9 − 0.3 在任何机型上都还
+ * 留得下它；屏幕再矮则由卡片外层那圈滚动兜底。
+ */
+internal const val UPDATE_NOTES_SCREEN_FRACTION = 0.3f
+
+/** 说明盒的高度上限；[screenHeightDp] 用窗口（屏高减系统栏）即可，比例本身就是余量。 */
+internal fun updateNotesBoxMaxHeight(screenHeightDp: Int): Dp =
+    (screenHeightDp * UPDATE_NOTES_SCREEN_FRACTION).dp
+
+/**
+ * 发行说明，直接印在卡片里，而不是藏在链接后面。
+ *
+ * 盒子有自己的上限和自己的滚动：说明可以上千字，没有上限就会把按钮与自动检查开关顶到
+ * 折叠线以下——而这个弹窗本身还有「屏高 90%」的上限。有了它，卡片在有说明时也保持没有
+ * 说明时的形状，说明在自己那一小块里随手指滚。带链接的完整版仍留一键（在浏览器打开）。
+ */
+@Composable
+private fun UpdateNotesBox(
+    notes: String,
+    notesUrl: String,
+    onOpenNotes: (String) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text("更新说明", style = MaterialTheme.typography.bodyMedium)
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            color = MaterialTheme.colorScheme.surfaceVariant,
+            shape = MaterialTheme.shapes.small,
+        ) {
+            // 长文本的盒子，下沿一定裁在某一行中间：一条渐隐让「还能往下滚」看得出来，而不是
+            // 看起来像说明本身被截断了。只在确实还有内容时画。
+            val scroll = rememberScrollState()
+            Box {
+                Text(
+                    notes,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = updateNotesBoxMaxHeight(LocalConfiguration.current.screenHeightDp))
+                        .verticalScroll(scroll)
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (scroll.canScrollForward) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .fillMaxWidth()
+                            .height(14.dp)
+                            .background(
+                                Brush.verticalGradient(
+                                    listOf(Color.Transparent, MaterialTheme.colorScheme.surfaceVariant),
+                                ),
+                            ),
+                    )
+                }
+            }
+        }
+        if (notesUrl.isNotBlank()) {
+            TextButton(
+                onClick = { onOpenNotes(notesUrl) },
+                modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
+            ) {
+                Icon(Icons.AutoMirrored.Outlined.OpenInNew, contentDescription = null, modifier = Modifier.size(16.dp))
+                Text("  在浏览器打开", textDecoration = TextDecoration.Underline, maxLines = 1)
+            }
         }
     }
 }

@@ -93,6 +93,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
@@ -903,6 +904,9 @@ private fun SupplierConfigurationDialog(
     // 内容，盒子的高度得自己按窗口算，见 rememberDialogWindowBox()——注意在弹窗**外面**调用：
     // 弹窗窗口夹在状态栏与导航栏之间，在里面读内边距一律是 0。
     val windowBox = rememberDialogWindowBox()
+    // 卡片最高到屏高的九成（与「关于与更新」同一条），表单区按内容自适应拉高：以前写死
+    // 480dp，高屏上表单明明放得下也要在小框里滚。到顶以后由表单区自己滚，卡片不再长高。
+    val maxSheetHeight = (LocalConfiguration.current.screenHeightDp * 0.9f).dp
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false),
@@ -916,7 +920,8 @@ private fun SupplierConfigurationDialog(
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(top = 44.dp),
+                        .padding(top = 44.dp)
+                        .heightIn(max = maxSheetHeight),
                     shape = MaterialTheme.shapes.extraLarge,
                     tonalElevation = 6.dp,
                     shadowElevation = 10.dp,
@@ -965,7 +970,9 @@ private fun SupplierConfigurationDialog(
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .heightIn(max = 480.dp)
+                                // 自适应：内容放得下就按内容高（卡片跟着长），放不下才收窄、由这里滚。
+                                // fill = false 是「长到够用为止」，不是「把剩下的都占掉」。
+                                .weight(1f, fill = false)
                                 .verticalScroll(rememberScrollState())
                                 .padding(horizontal = 24.dp),
                             verticalArrangement = Arrangement.spacedBy(12.dp),

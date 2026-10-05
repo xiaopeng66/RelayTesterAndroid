@@ -2,11 +2,14 @@ package com.relaytester.app
 
 import java.io.File
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * The two window contracts the dialogs have to keep, checked against the sources.
+ * The contracts that only the sources can pin, because no JVM test has the thing they describe:
+ * the dialogs' window geometry and dismiss scrims, the notes box's ceiling, and the activity
+ * side of the update page that opens itself.
  *
  * Neither can be caught from here as behaviour: a JVM test has no Android window, so it cannot
  * measure where a dialog puts its content or watch a tap land outside the card. What it *can* do
@@ -121,6 +124,85 @@ class DialogWindowContractTest {
                 "的点击），否则点卡片外关不掉。",
             emptyList<String>(),
             offenders,
+        )
+    }
+
+    @Test
+    fun `the window box matches the window on both axes`() {
+        // 宽和高一起才等于「系统给的那块窗口」。竖屏时左右系统栏都是 0，两条算式等价；横屏时
+        // 竖屏的状态栏转到左边（本机 48.8dp = 128px），只按高度收的话 fillMaxWidth 拿到的是
+        // 整屏宽（内容按整屏测量），占屏宽 94% 的卡片量到 200..2456——右边 21dp 连同圆角切在
+        // 屏幕外。JVM 测试量不到窗口，只能钉住这两行算式。
+        val file = File(sourceRoot, "com/relaytester/app/ui/components/DialogWindowBox.kt")
+        assertTrue("找不到 DialogWindowBox.kt：${file.absolutePath}", file.isFile)
+        val lines = code(file).lines().map(String::trim)
+        val text = lines.joinToString("\n")
+        assertTrue(
+            "窗口盒没有按左右系统栏收宽：横屏下卡片右缘会被屏幕切掉",
+            ".width(configuration.screenWidthDp.dp - barsWidth)" in lines,
+        )
+        assertTrue(
+            "窗口盒没有按上下系统栏收高：贴底的提示卡会被裁到屏幕外",
+            ".height(configuration.screenHeightDp.dp - barsHeight)" in lines,
+        )
+        assertTrue(
+            "左右系统栏没有来源：val barsWidth = with(density) { ... }",
+            "val barsWidth = with(density) {" in text,
+        )
+        assertTrue(
+            "窗口盒读的不是安全绘图区：横屏时挖孔那块（本机 128px）不算进去，卡片右缘照样被切",
+            "val insets = WindowInsets.safeDrawing" in text,
+        )
+    }
+
+    @Test
+    fun `the update dialog's notes box keeps a ceiling and its own scroll`() {
+        // 说明文本来自清单，是远程输入，可以带上千字：没有上限它会把卡片撑满，把按钮和自动
+        // 检查开关顶到看不见的地方——而弹窗本身还压着「屏高 90%」那条线。JVM 测试量不到高度，
+        // 但可以钉住产生这个缺陷的两个源码事实：上限真的挂在这个盒子上，且它自己滚。
+        val file = File(sourceRoot, "com/relaytester/app/feature/update/UpdateDialog.kt")
+        assertTrue("找不到 UpdateDialog.kt：${file.absolutePath}", file.isFile)
+        val lines = code(file).lines().map(String::trim)
+        val text = lines.joinToString("\n")
+        val capped = lines.indexOfFirst { it.startsWith(".heightIn(max = updateNotesBoxMaxHeight(") }
+        assertTrue(
+            "UpdateDialog.kt 的说明盒没有高度上限：说明一长卡片就被撑满",
+            capped >= 0,
+        )
+        assertEquals(
+            "说明盒的高度上限后面必须紧跟它自己的滚动（滚动状态用局部变量 scroll）",
+            ".verticalScroll(scroll)",
+            lines.getOrNull(capped + 1),
+        )
+        assertTrue(
+            "说明盒的滚动状态没有来源：val scroll = rememberScrollState()",
+            "val scroll = rememberScrollState()" in text,
+        )
+    }
+
+    @Test
+    fun `the activity opens the update page when a check nobody asked for finds one`() {
+        // 自动检查发现新版本时「关于与更新」要自己弹出来——这一步发生在 Activity 里，JVM 测试
+        // 跑不了 Compose，设备走查也不可能每次回归都做，所以钉住产生这条行为的源码事实：信号
+        // 被一个以它为键的 LaunchedEffect 读到、读到就打开页面、并且立刻消费掉（一次性）。
+        val file = File(sourceRoot, "com/relaytester/app/MainActivity.kt")
+        assertTrue("找不到 MainActivity.kt：${file.absolutePath}", file.isFile)
+        val text = code(file)
+        val block = Regex(
+            "(?s)LaunchedEffect\\(appUpdateState\\.autoOpenUpdate\\)\\s*\\{(.*?)\\n {8}\\}",
+        ).find(text)?.groupValues?.get(1)
+        assertNotNull(
+            "MainActivity 里没有消费自动弹窗信号（appUpdateState.autoOpenUpdate）的 LaunchedEffect：" +
+                "后台检查发现新版本时「关于与更新」不会自己弹出来",
+            block,
+        )
+        assertTrue(
+            "读到信号却没有打开「关于与更新」（showUpdates = true）",
+            "showUpdates = true" in block!!,
+        )
+        assertTrue(
+            "信号没有被消费：残留的一次性标志会在下一次重组或转屏时把页面再弹一次",
+            "appUpdateViewModel.consumeAutoOpen()" in block,
         )
     }
 }

@@ -105,39 +105,24 @@ class AppUpdateViewModelTest {
     }
 
     @Test
-    fun `the launch check runs when the last one is stale`() {
-        val fetcher = FakeHttpFetcher().apply { publishApp(apk) }
-        val preferences = MemoryUpdatePreferences(
-            UpdatePreferencesState(lastAppCheckAt = fixedNow - 7 * 60 * 60 * 1000L),
-        )
-        val subject = viewModel(fetcher = fetcher, preferences = preferences)
-
-        val started = runBlocking { subject.checkOnLaunch() }
-
-        assertTrue("过了节流期却没有检查", started)
-        assertEquals(1, fetcher.urls.size)
-        assertEquals(fixedNow, preferences.state.lastAppCheckAt)
-    }
-
-    @Test
-    fun `the launch check skips the feed inside the interval`() {
+    fun `every launch checks, however recent the last check was`() {
+        // 打开软件就是用户在问「有没有新版本」，所以那次检查的判据不是窗口：上一版让它在一
+        // 小时前查过就不查，从外面看就是这个应用不再检查了，「上次检查」也停在上一回。
         val fetcher = FakeHttpFetcher().apply { publishApp(apk) }
         val preferences = MemoryUpdatePreferences(
             UpdatePreferencesState(lastAppCheckAt = fixedNow - 60 * 60 * 1000L),
         )
         val subject = viewModel(fetcher = fetcher, preferences = preferences)
 
-        val started = runBlocking { subject.checkOnLaunch() }
-
-        assertFalse("一小时内又查了一次", started)
-        assertEquals(emptyList<String>(), fetcher.urls)
+        assertTrue("一小时前查过就不再查了", runBlocking { subject.checkOnLaunch() })
+        assertEquals(1, fetcher.urls.size)
+        assertEquals("这次检查的时间没有落盘", fixedNow, preferences.state.lastAppCheckAt)
     }
 
     @Test
-    fun `the interval is measured on a stored timestamp, not on the process`() {
-        // The point of persisting it: without a stored value every launch would be "the
-        // first check in a while", and closing the app twice would be two requests. The
-        // same store is handed to both view models, which is what a restart looks like.
+    fun `closing and reopening the app asks again`() {
+        // 第二次启动是一个新进程、新实例，内存里没有上一次的记录：判据只能是「这次启动」，
+        // 不是盘里那份时间戳离现在有多近。关掉再开就是两次请求，这就是用户要的语义。
         val fetcher = FakeHttpFetcher().apply { publishApp(apk) }
         val preferences = MemoryUpdatePreferences()
         val first = viewModel(fetcher = fetcher, preferences = preferences)
@@ -145,13 +130,28 @@ class AppUpdateViewModelTest {
         runBlocking { first.checkOnLaunch() }
         assertEquals(1, fetcher.urls.size)
 
-        // A second launch of the same app, ten minutes later.
         now = fixedNow + 10 * 60 * 1000L
         val second = viewModel(fetcher = fetcher, preferences = preferences)
-        val started = runBlocking { second.checkOnLaunch() }
+        assertTrue("重开软件没有查", runBlocking { second.checkOnLaunch() })
+        assertEquals("重开一次就该是两次请求", 2, fetcher.urls.size)
+        assertEquals(now, preferences.state.lastAppCheckAt)
+    }
 
-        assertFalse("第二次启动又查了一遍", started)
+    @Test
+    fun `a second start of the same process does not ask twice`() {
+        // 闸不是那个窗口回来：转屏会重建 Activity，启动检查就会再跑一次——而那是一次启动，
+        // 一次启动只配一次请求。判据也不能只看盘里那份：落盘可能失败，这一次检查的事实只有
+        // 进程内的时间戳记得（盘里那份有检测包那边的一条测试管着）。
+        val fetcher = FakeHttpFetcher().apply { publishApp(apk) }
+        val preferences = MemoryUpdatePreferences(dropWrites = true)
+        val subject = viewModel(fetcher = fetcher, preferences = preferences)
+
+        assertTrue(runBlocking { subject.checkOnLaunch() })
         assertEquals(1, fetcher.urls.size)
+
+        now = fixedNow + AppUpdateViewModel.LAUNCH_FLOOR_MILLIS - 1_000L
+        assertFalse("同一进程里的第二次启动又查了", runBlocking { subject.checkOnLaunch() })
+        assertEquals("转一次屏就是一个请求", 1, fetcher.urls.size)
     }
 
     // ---- the periodic check --------------------------------------------------
@@ -183,37 +183,40 @@ class AppUpdateViewModelTest {
     }
 
     @Test
-    fun `the periodic check wakes when the window is due`() {
+    fun `the periodic check wakes a window after the launch check`() {
         val fetcher = FakeHttpFetcher().apply { publishApp(apk, versionCode = 10_505L) }
-        val preferences = MemoryUpdatePreferences(
-            UpdatePreferencesState(lastAppCheckAt = fixedNow - 60 * 60 * 1000L),
-        )
+        val preferences = MemoryUpdatePreferences()
         val subject = viewModel(fetcher = fetcher, preferences = preferences)
 
         runBlocking { subject.checkOnLaunch() }
-        assertEquals("窗口内不该查", emptyList<String>(), fetcher.urls)
+        assertEquals("启动那次照常发", 1, fetcher.urls.size)
 
-        // Five hours later the six-hour window is up. Virtual time is what lets the timer be
-        // observed without waiting six real hours; the injected clock moves with it, because
-        // the due time is computed from that clock.
+        // 常开一路走过去，没到窗口就不查。
         now = fixedNow + 5 * 60 * 60 * 1000L
-        dispatcher.scheduler.advanceTimeBy(5 * 60 * 60 * 1000L + 1_000L)
+        dispatcher.scheduler.advanceTimeBy(5 * 60 * 60 * 1000L)
+        assertEquals("窗口没到就查了", 1, fetcher.urls.size)
 
-        assertEquals("到点没有自动检查", 1, fetcher.urls.size)
+        // 窗口是从启动那次写下的时间戳算的，所以再过一个多小时才到点。虚拟时间让这条定时器
+        // 不必等六个真实的钟头；注入的时钟跟着一起走，因为到期时间就是拿它算的。
+        now = fixedNow + 6 * 60 * 60 * 1000L + 1_000L
+        dispatcher.scheduler.advanceTimeBy(60 * 60 * 1000L + 1_000L)
+
+        assertEquals("到点没有自动检查", 2, fetcher.urls.size)
         assertEquals(now, preferences.state.lastAppCheckAt)
         assertNull("常开时的自动检查报了消息", subject.uiState.value.message)
     }
 
     @Test
-    fun `a launch inside the window still says when the last check was`() {
-        // Same as the detection package's card: no check this launch, but the stored stamp is
+    fun `a launch inside the floor still says when the last check was`() {
+        // Same as the detection package's card: no check this launch — less than a minute since
+        // the last one, so this is the same launch coming up twice — but the stored stamp is
         // still a fact worth printing, and printing it must not claim a verdict.
-        val lastCheck = fixedNow - 60 * 60 * 1000L
+        val lastCheck = fixedNow - 30 * 1000L
         val fetcher = FakeHttpFetcher().apply { publishApp(apk) }
         val preferences = MemoryUpdatePreferences(UpdatePreferencesState(lastAppCheckAt = lastCheck))
         val subject = viewModel(fetcher = fetcher, preferences = preferences)
 
-        assertFalse("窗口内不该查", runBlocking { subject.checkOnLaunch() })
+        assertFalse("一分钟内又查了一次", runBlocking { subject.checkOnLaunch() })
         assertEquals(emptyList<String>(), fetcher.urls)
         assertEquals(lastCheck, subject.uiState.value.earlierCheckAtMillis)
         assertEquals(UpdateCheckOutcome.EARLIER_CHECK, appCheckOutcome(subject.uiState.value))
@@ -253,27 +256,32 @@ class AppUpdateViewModelTest {
     }
 
     @Test
-    fun `a wake never re-checks inside the timer's minimum wait`() {
-        // The floor exists for the case where the wake arithmetic says "due before now": a
-        // wake stays at least a minute out, so an arithmetic bug costs one late check instead
-        // of a busy loop. Thirty seconds past due is the only window where it changes the
-        // answer, which is why the test drives exactly that.
+    fun `a wake that finds the window 30 seconds away still waits out the minimum`() {
+        // 「窗口只差一点点」只出现在时间被往回调过之后：上一次检查的时间戳落在未来（这里 30
+        // 秒之后），启动那一次被闸挡住不查，定时器的第一次唤醒算出「还差 6 小时半」而被上限
+        // 压回 6 小时，第二次醒来时只差 30 秒 —— 唯一一段最小间隔会改变答案的地方。有它在，
+        // 算术出错只花掉一次迟到的检查，而不是一个紧循环。
         val fetcher = FakeHttpFetcher().apply { publishApp(apk, versionCode = 10_505L) }
         val preferences = MemoryUpdatePreferences(
-            UpdatePreferencesState(lastAppCheckAt = fixedNow - 6 * 60 * 60 * 1000L + 30_000L),
+            UpdatePreferencesState(lastAppCheckAt = fixedNow + 30_000L),
         )
         val subject = viewModel(fetcher = fetcher, preferences = preferences)
 
-        runBlocking { subject.checkOnLaunch() }
-        assertEquals("窗口没到就查了", emptyList<String>(), fetcher.urls)
+        assertFalse("落在未来的时间戳不该让启动检查联网", runBlocking { subject.checkOnLaunch() })
+        assertEquals(emptyList<String>(), fetcher.urls)
 
-        // 45 s: past the arithmetic's due time, inside the floor.
-        now = fixedNow + 45_000L
-        dispatcher.scheduler.advanceTimeBy(45_000L)
+        // 第一次唤醒：算术上的「还差 6 小时半」被上限压回 6 小时。醒来时只差 30 秒，于是最小
+        // 间隔把它推到一分钟外。（注入的时钟要跟虚拟时间对齐地走，否则唤醒读到的是别的时刻；
+        // 而 advanceTimeBy 只跑严格早于目标的任务，所以第一步要跨过 6 小时这个点。）
+        now = fixedNow + 6 * 60 * 60 * 1000L + 1_000L
+        dispatcher.scheduler.advanceTimeBy(6 * 60 * 60 * 1000L + 1_000L)
+        now = fixedNow + 6 * 60 * 60 * 1000L + 59_000L
+        dispatcher.scheduler.advanceTimeBy(58_000L)
         assertEquals("最小间隔没兜住提前的唤醒", emptyList<String>(), fetcher.urls)
 
-        now = fixedNow + 61_000L
-        dispatcher.scheduler.advanceTimeBy(16_000L)
+        // 一分钟后唤醒真的到了，这时窗口已经过去。
+        now = fixedNow + 6 * 60 * 60 * 1000L + 62_000L
+        dispatcher.scheduler.advanceTimeBy(3_000L)
         assertEquals("过了最小间隔还是没有自动检查", 1, fetcher.urls.size)
     }
 
@@ -363,6 +371,7 @@ class AppUpdateViewModelTest {
         subject.checkOnLaunch()
 
         assertNull("静默检查报了一次「已是最新」", subject.uiState.value.message)
+        assertFalse("没事却举手要弹页面", subject.uiState.value.autoOpenUpdate)
         assertEquals(fixedNow, subject.uiState.value.checkedAtMillis)
         assertFalse(subject.uiState.value.checkFailed)
     }
@@ -379,6 +388,70 @@ class AppUpdateViewModelTest {
         assertTrue("没有说出新版本名：$message", message.contains("1.6.0"))
         assertTrue("没有说出新版本代码：$message", message.contains("10600"))
         assertEquals(10_600L, subject.uiState.value.available?.versionCode)
+    }
+
+    // ---- the page that opens itself ------------------------------------------
+
+    @Test
+    fun `a check nobody asked for asks for the page to open`() {
+        // 用户的要求：后台检查发现有更新，「关于与更新」要自己弹出来，把「下载并安装」摆在
+        // 他面前——只发一条要他自己去找的消息不算。页面是 Activity 的，所以视图模型只举手。
+        val fetcher = FakeHttpFetcher().apply { publishApp(apk, versionCode = 10_600L) }
+        val subject = viewModel(fetcher = fetcher)
+
+        runBlocking { subject.checkOnLaunch() }
+
+        assertTrue("自动检查发现了新版本却不弹页面", subject.uiState.value.autoOpenUpdate)
+        assertEquals(10_600L, subject.uiState.value.available?.versionCode)
+
+        // 一次性：页面开过就清掉，重组成或转屏不再弹第二次。
+        subject.consumeAutoOpen()
+        assertFalse("清掉以后还留着", subject.uiState.value.autoOpenUpdate)
+    }
+
+    @Test
+    fun `the same version is not offered twice`() {
+        // 用户把页面关掉就是回答过了。定时器再查到同一个版本时，页面不该从他手上被拽走。
+        val fetcher = FakeHttpFetcher().apply { publishApp(apk, versionCode = 10_600L) }
+        val subject = viewModel(fetcher = fetcher)
+
+        runBlocking { subject.checkOnLaunch() }
+        subject.consumeAutoOpen()
+
+        now = fixedNow + 6 * 60 * 60 * 1000L + 1_000L
+        dispatcher.scheduler.advanceTimeBy(6 * 60 * 60 * 1000L + 1_000L)
+
+        assertEquals("定时器没有再查一次", 2, fetcher.urls.size)
+        assertFalse("同一个版本又弹了一次页面", subject.uiState.value.autoOpenUpdate)
+    }
+
+    @Test
+    fun `a newer version is a new question and gets its own offer`() {
+        val fetcher = FakeHttpFetcher().apply { publishApp(apk, versionCode = 10_600L) }
+        val subject = viewModel(fetcher = fetcher)
+
+        runBlocking { subject.checkOnLaunch() }
+        subject.consumeAutoOpen()
+
+        // 又发布了一个：这不是「同一个版本又问一遍」，是另一个问题。
+        fetcher.publishApp(apk, versionCode = 10_601L)
+        now = fixedNow + 6 * 60 * 60 * 1000L + 1_000L
+        dispatcher.scheduler.advanceTimeBy(6 * 60 * 60 * 1000L + 1_000L)
+
+        assertEquals(2, fetcher.urls.size)
+        assertTrue("更新的版本没有再弹页面", subject.uiState.value.autoOpenUpdate)
+    }
+
+    @Test
+    fun `a check the user pressed does not ask to open the page he is on`() {
+        val fetcher = FakeHttpFetcher().apply { publishApp(apk, versionCode = 10_600L) }
+        val subject = viewModel(fetcher = fetcher)
+
+        subject.checkNow()
+        settle(subject)
+
+        assertNotNull(subject.uiState.value.available)
+        assertFalse("用户自己按的那次也举手要弹窗", subject.uiState.value.autoOpenUpdate)
     }
 
     @Test

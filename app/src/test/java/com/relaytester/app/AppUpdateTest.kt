@@ -191,11 +191,61 @@ class AppUpdateTest {
     @Test
     fun `the optional fields may be absent`() {
         val manifest = AppUpdateManifestParser.parse(
-            appManifestJson(apk, omit = setOf("minSdk", "notesUrl", "publishedAt")),
+            appManifestJson(apk, omit = setOf("minSdk", "notesUrl", "notes", "publishedAt")),
         )
         assertEquals(0, manifest.minSdk)
         assertEquals("", manifest.notesUrl)
+        // A feed without the text is an older one, not a broken one: the dialog falls back
+        // to the notes link in exactly this case.
+        assertEquals("", manifest.notes)
         assertEquals("", manifest.publishedAt)
+    }
+
+    // ---- the notes text the dialog prints ----------------------------------
+
+    @Test
+    fun `the feed's notes reach the manifest`() {
+        val manifest = AppUpdateManifestParser.parse(appManifestJson(apk))
+        assertEquals(APP_NOTES_TEXT, manifest.notes)
+    }
+
+    @Test
+    fun `notes keep their line breaks and lose their edges`() {
+        // Line breaks are the structure of the text; leading and trailing whitespace is
+        // not, and the dialog would show it as a gap.
+        val manifest = AppUpdateManifestParser.parse(
+            appManifestJson(apk, notes = "\n  优化\n\n· 甲\n· 乙\n\n  "),
+        )
+        assertEquals("优化\n\n· 甲\n· 乙", manifest.notes)
+    }
+
+    @Test
+    fun `notes with windows line endings are normalised`() {
+        // The field is remote input: a CR that survives shows up as a stray glyph.
+        val manifest = AppUpdateManifestParser.parse(
+            appManifestJson(apk, notes = "甲\r\n乙\r丙"),
+        )
+        assertEquals("甲\n乙\n丙", manifest.notes)
+    }
+
+    @Test
+    fun `notes past the ceiling are cut with an ellipsis`() {
+        val over = "说".repeat(AppUpdateManifestParser.MAX_NOTES_CHARS + 500)
+        val manifest = AppUpdateManifestParser.parse(appManifestJson(apk, notes = over))
+        assertEquals(AppUpdateManifestParser.MAX_NOTES_CHARS + 1, manifest.notes.length)
+        assertTrue("截断处没有省略号：${manifest.notes.takeLast(1)}", manifest.notes.endsWith("…"))
+        // The publisher truncates to the same ceiling, so this is the defence, not the
+        // normal path — but a feed that ignores the ceiling must not become a wall of text.
+        assertEquals(
+            AppUpdateManifestParser.MAX_NOTES_CHARS,
+            manifest.notes.dropLast(1).length,
+        )
+    }
+
+    @Test
+    fun `notes that are only whitespace are empty`() {
+        val manifest = AppUpdateManifestParser.parse(appManifestJson(apk, notes = " \n\t\n "))
+        assertEquals("", manifest.notes)
     }
 
     // ---- what counts as an update -----------------------------------------

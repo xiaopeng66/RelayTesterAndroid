@@ -7,6 +7,7 @@ import com.relaytester.app.feature.update.appCheckOutcome
 import com.relaytester.app.feature.update.appOtherPackageLine
 import com.relaytester.app.feature.update.appUpdateOffer
 import com.relaytester.app.feature.update.appVersionLine
+import com.relaytester.app.feature.update.updateNotesBoxMaxHeight
 import com.relaytester.app.ui.components.UpdateCheckOutcome
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -103,5 +104,23 @@ class AppUpdateTextTest {
         // The two are different claims: "nothing is new" must never be printed for a check
         // that has not happened.
         assertEquals(UpdateCheckOutcome.NEVER_CHECKED, appCheckOutcome(state(checkedAtMillis = null)))
+    }
+
+    // ---- the notes box's ceiling ------------------------------------------
+
+    @Test
+    fun `the notes box never takes more than a third of the screen`() {
+        // The dialog itself is capped at 90% of the screen and the card's fixed part is
+        // roughly 400dp; this is what keeps a long feed from pushing the buttons and the
+        // auto-check switch out of sight. Measured as a fraction, so it holds at every
+        // screen size rather than on the one phone it was tuned on.
+        val box = updateNotesBoxMaxHeight(1_000)
+        assertEquals(300f, box.value, 1f)
+        assertTrue("说明盒不比 90% 的卡片小多少：$box", box.value <= 1_000 * 0.9f / 2)
+        assertEquals(0f, updateNotesBoxMaxHeight(0).value, 0.001f)
+        assertTrue(
+            "更高的屏应该给说明更多空间",
+            updateNotesBoxMaxHeight(2_000).value > updateNotesBoxMaxHeight(1_000).value,
+        )
     }
 }

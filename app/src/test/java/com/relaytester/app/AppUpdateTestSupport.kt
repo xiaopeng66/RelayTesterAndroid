@@ -24,6 +24,15 @@ internal const val APP_NOTES_URL =
     "https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.6.0"
 
 /**
+ * The notes text a feed carries, shaped like `publish_release_apk.py` writes it: plain text,
+ * one `· ` bullet per line. The lines are from a real release's notes, flattened.
+ */
+internal const val APP_NOTES_TEXT =
+    "更新内容\n\n优化\n\n· 更新下载锁定发布站点：每一跳重定向都必须是 HTTPS 且落在发布站点。\n" +
+        "· 下载先核对再落名：核对字节数与 SHA-256 后才改名。\n\n修复\n\n" +
+        "· 修复余额查询脚本不返回时整次查询被挂住的问题。"
+
+/**
  * An app-release manifest body, as `publish_release_apk.py` would write it.
  *
  * Every field is a parameter so a test can break exactly one of them: the cases that
@@ -42,6 +51,7 @@ internal fun appManifestJson(
     sha256: String = sha256Hex(apkBytes),
     minSdk: Int = 26,
     notesUrl: String = APP_NOTES_URL,
+    notes: String = APP_NOTES_TEXT,
     publishedAt: String = "2026-10-04T09:00:00+00:00",
     omit: Set<String> = emptySet(),
 ): String = JSONObject().apply {
@@ -57,6 +67,7 @@ internal fun appManifestJson(
     putUnlessOmitted("sha256", sha256)
     putUnlessOmitted("minSdk", minSdk)
     putUnlessOmitted("notesUrl", notesUrl)
+    putUnlessOmitted("notes", notes)
     putUnlessOmitted("publishedAt", publishedAt)
 }.toString()
 

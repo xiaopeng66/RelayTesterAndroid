@@ -731,7 +731,7 @@ private fun ReferenceBankCard(
 
             SupportedModelsButton(models = state.bankModels)
 
-            // 自动检测与它管的那件事贴在一起：开关只管「进面板要不要自己查」，与上面的
+            // 自动检测与它管的那件事贴在一起：开关只管「打开软件要不要自己查」，与上面的
             // 手动按钮是一件事的两条路径，所以留在同一张卡上。
             Row(
                 modifier = Modifier.fillMaxWidth(),

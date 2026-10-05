@@ -1606,18 +1606,22 @@ class FingerprintViewModel(
     fun checkBankUpdate() = startBankCheck(silent = false)
 
     /**
-     * The automatic check: once when the app comes up, then every [bankCheckIntervalMillis]
-     * for as long as the app stays open.
+     * The automatic check: once every time the app comes up, then every
+     * [bankCheckIntervalMillis] for as long as the app stays open.
      *
      * Deliberately *not* tied to opening the panel. It used to run on every panel entry,
      * which meant switching between the three tabs re-asked the endpoint each time — the
      * card's "上次检查：…" moved with it, so the row looked like it reset itself. One check
-     * per launch, timed from a *stored* timestamp, is what "只自动检测一次" means: without
-     * the stored stamp every launch would be "the first check in a while" and closing the
-     * app twice would be two requests.
+     * per launch is what「打开软件查一次」means, and a launch is what the user does when they
+     * want to know: it used to additionally wait out the six-hour window, so opening the app
+     * inside that window asked nothing and the row kept the previous session's time — from
+     * the outside, an app that had stopped checking altogether.
+     *
+     * [LAUNCH_FLOOR_MILLIS] is not that window coming back: it only spans the same process's
+     * own repeated calls, because recreating the activity (a rotation) runs this again.
      *
      * Starting the periodic check is part of coming up, not of this check succeeding: an app
-     * launched with the switch off, or inside the window, still has to be watching for the
+     * launched with the switch off, or inside the floor, still has to be watching for the
      * moment the window passes.
      *
      * @return true when a check was actually started.
@@ -1635,8 +1639,8 @@ class FingerprintViewModel(
     private suspend fun runLaunchBankCheck(): Boolean {
         val stored = withContext(ioDispatcher) { updatePreferences.read() }
         // Handed to the row before anything can return early: a launch that checks nothing
-        // because the window has not passed still knows when the last check was, and the
-        // stored stamp is the only thing that can say it.
+        // because the switch is off or a check is in flight still knows when the last check
+        // was, and the stored stamp is the only thing that can say it.
         _uiState.update {
             it.copy(
                 autoCheckBank = stored.autoCheckBank,
@@ -1646,8 +1650,12 @@ class FingerprintViewModel(
         // The switch is the whole point: off means this panel does not talk to the release
         // endpoint unless the user presses 「检查更新」.
         if (!stored.autoCheckBank) return false
-        val since = clock() - stored.lastBankCheckAt
-        if (stored.lastBankCheckAt > 0 && since < bankCheckIntervalMillis) return false
+        // Two calls a second apart are one launch: the activity is recreated — on a rotation,
+        // on a theme change — and this runs again, but「又打开了一次软件」is not what happened.
+        // The in-memory stamp counts as a reference because a check whose write failed is
+        // still a check that was made.
+        val reference = maxOf(stored.lastBankCheckAt, lastBankCheckAtMillis)
+        if (reference > 0 && clock() - reference < LAUNCH_FLOOR_MILLIS) return false
         // Remembered rather than dropped when the startup read is still running: on a fresh
         // install this check is what puts the download button on an empty card.
         entryCheckPending = true
@@ -2024,6 +2032,16 @@ class FingerprintViewModel(
          * it, and this is only used before one is installed.
          */
         const val DEFAULT_MINIMUM_VALID_NUMBERS = 80
+
+        /**
+         * The shortest gap between two wake-ups by the launch check.
+         *
+         * Not the check's window — the window is gone, every launch checks — but the same
+         * process can come up more than once: recreating the activity (a rotation, a theme
+         * change) runs the launch check again, and that is one launch, not two. A minute is
+         * far longer than any recreation and far shorter than any real relaunch.
+         */
+        internal const val LAUNCH_FLOOR_MILLIS = 60_000L
 
         /**
          * The shortest gap between two wakes of the periodic package check.

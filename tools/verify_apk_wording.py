@@ -53,6 +53,10 @@ FINAL = [
     "自动检查检测包更新",
     # The dialog's one outbound link, added this round.
     "github.com/xiaopeng66/RelayTesterAndroid",
+    # 更新说明这一块：说明文本随清单下发、在卡片里内嵌显示，标题与「在浏览器打开」是它新加的
+    # 两条可见文案（清单里的说明正文是数据，不是本 APK 的文案，登记在这里没有意义）。
+    "更新说明",
+    "在浏览器打开",
 ]
 
 # Only strings that this round retired everywhere. A word that still has a legitimate

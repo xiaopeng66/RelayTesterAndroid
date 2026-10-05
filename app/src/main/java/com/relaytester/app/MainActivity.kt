@@ -75,14 +75,26 @@ private fun RelayTesterApp() {
             ?: AppDestination.MODEL_TEST
         val appUpdateState by appUpdateViewModel.uiState.collectAsStateWithLifecycle()
         val updateSnackbarHostState = remember { SnackbarHostState() }
-        // The launch check: throttled inside the view model, and it stays off when the
-        // switch is off. Keyed on nothing, so it runs once per activity, not per tab switch.
+        // The launch check: on every launch while the switch is on (the view model floors only
+        // a second start of the same process). Keyed on nothing, so it runs once per activity,
+        // not per tab switch.
         LaunchedEffect(Unit) { appUpdateViewModel.checkOnLaunch() }
         // The detection package's automatic check runs on the same terms — once per launch,
-        // timed from a stored timestamp, plus a six-hour timer while the app stays open. It
-        // used to hang off opening the fingerprint panel, which made every switch between
-        // the three tabs re-ask the endpoint and reset the card's「上次检查」row.
+        // plus a six-hour timer while the app stays open. It used to hang off opening the
+        // fingerprint panel, which made every switch between the three tabs re-ask the
+        // endpoint and reset the card's「上次检查」row.
         LaunchedEffect(Unit) { fingerprintViewModel.checkBankOnLaunch() }
+
+        // 自动检查发现了新版本：把「关于与更新」自己打开，「下载并安装」就摆在用户面前。
+        // 一次性信号：打开之后立刻清掉，所以用户关掉页面不会被下一次重组或转屏再弹一次；
+        // 检测包那边没有要开的页面——卡片上的「更新检测包」按钮只认 availableBankUpdate，
+        // 查到了它自己就在（FingerprintScreen）。
+        LaunchedEffect(appUpdateState.autoOpenUpdate) {
+            if (appUpdateState.autoOpenUpdate) {
+                showUpdates = true
+                appUpdateViewModel.consumeAutoOpen()
+            }
+        }
 
         // A Box only so the snackbar host below can sit at the bottom edge; the
         // screens keep their own layout.

@@ -82,11 +82,16 @@ APP_ASSET = "app-latest.json"
 APP_FORMAT_VERSION = 1
 APP_RELEASE_BODY = """应用自身的更新清单，供 App 的「关于与更新」页读取。
 
-- `app-latest.json`：最新版本的版本代码、版本名、安装包地址与 SHA-256。
+- `app-latest.json`：最新版本的版本代码、版本名、安装包地址与 SHA-256，以及这份发行说明的纯文本。
 
 App 只比较版本代码（本仓库会沿用同一个版本名重新发布，版本名不足以判断新旧）。
 这里不存放安装包本体，APK 在对应的 `v<版本>` 发行版里。
 """
+
+# 清单里 `notes` 字段的字符上限。与 App 侧 `AppUpdateManifestParser.MAX_NOTES_CHARS`
+# 必须是同一个数：两边不一致时，App 会在对话框里给用户看一段截断的文字（带省略号），
+# 那是防御，不该是常态。
+FEED_NOTES_LIMIT = 4_000
 
 
 def read_token():
@@ -209,6 +214,74 @@ def verify_notes_identity(notes_bytes, apk_bytes, notes_path):
         f"  把 {os.path.basename(notes_path)} 改成本次产物的数字再发布"
         "（Android 构建不可字节复现，重建一次摘要就会变）。"
     )
+
+
+def notes_for_feed(notes_bytes, limit=FEED_NOTES_LIMIT):
+    """The release notes flattened into the plain text the feed carries.
+
+    The app's dialog prints this text as it comes — there is no Markdown renderer on that
+    side — so the markers the notes file is written with come off here, once, where a gate
+    can look at the result, instead of on a user's phone:
+
+      * heading markers (`# …`) drop, the heading text stays;
+      * list bullets become `· `, which is what the release page shows anyway;
+      * emphasis (`**x**`, `__x__`) and code spans (`` `x` ``) unwrap;
+      * links keep their label and drop the target — it is long, unclickable inside a plain
+        `Text`, and one tap away behind「在浏览器打开」.
+
+    Blank lines collapse to one so paragraph breaks survive without opening gaps, and a
+    result past [limit] is cut on a line boundary with an ellipsis. The number matches the
+    app's own ceiling (`AppUpdateManifestParser.MAX_NOTES_CHARS`), so a feed written by this
+    function is shown whole.
+    """
+    lines = []
+    for raw in notes_bytes.decode("utf-8").splitlines():
+        line = raw.strip()
+        line = re.sub(r"^#{1,6}\s*", "", line)
+        line = re.sub(r"^[-*+]\s+", "· ", line)
+        line = re.sub(r"\*\*(.+?)\*\*", r"\1", line)
+        line = re.sub(r"__(.+?)__", r"\1", line)
+        line = re.sub(r"`([^`]*)`", r"\1", line)
+        line = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", line)
+        if line == "" and (not lines or lines[-1] == ""):
+            continue
+        lines.append(line)
+    while lines and lines[-1] == "":
+        lines.pop()
+    text = "\n".join(lines)
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 2].rstrip()
+    newline = cut.rfind("\n")
+    if newline > limit // 2:
+        cut = cut[:newline]
+    return cut.rstrip() + "\n…"
+
+
+def verify_feed_notes(text, notes_path, limit=FEED_NOTES_LIMIT):
+    """Refuse a feed whose notes still look like Markdown, or are past the app's ceiling.
+
+    A gate rather than trust in [notes_for_feed]: the converter is the only thing standing
+    between the notes file and a dialog that prints exactly what it is handed, and a rule
+    the file grows later (a table, a nested list, an image) would otherwise surface as
+    literal `**` on a phone. Cheap to check here, impossible to notice there.
+    """
+    name = os.path.basename(notes_path)
+    if not text.strip():
+        raise SystemExit(f"{name} 转成纯文本后是空的，清单里没有可显示的说明")
+    if len(text) > limit:
+        raise SystemExit(
+            f"清单里的说明 {len(text)} 字，超过上限 {limit}（App 侧会截断成省略号）；"
+            f"要么删减 {name}，要么同时提高两边的上限"
+        )
+    leftovers = [marker for marker in ("**", "__", "`", "](") if marker in text]
+    if leftovers:
+        raise SystemExit(f"清单里的说明还留着 Markdown 记号 {leftovers}（{name}），补 notes_for_feed 的规则")
+    prefixed = next(
+        (line for line in text.splitlines() if line.startswith(("#", "- ", "* ", "> "))), None
+    )
+    if prefixed is not None:
+        raise SystemExit(f"清单里的说明还有未转换的行：{prefixed!r}（{name}）")
 
 
 def sdk_roots():
@@ -432,13 +505,16 @@ def apk_identity(apk_path):
     }
 
 
-def build_app_manifest(identity, apk_bytes, tag, name, notes_url):
+def build_app_manifest(identity, apk_bytes, tag, name, notes_url, notes):
     """The feed document describing the APK that is about to be published.
 
     `versionName` comes from the build file rather than from the APK because the APK's
     carries the variant suffix (`1.5.0-optimized`) while the release it belongs to is
     tagged with the public line — the same field the tag is built from, so the two agree
     by construction.
+
+    `notes` is the release notes as plain text ([notes_for_feed]), which is what lets the
+    app's update dialog show them inline instead of behind a link.
     """
     return {
         "formatVersion": APP_FORMAT_VERSION,
@@ -450,6 +526,7 @@ def build_app_manifest(identity, apk_bytes, tag, name, notes_url):
         "sha256": sha256(apk_bytes),
         "minSdk": identity["minSdk"],
         "notesUrl": notes_url,
+        "notes": notes,
         "publishedAt": datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat(),
     }
 
@@ -594,12 +671,18 @@ def main():
     # that is not an APK) has to stop the run while the release is still untouched.
     identity = apk_identity(apk_path)
     verify_release_identity(identity, apk_path)
+    # The notes' plain-text form goes into the feed, so it is built and checked here, with
+    # the other gates and before anything is uploaded.
+    feed_notes = notes_for_feed(notes_bytes)
+    verify_feed_notes(feed_notes, notes_path)
+    print(f"notes: 清单内说明 {len(feed_notes)} 字（上限 {FEED_NOTES_LIMIT}）")
     manifest = build_app_manifest(
         identity,
         apk_bytes,
         tag,
         name,
         notes_url=f"https://github.com/{REPO}/releases/tag/{tag}",
+        notes=feed_notes,
     )
     manifest_bytes = (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     print(f"{APP_TAG}: {identity['packageName']} 版本代码 {identity['versionCode']} "

@@ -2053,10 +2053,10 @@ class FingerprintViewModelTest {
     }
 
     @Test
-    fun `the launch check runs once and the next one waits out the window`() {
-        // 这就是用户要的语义：打开软件只自动检测一次。以前挂在「进面板」上，切三大界面
-        // 来回一次就重查一次，卡片上的「上次检查」跟着跳。节流的判据必须是落盘的时间戳，
-        // 否则每次启动都算「第一次」，关掉再开就是两次请求。
+    fun `every launch checks, and a relaunch inside the floor does not`() {
+        // 这就是用户要的语义：打开软件就查一次，卡片上的「上次检查」跟着这次启动走。以前还
+        // 要多等过一个六小时窗口，窗口里的启动一次都不问——从外面看就是这个应用不再检查了。
+        // 闸只挡「同一分钟里的又一次 Activity 创建」（转屏就是），那不是又一次打开软件。
         val fetcher = FakeHttpFetcher().apply { publish(fixtureBankBytes()) }
         val preferences = MemoryUpdatePreferences()
         val subject = readyApiViewModelFor(
@@ -2070,17 +2070,12 @@ class FingerprintViewModelTest {
         assertTrue("启动那一次没有查", runBlocking { subject.checkBankOnLaunch() })
         assertEquals(listOf(FakeHttpFetcher.MANIFEST_URL), fetcher.urls)
         assertEquals(
-            "查完的时间必须落盘，否则每次启动都是「第一次」",
+            "查完的时间必须落盘，否则「上次检查」重开就丢",
             FIXED_NOW_MILLIS,
             preferences.state.lastBankCheckAt,
         )
 
-        // 同一个六小时窗口里再启动一次：端点不问第二遍。
-        assertFalse("窗口里又查了一次", runBlocking { subject.checkBankOnLaunch() })
-        assertEquals("窗口内的第二次启动不得联网", 1, fetcher.urls.size)
-
-        // 同一个窗口里重开软件：新实例的内存是空的，唯一记得这次检查的就是盘里那份时间戳
-        // —— 判据必须是它，否则每次启动都会当「从没查过」，关掉再开就是又一次请求。
+        // 同一分钟里重开：新实例的内存是空的，但盘里的时间戳还在一分钟内，所以不问第二遍。
         val relaunched = readyApiViewModelFor(
             SingleSupplierStore(testSupplier()),
             FakeCompletionApi(goldenCase().answers),
@@ -2088,32 +2083,27 @@ class FingerprintViewModelTest {
             updatePreferences = preferences,
         )
         runBlocking { relaunched.awaitIdle() }
-        assertFalse("重开软件就把节流忘了", runBlocking { relaunched.checkBankOnLaunch() })
-        assertEquals("窗口内重开不得联网", 1, fetcher.urls.size)
+        assertFalse("一分钟里重开又查了一次", runBlocking { relaunched.checkBankOnLaunch() })
+        assertEquals("闸里的第二次启动不得联网", 1, fetcher.urls.size)
 
-        // 上一次检查已经过期的启动：换个实例模拟「重开软件」，它从盘里读到的是过期的
-        // 时间戳，于是该查。
+        // 十分钟后再打开软件：那是又一次「打开软件」，该问 —— 判据是这次启动，不是窗口。
+        mainDispatcher.scheduler.advanceTimeBy(10 * 60 * 1000L)
         val restarted = readyApiViewModelFor(
             SingleSupplierStore(testSupplier()),
             FakeCompletionApi(goldenCase().answers),
             bankFetcher = fetcher,
-            updatePreferences = MemoryUpdatePreferences(
-                UpdatePreferencesState(
-                    lastBankCheckAt = FIXED_NOW_MILLIS -
-                        UpdatePreferencesState.APP_CHECK_INTERVAL_MILLIS - 1L,
-                ),
-            ),
+            updatePreferences = preferences,
         )
         runBlocking { restarted.awaitIdle() }
-        assertTrue("过了窗口却没查", runBlocking { restarted.checkBankOnLaunch() })
-        assertEquals(2, fetcher.urls.size)
+        assertTrue("过了闸重开却没查", runBlocking { restarted.checkBankOnLaunch() })
+        assertEquals("重开一次就该是两次请求", 2, fetcher.urls.size)
     }
 
     @Test
-    fun `a launch inside the window still says when the last check was`() {
-        // 这一次启动不查（窗口没到），但卡片不能因此退回「尚未检查」：上一次检查的时间是
-        // 盘上就写着的事实，只是它的结论本进程没看到过，所以只印时间、不印结论。
-        val lastCheck = FIXED_NOW_MILLIS - 60 * 60 * 1000L
+    fun `a launch inside the floor still says when the last check was`() {
+        // 这一次启动不查（离上次不到一分钟），但卡片不能因此退回「尚未检查」：上一次检查的
+        // 时间是盘上就写着的事实，只是它的结论本进程没看到过，所以只印时间、不印结论。
+        val lastCheck = FIXED_NOW_MILLIS - 30 * 1000L
         val fetcher = FakeHttpFetcher().apply { publish(fixtureBankBytes()) }
         val subject = apiViewModel(
             api = FakeCompletionApi(goldenCase().answers),
@@ -2124,8 +2114,8 @@ class FingerprintViewModelTest {
             ),
         )
 
-        assertFalse("窗口没到却查了", runBlocking { subject.checkBankOnLaunch() })
-        assertEquals("窗口内的启动不该联网", emptyList<String>(), fetcher.urls)
+        assertFalse("一分钟内又查了一次", runBlocking { subject.checkBankOnLaunch() })
+        assertEquals("闸里的启动不该联网", emptyList<String>(), fetcher.urls)
         assertEquals(lastCheck, subject.uiState.value.bankEarlierCheckAtMillis)
         assertEquals(UpdateCheckOutcome.EARLIER_CHECK, bankCheckOutcome(subject.uiState.value))
     }
@@ -2156,31 +2146,29 @@ class FingerprintViewModelTest {
     }
 
     @Test
-    fun `a wake never re-checks inside the timer's minimum wait`() {
-        // 最小间隔存在的理由和软件更新那条一样：唤醒算术把时间算到了过去时，一次唤醒
-        // 至少还隔一分钟，于是算术出错只花掉一次迟到的检查，而不是变成一个紧循环。
+    fun `a wake that finds the window 30 seconds away still waits out the minimum`() {
+        // 「窗口只差一点点」只出现在时间被往回调过之后：上一次检查的时间戳落在未来（这里 30
+        // 秒之后），启动那一次被闸挡住不查，定时器的第一次唤醒算出「还差 6 小时半」而被上限
+        // 压回 6 小时，第二次醒来时只差 30 秒 —— 唯一一段最小间隔会改变答案的地方。有它在，
+        // 算术出错只花掉一次迟到的检查，而不是一个紧循环。
         val fetcher = FakeHttpFetcher().apply { publish(fixtureBankBytes()) }
         val subject = apiViewModel(
             api = FakeCompletionApi(goldenCase().answers),
             ioDispatcher = mainDispatcher,
             bankFetcher = fetcher,
             updatePreferences = MemoryUpdatePreferences(
-                UpdatePreferencesState(
-                    // 差 30 秒到期：唯一一段最小间隔会改变答案的窗口。
-                    lastBankCheckAt = FIXED_NOW_MILLIS -
-                        UpdatePreferencesState.APP_CHECK_INTERVAL_MILLIS + 30_000L,
-                ),
+                UpdatePreferencesState(lastBankCheckAt = FIXED_NOW_MILLIS + 30_000L),
             ),
         )
 
-        assertFalse("窗口没到却查了", runBlocking { subject.checkBankOnLaunch() })
+        assertFalse("落在未来的时间戳不该让启动检查联网", runBlocking { subject.checkBankOnLaunch() })
         assertEquals(emptyList<String>(), fetcher.urls)
 
-        // 45 秒：已经过了算术上的到期点，但还在最小间隔里。
-        mainDispatcher.scheduler.advanceTimeBy(45_000L)
+        // 六小时后定时器醒来，把「还差 30 秒」推到一分钟外；没有那道闸，这里就有一次请求。
+        mainDispatcher.scheduler.advanceTimeBy(6 * 60 * 60 * 1000L + 59_000L)
         assertEquals("最小间隔没兜住提前的唤醒", emptyList<String>(), fetcher.urls)
 
-        mainDispatcher.scheduler.advanceTimeBy(16_000L)
+        mainDispatcher.scheduler.advanceTimeBy(2_000L)
         assertEquals("过了最小间隔还是没有自动检查", 1, fetcher.urls.size)
     }
 

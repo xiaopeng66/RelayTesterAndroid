@@ -86,8 +86,13 @@ android {
         // stored credentials report when they can no longer be decrypted, corrupted storage
         // is surfaced instead of silently dropped, and the streaming and balance paths get
         // their missing ceilings and deadlines.
-        versionCode = 10_700
-        versionName = "1.7.0"
+        // 10701 prints the release notes inside the update dialog and sizes both raw dialogs
+        // to the real window on both axes (landscape was clipping the card edge). The launch
+        // check now runs on every launch while the switch is on — the six-hour window used to
+        // swallow it, so nothing was ever checked and the「上次检查」row kept the previous
+        // session's time — and a silent check that finds an update opens the page by itself.
+        versionCode = 10_701
+        versionName = "1.7.1"
         ndk {
             // arm64 only: the published update ships one APK, and every device the app is
             // meant for is arm64. The 32-bit and x86 ABIs would each add a copy of the two

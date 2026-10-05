@@ -32,6 +32,19 @@ data class AppUpdateManifest(
     val sha256: String,
     val minSdk: Int,
     val notesUrl: String,
+    /**
+     * The release notes as plain text, carried by the feed itself.
+     *
+     * In the feed rather than fetched from the release page: the app already downloads this
+     * document over the pinned release host, and a second request (the releases API, or the
+     * raw Markdown file) would add a source this chain does not check, an anonymous rate
+     * limit, and HTML to parse. Plain text rather than Markdown because the dialog prints it
+     * as-is — the publisher flattens the notes file before writing this field.
+     *
+     * Empty when the feed has none (an older feed, or a release published without notes):
+     * the dialog then falls back to the [notesUrl] link.
+     */
+    val notes: String,
     val publishedAt: String,
 )
 
@@ -48,6 +61,17 @@ object AppUpdateManifestParser {
 
     /** Ceiling for the APK itself; well past the current ~3 MB and short of absurd. */
     const val MAX_APK_BYTES = 64L * 1024 * 1024
+
+    /**
+     * Ceiling for the feed's `notes` text, in characters.
+     *
+     * The publisher truncates to this same number before writing the feed (see
+     * `FEED_NOTES_LIMIT` in `tools/publish_release_apk.py`), so the two sides agree on what
+     * "the whole text" means; a feed that ignores it gets cut here with a visible ellipsis
+     * rather than printed in full. Four thousand characters is roughly ten screens of body
+     * text — past any notes this project writes, small enough to bound the dialog.
+     */
+    const val MAX_NOTES_CHARS = 4_000
 
     fun parse(text: String): AppUpdateManifest {
         val root = try {
@@ -94,8 +118,25 @@ object AppUpdateManifestParser {
             // trade an update for a missing hyperlink. Dropping it also means a feed cannot
             // hand the app an `intent:` or `file:` URL to launch.
             notesUrl = root.optString("notesUrl").takeIf { UpdateHosts.httpsOrNull(it) != null }.orEmpty(),
+            notes = feedNotes(root.optString("notes")),
             publishedAt = root.optString("publishedAt"),
         )
+    }
+
+    /**
+     * The feed's notes text, ready to print.
+     *
+     * Line endings are normalised (the publisher writes LF, but the field is remote input and
+     * a CR would show up as a stray glyph) and the length is capped: the feed is bounded at
+     * [AppUpdateClient.MAX_MANIFEST_BYTES] already, and this keeps a feed from turning the
+     * dialog into a wall of text the reader has to scroll out of. The publisher truncates to
+     * this same ceiling, so the ellipsis is a defence against a feed that ignores it, not a
+     * normal sight.
+     */
+    private fun feedNotes(raw: String): String {
+        val text = raw.replace("\r\n", "\n").replace('\r', '\n').trim()
+        if (text.length <= MAX_NOTES_CHARS) return text
+        return text.take(MAX_NOTES_CHARS).trimEnd() + "…"
     }
 
     private fun JSONObject.string(key: String, what: String): String =
