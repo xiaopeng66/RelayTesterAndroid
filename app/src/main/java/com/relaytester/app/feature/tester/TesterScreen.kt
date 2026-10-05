@@ -12,6 +12,8 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -29,9 +31,12 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.wrapContentSize
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -48,11 +53,14 @@ import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.EditNote
 import androidx.compose.material.icons.outlined.Fingerprint
+import androidx.compose.material.icons.outlined.KeyboardArrowDown
+import androidx.compose.material.icons.outlined.KeyboardArrowUp
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.StopCircle
+import androidx.compose.material.icons.outlined.SwapVert
 import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.outlined.Visibility
@@ -83,6 +91,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -93,6 +102,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -111,12 +122,14 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import kotlin.math.roundToInt
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.relaytester.app.core.model.ModelTestResult
 import com.relaytester.app.core.model.ModelCatalogEntry
@@ -196,6 +209,7 @@ fun TesterScreen(
     var pendingExport by remember { mutableStateOf<ExportPayload?>(null) }
     var showModelCatalog by rememberSaveable { mutableStateOf(false) }
     var configurationSupplierId by rememberSaveable { mutableStateOf<String?>(null) }
+    var showSupplierOrder by rememberSaveable { mutableStateOf(false) }
     var saveCompletedAt by rememberSaveable { mutableStateOf(0L) }
     var supplierToDeleteId by rememberSaveable { mutableStateOf<String?>(null) }
     // The configuration card already fills the first viewport. Keeping the
@@ -290,6 +304,7 @@ fun TesterScreen(
                     viewModel.selectSupplier(supplierId)
                 },
                 onAddSupplier = viewModel::addSupplier,
+                onReorderSuppliers = { showSupplierOrder = true },
                 onFetchModels = viewModel::fetchModels,
                 onStartTest = viewModel::startTest,
                 onToggleModel = viewModel::toggleModelSelection,
@@ -374,6 +389,13 @@ fun TesterScreen(
             )
         }
     }
+    if (showSupplierOrder) {
+        SupplierOrderDialog(
+            suppliers = state.suppliers,
+            onMove = viewModel::moveSupplier,
+            onDismiss = { showSupplierOrder = false },
+        )
+    }
     supplierToDeleteId?.let { supplierId ->
         val supplier = state.suppliers.firstOrNull { it.id == supplierId }
         if (supplier != null) {
@@ -422,6 +444,7 @@ private fun TesterContent(
     onFetchAllSupplierModels: () -> Unit,
     onEditSupplier: (String) -> Unit,
     onAddSupplier: () -> Unit,
+    onReorderSuppliers: () -> Unit,
     onFetchModels: () -> Unit,
     onStartTest: () -> Unit,
     onToggleModel: (String) -> Unit,
@@ -484,6 +507,7 @@ private fun TesterContent(
                 onFetchAll = onFetchAllSupplierModels,
                 onEditSupplier = onEditSupplier,
                 onAdd = onAddSupplier,
+                onReorder = onReorderSuppliers,
             )
         }
         if (state.modelFetchFailures.isNotEmpty()) {
@@ -654,6 +678,7 @@ private fun SupplierSelector(
     onFetchAll: () -> Unit,
     onEditSupplier: (String) -> Unit,
     onAdd: () -> Unit,
+    onReorder: () -> Unit,
 ) {
     val manageEnabled = enabled && fetchingSupplierIds.isEmpty()
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -663,15 +688,31 @@ private fun SupplierSelector(
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
             Text("供应商", style = MaterialTheme.typography.titleMedium)
-            IconButton(
-                onClick = onAdd,
-                enabled = manageEnabled,
-                modifier = Modifier.size(48.dp),
-            ) {
-                Icon(
-                    imageVector = Icons.Outlined.Add,
-                    contentDescription = "添加供应商",
-                )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                // 排序只在有两个以上供应商时才有意义：一个供应商的面板是一个空操作，
+                // 摆在那里只会让人点进去发现没得排。
+                if (suppliers.size > 1) {
+                    IconButton(
+                        onClick = onReorder,
+                        enabled = manageEnabled,
+                        modifier = Modifier.size(48.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.SwapVert,
+                            contentDescription = "排序供应商",
+                        )
+                    }
+                }
+                IconButton(
+                    onClick = onAdd,
+                    enabled = manageEnabled,
+                    modifier = Modifier.size(48.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.Add,
+                        contentDescription = "添加供应商",
+                    )
+                }
             }
         }
         Button(
@@ -878,6 +919,221 @@ private fun SupplierSelector(
             "点按切换供应商，双击重拉模型；右上角图标可编辑。",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/**
+ * Reorders the suppliers, and through them every surface that lists them.
+ *
+ * The list is the profiles list's own order — there is no rank field — so the panel sends
+ * [onMove] and the stored list follows; the test tab's cards, the balance grid and the
+ * fingerprint picker (on its next tab entry) all render that one order.
+ *
+ * The drag works on ids, not positions: the pointer's target is resolved against the live
+ * list when the event arrives, so an event that lands before the recomposition simply
+ * resolves to no-op instead of swapping the same two rows back and forth. Rows animate to
+ * their new places through `Modifier.animateItem`, and nothing is written until the finger
+ * is up — the view model already applied each swap to the UI state on the way, so the
+ * animation is the recomposition, not a delayed echo of the disk.
+ *
+ * The up/down buttons are not a fallback for the drag: a drag target is a fraction of a
+ * row's height, which assistive technology cannot be asked to hit. They name the same
+ * adjacent supplier the drag would land on.
+ */
+@Composable
+private fun SupplierOrderDialog(
+    suppliers: List<SupplierProfile>,
+    onMove: (String, String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    // 与供应商配置弹窗同一套几何：卡片占屏宽 94%，内容盒按窗口定尺，遮罩自绘。
+    val windowBox = rememberDialogWindowBox()
+    val maxSheetHeight = (LocalConfiguration.current.screenHeightDp * 0.9f).dp
+    val listState = rememberLazyListState()
+    var draggingId by remember { mutableStateOf<String?>(null) }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Box(modifier = windowBox, contentAlignment = Alignment.Center) {
+            DialogDismissScrim(onDismiss = onDismiss)
+            Box(modifier = Modifier.fillMaxWidth(0.94f)) {
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 44.dp)
+                        .heightIn(max = maxSheetHeight),
+                    shape = MaterialTheme.shapes.extraLarge,
+                    tonalElevation = 6.dp,
+                    shadowElevation = 10.dp,
+                ) {
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Column(
+                            modifier = Modifier.padding(
+                                start = 24.dp,
+                                end = 24.dp,
+                                top = 20.dp,
+                                bottom = 4.dp,
+                            ),
+                            verticalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            Text("供应商排序", style = MaterialTheme.typography.headlineSmall)
+                            Text(
+                                "按住右侧手柄拖动，或用箭头上下移；顺序在所有页面一致。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        LazyColumn(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f, fill = false),
+                            state = listState,
+                            contentPadding = PaddingValues(
+                                start = 12.dp,
+                                end = 12.dp,
+                                top = 8.dp,
+                                bottom = 8.dp,
+                            ),
+                        ) {
+                            itemsIndexed(suppliers, key = { _, supplier -> supplier.id }) { index, supplier ->
+                                SupplierOrderRow(
+                                    supplier = supplier,
+                                    position = index + 1,
+                                    canMoveUp = index > 0,
+                                    canMoveDown = index < suppliers.lastIndex,
+                                    isDragging = supplier.id == draggingId,
+                                    onStartDrag = { draggingId = supplier.id },
+                                    onStopDrag = { draggingId = null },
+                                    onMoveOver = { overId -> onMove(supplier.id, overId) },
+                                    onMoveUp = { suppliers.getOrNull(index - 1)?.let { up -> onMove(supplier.id, up.id) } },
+                                    onMoveDown = { suppliers.getOrNull(index + 1)?.let { down -> onMove(supplier.id, down.id) } },
+                                )
+                            }
+                        }
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 24.dp, vertical = 12.dp),
+                            horizontalArrangement = Arrangement.End,
+                        ) {
+                            Button(onClick = onDismiss, modifier = Modifier.heightIn(min = 48.dp)) {
+                                Text("完成")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SupplierOrderRow(
+    supplier: SupplierProfile,
+    position: Int,
+    canMoveUp: Boolean,
+    canMoveDown: Boolean,
+    isDragging: Boolean,
+    onStartDrag: () -> Unit,
+    onStopDrag: () -> Unit,
+    onMoveOver: (String) -> Unit,
+    onMoveUp: () -> Unit,
+    onMoveDown: () -> Unit,
+) {
+    var rowHeightPx by remember { mutableIntStateOf(0) }
+    // 拖动是用「位移除以行高」算的，不是用指针的绝对坐标：LazyColumn 有自己的内边距和滚动
+    // 偏移，拿绝对 y 找行会把两者都算进去（这是这类实现最常见的一处错）。位移只关心跨过了
+    // 几行，行高从测量拿到，与滚动位置无关。
+    val dragModifier = Modifier.pointerInput(supplier.id) {
+        // 每次手势开始时归零：上一次的残留位移会把第一次换位提前触发。
+        var travelled = 0f
+        detectDragGesturesAfterLongPress(
+            onDragStart = {
+                travelled = 0f
+                onStartDrag()
+            },
+            onDragEnd = { onStopDrag() },
+            onDragCancel = { onStopDrag() },
+            onDrag = { change, dragAmount ->
+                change.consume()
+                travelled += dragAmount.y
+                val row = rowHeightPx
+                if (row <= 0) return@detectDragGesturesAfterLongPress
+                // 半个行高＝两行的中点，跨过它才换位；一次手势里跨过几行就换几位。
+                val steps = (travelled / row).roundToInt()
+                if (steps != 0) {
+                    repeat(kotlin.math.abs(steps)) { onMoveOver(supplier.id) }
+                    // 只减掉已经兑现的那几行：剩下的零头留着，跨回半行就能换回去，
+                    // 不会出现「换过去就换不回来」的死区。
+                    travelled -= steps * row
+                }
+            },
+        )
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .onSizeChanged { rowHeightPx = it.height }
+            .graphicsLayer { alpha = if (isDragging) 0.6f else 1f }
+            .background(
+                color = MaterialTheme.colorScheme.surface,
+                shape = MaterialTheme.shapes.medium,
+            )
+            .padding(horizontal = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = position.toString(),
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.width(24.dp),
+            textAlign = TextAlign.Center,
+        )
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .padding(vertical = 12.dp),
+        ) {
+            Text(
+                text = supplier.name,
+                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = protocolShortLabel(supplier.protocol),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+            )
+        }
+        IconButton(
+            onClick = onMoveUp,
+            enabled = canMoveUp,
+            modifier = Modifier.size(44.dp),
+        ) {
+            Icon(Icons.Outlined.KeyboardArrowUp, contentDescription = "上移 ${supplier.name}")
+        }
+        IconButton(
+            onClick = onMoveDown,
+            enabled = canMoveDown,
+            modifier = Modifier.size(44.dp),
+        ) {
+            Icon(Icons.Outlined.KeyboardArrowDown, contentDescription = "下移 ${supplier.name}")
+        }
+        Text(
+            text = "⠿",
+            color = if (isDragging) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier
+                .size(44.dp)
+                .clip(MaterialTheme.shapes.small)
+                .then(dragModifier)
+                .semantics { contentDescription = "拖动排序 ${supplier.name}" }
+                .wrapContentSize(Alignment.Center),
         )
     }
 }

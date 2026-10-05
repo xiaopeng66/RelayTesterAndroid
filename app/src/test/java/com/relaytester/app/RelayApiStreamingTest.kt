@@ -199,7 +199,7 @@ class RelayApiStreamingTest {
                     ).toByteArray(),
             )
             val filler = "1 ".repeat(60)
-            repeat(4_000) { out.write(chatChunk(filler).toByteArray()) }
+            repeat(11_000) { out.write(chatChunk(filler).toByteArray()) }
         }.use { server ->
             val result = stream(server.port)
 
@@ -207,6 +207,72 @@ class RelayApiStreamingTest {
             val error = (result as ApiResult.Failure).error
             assertTrue("失败原因要说清是流太大：${error.message}", error.message.contains("流式响应过大"))
             assertTrue("过大的流不是网络故障", error.message.isNotBlank())
+        }
+    }
+
+    @Test
+    fun `a reasoning stream far larger than the old wire bound still answers`() {
+        // The report that started this: a reasoning model streams thousands of thinking
+        // frames before a single answer token. Each frame is discarded by the extractor,
+        // but it is a couple of hundred bytes on the wire, so the old 256 KB wire bound
+        // counted framing that never reaches the answer and failed a challenge whose
+        // answer is ~300 numbers. What the ceiling exists for — memory — never depended
+        // on the size of the reasoning.
+        val frames = 1_500
+        WireServer { out ->
+            out.write(
+                (
+                    "HTTP/1.1 200 OK\r\n" +
+                        "Content-Type: text/event-stream\r\n" +
+                        "Connection: close\r\n\r\n"
+                    ).toByteArray(),
+            )
+            // ~350 bytes per frame: ~500 KB of reasoning on the wire — twice the old
+            // ceiling, well inside the new one, and none of it the answer.
+            repeat(frames) { index ->
+                val reasoning = "thinking step $index ".repeat(16)
+                out.write(
+                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"$reasoning\"}}]}\n\n"
+                        .toByteArray(),
+                )
+            }
+            out.write(chatChunk("7 8 9 ").toByteArray())
+            out.write("data: [DONE]\n\n".toByteArray())
+        }.use { server ->
+            val result = stream(server.port)
+
+            assertTrue("推理帧不该让检测失败：$result", result is ApiResult.Success)
+            assertEquals("推理帧不得混进回答", "7 8 9 ", (result as ApiResult.Success).value)
+        }
+    }
+
+    @Test
+    fun `an answer longer than the answer ceiling is truncated with its head intact`() {
+        // The other half of the same trade: the wire ceiling stays for memory, and the
+        // answer gets its own bound. Past it the stream is drained, not killed — an
+        // over-long answer keeps the numbers the scorer reads, and the request does not
+        // fail the way it would have under the old single 256 KB bound.
+        WireServer { out ->
+            out.write(
+                (
+                    "HTTP/1.1 200 OK\r\n" +
+                        "Content-Type: text/event-stream\r\n" +
+                        "Connection: close\r\n\r\n"
+                    ).toByteArray(),
+            )
+            // 4 KB per chunk over 40 chunks: ~160 KB of answer text, past the 64K ceiling
+            // and comfortably inside the 1 MB wire ceiling.
+            repeat(40) { index ->
+                out.write(chatChunk("$index ".repeat(1_000)).toByteArray())
+            }
+            out.write("data: [DONE]\n\n".toByteArray())
+        }.use { server ->
+            val result = stream(server.port)
+
+            assertTrue("过长的回答应当截断而不是失败：$result", result is ApiResult.Success)
+            val answer = (result as ApiResult.Success).value
+            assertEquals("截断到回答上限", 65_536, answer.length)
+            assertTrue("头部必须保留（打分读的就是开头）", answer.startsWith("0 0 "))
         }
     }
 
@@ -225,7 +291,7 @@ class RelayApiStreamingTest {
             // More than the reader's ceiling, in one unterminated line: the reader has to
             // give up mid-line, which is the case a newline-oriented bound cannot cover.
             val blob = "x".repeat(8_192)
-            repeat(40) { out.write(blob.toByteArray()) }
+            repeat(140) { out.write(blob.toByteArray()) }
         }.use { server ->
             val result = stream(server.port)
 

@@ -2011,6 +2011,39 @@ class TesterViewModel(
     }
 
     /**
+     * Moves one supplier into the slot another one currently occupies. That is the
+     * whole reorder primitive, stated by ids on purpose: a drag says "drop this row
+     * where that row sits" and the up/down buttons name the adjacent supplier, and
+     * because the resolution happens against the live list, a pointer event that
+     * arrives before the recomposition lands simply resolves to no-op instead of
+     * swapping the two rows back.
+     *
+     * Supplier order is the profiles list's own order — there is no separate rank
+     * field — so every surface that renders that list (the test tab's cards, the
+     * balance grid, the fingerprint picker after its tab-entry refresh) follows at
+     * once. The swap reaches the UI state before the save, because a drag must not
+     * wait on disk; a failed save rolls the whole move back, the same discipline as
+     * [deleteSupplier]. Rapid swaps inside one gesture queue behind the same write
+     * mutex and each snapshot carries every earlier one, so the last write lands the
+     * final order rather than an intermediate one.
+     */
+    fun moveSupplier(supplierId: String, targetId: String) {
+        if (runningOrInitializing()) return
+        viewModelScope.launch {
+            val from = profiles.indexOfFirst { it.id == supplierId }
+            val to = profiles.indexOfFirst { it.id == targetId }
+            if (from < 0 || to < 0 || from == to) return@launch
+            val previousProfiles = profiles.toMutableList()
+            profiles.add(to, profiles.removeAt(from))
+            _uiState.update { it.copy(suppliers = profiles.toList()) }
+            if (!saveProfiles()) {
+                profiles = previousProfiles
+                _uiState.update { it.copy(suppliers = profiles.toList()) }
+            }
+        }
+    }
+
+    /**
      * Refreshes every configured supplier in parallel. Each request uses only
      * that supplier's credentials, and one failure never cancels the batch.
      */

@@ -1108,7 +1108,7 @@ private fun ModelListDialog(
                         unmatched?.let { keyword ->
                             ModelRow(
                                 label = keyword,
-                                supporting = "该供应商的列表里没有这个名字，将直接用它检测",
+                                supporting = "不在列表，直接检测",
                                 order = selectedModels.indexOf(keyword).takeIf { it >= 0 }?.plus(1),
                                 selected = keyword in selectedModels,
                                 enabled = enabled,

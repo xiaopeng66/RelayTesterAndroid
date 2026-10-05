@@ -91,8 +91,15 @@ android {
         // check now runs on every launch while the switch is on — the six-hour window used to
         // swallow it, so nothing was ever checked and the「上次检查」row kept the previous
         // session's time — and a silent check that finds an update opens the page by itself.
-        versionCode = 10_701
-        versionName = "1.7.1"
+        // 10702 lets the suppliers be reordered from a drag panel in the test tab: the order is
+        // the profiles list's own, so the test cards, the balance grid and the fingerprint
+        // picker all follow one drag. The template editor becomes a dialog over the balance
+        // page instead of replacing it, so closing it lands back on the same scroll position
+        // instead of the top. A reasoning model's stream no longer fails the detection: the
+        // wire ceiling stops judging the answer (reasoning frames used to spend it), and the
+        // answer text gets its own bound instead.
+        versionCode = 10_702
+        versionName = "1.7.2"
         ndk {
             // arm64 only: the published update ships one APK, and every device the app is
             // meant for is arm64. The 32-bit and x86 ABIs would each add a copy of the two

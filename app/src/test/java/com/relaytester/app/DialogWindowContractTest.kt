@@ -205,4 +205,27 @@ class DialogWindowContractTest {
             "appUpdateViewModel.consumeAutoOpen()" in block,
         )
     }
+
+    @Test
+    fun `the drag converts its travel into rows, not into a fixed step`() {
+        // 拖动的换位判据是「位移除以行高」，行高来自测量。JVM 测试没有指针也没有布局，
+        // SupplierOrderTest 只能测原语，测不到这行换算——把它写死成 0（或任何常数）时那些
+        // 测试仍然是绿的，而排序在设备上会彻底失灵。所以这里钉住的是那行换算本身：它必须读
+        // 一个变化量、除以一个测量出来的高度，并且用四舍五入（半个行高＝两行中点）。
+        val file = File(sourceRoot, "com/relaytester/app/feature/tester/TesterScreen.kt")
+        assertTrue("找不到 TesterScreen.kt：${file.absolutePath}", file.isFile)
+        val text = code(file)
+        assertTrue(
+            "排序面板里没有「位移 ÷ 行高」的换算：跨半行就换位这条手感失去了依据",
+            Regex("""val steps = \(travelled / row\)\.roundToInt\(\)""").containsMatchIn(text),
+        )
+        assertTrue(
+            "行高没有从测量拿到（onSizeChanged）：换算会一直用 0，拖动完全不动",
+            "onSizeChanged { rowHeightPx = it.height }" in text,
+        )
+        assertTrue(
+            "每次手势开始没有把位移归零：上一次的残留会让第一次换位提前触发",
+            "travelled = 0f" in text,
+        )
+    }
 }

@@ -102,12 +102,17 @@ import com.relaytester.app.core.model.SupplierProfile
 import com.relaytester.app.feature.tester.BalanceTemplateDraft
 import com.relaytester.app.feature.tester.BalanceTemplateErrors
 import com.relaytester.app.feature.tester.BalanceTemplateField
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import com.relaytester.app.feature.tester.BalanceCredentialsDraft
 import com.relaytester.app.feature.tester.BalanceCredentialsErrors
 import com.relaytester.app.feature.tester.BalanceUiState
 import com.relaytester.app.feature.tester.TesterViewModel
 import com.relaytester.app.ui.navigation.AppDestination
+import com.relaytester.app.ui.components.DialogDismissScrim
 import com.relaytester.app.ui.components.RelayAppHeader
+import com.relaytester.app.ui.components.rememberDialogWindowBox
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
@@ -138,10 +143,37 @@ fun BalanceScreen(
     }
 
     val editor = state.editor
+    BalanceHome(
+        state = state,
+        activeDestination = activeDestination,
+        onDestinationSelected = onDestinationSelected,
+        onConfigurationBackup = onConfigurationBackup,
+        onOpenUpdates = onOpenUpdates,
+        hasAppUpdate = hasAppUpdate,
+        onQuery = viewModel::queryBalance,
+        onQueryAll = viewModel::queryAllBalances,
+        onSelectSupplier = viewModel::selectSupplier,
+        onRefreshSupplierBalance = viewModel::refreshSupplierBalance,
+        onAccessTokenChange = viewModel::updateBalanceAccessToken,
+        onUserIdChange = viewModel::updateBalanceUserId,
+        onSaveCredentials = viewModel::saveBalanceCredentials,
+        onDismissCredentials = viewModel::discardBalanceCredentialsChanges,
+        onTemplateSelected = viewModel::selectBalanceTemplate,
+        onNewTemplate = viewModel::beginCreateBalanceTemplate,
+        onEditTemplate = viewModel::beginEditBalanceTemplate,
+        onDeleteTemplate = viewModel::deleteBalanceTemplate,
+        isQuerying = state.isQuerying,
+        isSecretsHydrating = state.isSecretsHydrating,
+        snackbarHostState = snackbarHostState,
+        modifier = modifier,
+    )
     if (editor != null) {
-        // The editor is an in-screen state, not a separate Activity destination. Intercepting
-        // the system Back gesture keeps it consistent with the visible "取消" action instead
-        // of finishing MainActivity and making the app appear to have exited unexpectedly.
+        // 编辑器是盖在余额页上的一层弹窗，不是换掉这一页：换页会把 LazyColumn 连同滚动位置
+        // 一起重建，于是「保存 / 取消」回来永远落在列表顶端，用户排到一半的位置没了。弹窗把
+        // 余额页留在下面，回来时就是离开前的那一屏。
+        //
+        // Back 键仍然归它：弹窗自己吃掉返回手势，否则会直接结束 MainActivity，看起来像应用
+        // 意外退出（这是它从整屏页改成弹窗时必须保住的那条行为）。
         BackHandler(onBack = viewModel::dismissBalanceTemplateEditor)
         BalanceTemplateEditor(
             draft = editor,
@@ -155,31 +187,6 @@ fun BalanceScreen(
             onDerivedTotalChange = viewModel::updateBalanceTemplateDerivedTotal,
             onSave = { viewModel.saveBalanceTemplate(queryAfterSave = false) },
             onSaveAndQuery = { viewModel.saveBalanceTemplate(queryAfterSave = true) },
-            snackbarHostState = snackbarHostState,
-            modifier = modifier,
-        )
-    } else {
-        BalanceHome(
-            state = state,
-            activeDestination = activeDestination,
-            onDestinationSelected = onDestinationSelected,
-            onConfigurationBackup = onConfigurationBackup,
-            onOpenUpdates = onOpenUpdates,
-            hasAppUpdate = hasAppUpdate,
-            onQuery = viewModel::queryBalance,
-            onQueryAll = viewModel::queryAllBalances,
-            onSelectSupplier = viewModel::selectSupplier,
-            onRefreshSupplierBalance = viewModel::refreshSupplierBalance,
-            onAccessTokenChange = viewModel::updateBalanceAccessToken,
-            onUserIdChange = viewModel::updateBalanceUserId,
-            onSaveCredentials = viewModel::saveBalanceCredentials,
-            onDismissCredentials = viewModel::discardBalanceCredentialsChanges,
-            onTemplateSelected = viewModel::selectBalanceTemplate,
-            onNewTemplate = viewModel::beginCreateBalanceTemplate,
-            onEditTemplate = viewModel::beginEditBalanceTemplate,
-            onDeleteTemplate = viewModel::deleteBalanceTemplate,
-            isQuerying = state.isQuerying,
-            isSecretsHydrating = state.isSecretsHydrating,
             snackbarHostState = snackbarHostState,
             modifier = modifier,
         )
@@ -1241,42 +1248,67 @@ private fun BalanceTemplateEditor(
     modifier: Modifier,
 ) {
     var showAdvancedMapping by rememberSaveable(draft.id) { mutableStateOf(false) }
-    Scaffold(
-        modifier = modifier.fillMaxSize(),
-        topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text("余额模板编辑", style = MaterialTheme.typography.titleLarge)
-                        Text(
-                            "参数配置或受限查询脚本，均由本机安全发起请求",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                },
-                navigationIcon = {
-                    IconButton(onClick = onBack, enabled = !isQuerying) {
-                        Icon(Icons.AutoMirrored.Outlined.ArrowBack, contentDescription = "返回余额页")
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.surface,
-                ),
-            )
-        },
-        snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
-    ) { innerPadding ->
-        LazyColumn(
-            modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(
-                start = 16.dp,
-                top = innerPadding.calculateTopPadding() + 12.dp,
-                end = 16.dp,
-                bottom = innerPadding.calculateBottomPadding() + 24.dp,
-            ),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
-        ) {
+    // 与其它弹窗同一套几何：卡片占屏宽 94%，内容盒按窗口定尺（要在弹窗外面算），遮罩自绘
+    // 才能点卡片外关掉。编辑器以前是整屏页，没有这些。
+    val windowBox = rememberDialogWindowBox()
+    val maxSheetHeight = (LocalConfiguration.current.screenHeightDp * 0.92f).dp
+    Dialog(
+        onDismissRequest = { if (!isQuerying) onBack() },
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Box(modifier = windowBox, contentAlignment = Alignment.Center) {
+            DialogDismissScrim(onDismiss = { if (!isQuerying) onBack() })
+            Box(modifier = Modifier.fillMaxWidth(0.94f)) {
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 44.dp)
+                        .heightIn(max = maxSheetHeight),
+                    shape = MaterialTheme.shapes.extraLarge,
+                    tonalElevation = 6.dp,
+                    shadowElevation = 10.dp,
+                ) {
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            IconButton(
+                                onClick = onBack,
+                                enabled = !isQuerying,
+                                modifier = Modifier.size(56.dp),
+                            ) {
+                                Icon(
+                                    Icons.AutoMirrored.Outlined.ArrowBack,
+                                    contentDescription = "返回余额页",
+                                )
+                            }
+                            Column(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .padding(end = 16.dp),
+                            ) {
+                                Text("余额模板编辑", style = MaterialTheme.typography.titleLarge)
+                                Text(
+                                    "参数配置或受限查询脚本，均由本机安全发起请求",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                        HorizontalDivider()
+                        LazyColumn(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f, fill = false),
+                            contentPadding = PaddingValues(
+                                start = 16.dp,
+                                top = 12.dp,
+                                end = 16.dp,
+                                bottom = 12.dp,
+                            ),
+                            verticalArrangement = Arrangement.spacedBy(16.dp),
+                        ) {
             item(key = "editor_intro") {
                 OutlinedCard(modifier = Modifier.fillMaxWidth()) {
                     Text(
@@ -1546,6 +1578,10 @@ private fun BalanceTemplateEditor(
                         enabled = !isQuerying,
                         modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                     ) { Text("取消") }
+                }
+            }
+                        }
+                    }
                 }
             }
         }

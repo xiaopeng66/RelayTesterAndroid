@@ -396,7 +396,13 @@ open class RelayApi(
                 .getOrNull()
                 .orEmpty()
             if (delta.isEmpty()) continue
-            accumulated.append(delta)
+            // Past the answer ceiling the stream is drained but not recorded: reasoning
+            // frames never accumulated in the first place, and an answer that runs this
+            // long is truncated with its head intact rather than killing the request
+            // (see [MAX_STREAM_ANSWER_CHARS] for why that is the honest trade).
+            if (accumulated.length < MAX_STREAM_ANSWER_CHARS) {
+                accumulated.append(delta.take(MAX_STREAM_ANSWER_CHARS - accumulated.length))
+            }
             // Reported per delta, not per byte: a challenge yields a few hundred small
             // chunks, and one callback per chunk is what keeps the count live without
             // flooding the UI state. The cost is quadratic in the number of chunks, which is
@@ -731,16 +737,37 @@ open class RelayApi(
         const val MAX_ERROR_CHARS = 300
 
         /**
-         * How many bytes of a streaming answer are read before the read is abandoned.
+         * How many raw stream bytes are read before the read is abandoned.
          *
-         * The buffered path already refuses a body past [MAX_RESPONSE_BYTES]; the streaming
-         * one had no ceiling at all, so a relay that never sent `[DONE]` — or an endpoint that
-         * answered `text/event-stream` and then streamed something else — grew a string until
-         * the process ran out of memory. 256 KB is far past any real answer (the detection
-         * challenge asks for ~300 numbers, a couple of kilobytes) and well under the buffered
-         * path's ceiling, which also counts the framing this one strips.
+         * The buffered path refuses a body past [MAX_RESPONSE_BYTES]; the streaming path
+         * gets the same bound on its wire bytes, and for the same reason — a relay that
+         * never sent `[DONE]`, or an endpoint that answered `text/event-stream` and then
+         * streamed something else, must hit a wall instead of growing a buffer forever.
+         *
+         * The ceiling's job is memory, not judging the answer. Reasoning models stream
+         * thousands of `reasoning_content`/`thinking` frames before any answer text, each
+         * frame a couple of hundred bytes of JSON framing; the old 256 KB wire bound
+         * measured that framing and killed perfectly sane challenges whose answer is
+         * ~300 numbers — a couple of kilobytes. Those frames are discarded per line by
+         * the extractor and never accumulate, so the bound that judges the answer itself
+         * is [MAX_STREAM_ANSWER_CHARS], not this one.
          */
-        const val MAX_STREAM_BYTES = 262_144L
+        const val MAX_STREAM_BYTES = 1_048_576L
+
+        /**
+         * How many characters of extracted answer text are accumulated before the rest
+         * of the stream is drained but not recorded.
+         *
+         * This is the bound the wire ceiling used to double as, back when stream bytes
+         * and answer text moved together. The per-delta progress callback copies the
+         * accumulated text, so the reader's cost is quadratic in the answer length; a
+         * challenge answer is a couple of kilobytes, 64K chars is about thirty times
+         * that — past anything a model answering the challenge emits, tight enough to
+         * keep the copies cheap. Truncation is deliberate: an answer this long is
+         * rambling anyway, its head — the part the scorer reads — is intact, and
+         * killing the request would only repeat the 256 KB mistake one level up.
+         */
+        const val MAX_STREAM_ANSWER_CHARS = 65_536
 
         /** What an HTTP header value may contain: the printable range, plus tab. */
         val ASCII_PRINTABLE = 0x20..0x7e
