@@ -36,4 +36,4 @@
 - 包名：`com.relaytester.app`
 - 版本代码：`10700`
 - 字节数：`2,974,695`
-- SHA-256：`21fe9fd4786ed8accabbf2d52ad6836e18c8ba6f4b6fa590ccf6873e991546ba`
+- SHA-256：`998fa1d63b97fcdd35556be43c75e6fe7b19abe922e5c690936d12e152d4adb8`

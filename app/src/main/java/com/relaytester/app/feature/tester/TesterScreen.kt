@@ -2271,14 +2271,19 @@ private fun ResultActions(
 
 @Composable
 private fun SecurityNote() {
+    // The default 24 dp icon towers over this note's 16 sp line, and top alignment
+    // then leaves its centre below the text's. Match the line box and centre on it, so
+    // the glyph rides the text's centre line at every font scale.
+    val lineHeight = MaterialTheme.typography.bodySmall.lineHeight
     Row(
         modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.Top,
+        verticalAlignment = Alignment.CenterVertically,
     ) {
         Icon(
             Icons.Outlined.Security,
             contentDescription = null,
+            modifier = Modifier.size(with(LocalDensity.current) { lineHeight.toDp() }),
             tint = MaterialTheme.colorScheme.tertiary,
         )
         Text(
