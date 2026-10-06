@@ -198,8 +198,9 @@ class RelayApiStreamingTest {
                         "Connection: close\r\n\r\n"
                     ).toByteArray(),
             )
-            val filler = "1 ".repeat(60)
-            repeat(11_000) { out.write(chatChunk(filler).toByteArray()) }
+            // ~2 KB per frame, 5,000 frames: ~10 MB of framing, past the 8 MB ceiling.
+            val filler = "1 ".repeat(1_000)
+            repeat(5_000) { out.write(chatChunk(filler).toByteArray()) }
         }.use { server ->
             val result = stream(server.port)
 
@@ -227,8 +228,9 @@ class RelayApiStreamingTest {
                         "Connection: close\r\n\r\n"
                     ).toByteArray(),
             )
-            // ~350 bytes per frame: ~500 KB of reasoning on the wire — twice the old
-            // ceiling, well inside the new one, and none of it the answer.
+            // ~350 bytes per frame: ~500 KB of reasoning on the wire — twice the original
+            // 256 KB bound, and none of it the answer. The 1 MB era is covered by the
+            // regression above; this one keeps the smallest repro of the original report.
             repeat(frames) { index ->
                 val reasoning = "thinking step $index ".repeat(16)
                 out.write(
@@ -247,6 +249,41 @@ class RelayApiStreamingTest {
     }
 
     @Test
+    fun `a reasoning stream past the previous wire bound still answers`() {
+        // The report that kept coming back: at the 1 MB bound a slow, thorough model still
+        // crossed it, so the panel showed "stream too large" for a challenge whose answer is
+        // a few kilobytes. Reasoning frames pay 58-350 bytes each of JSON framing and never
+        // reach the answer, so the bound is spent by frame count, not by anything the user
+        // asked for. ~2 MB here is twice the bound that used to fail and a quarter of the
+        // current one: this is the regression that says the raise is real.
+        val frames = 6_000
+        WireServer { out ->
+            out.write(
+                (
+                    "HTTP/1.1 200 OK\r\n" +
+                        "Content-Type: text/event-stream\r\n" +
+                        "Connection: close\r\n\r\n"
+                    ).toByteArray(),
+            )
+            // ~330 bytes per frame: ~2 MB of reasoning on the wire, none of it the answer.
+            repeat(frames) { index ->
+                val reasoning = "thinking step $index ".repeat(16)
+                out.write(
+                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"$reasoning\"}}]}\n\n"
+                        .toByteArray(),
+                )
+            }
+            out.write(chatChunk("4 5 6 ").toByteArray())
+            out.write("data: [DONE]\n\n".toByteArray())
+        }.use { server ->
+            val result = stream(server.port)
+
+            assertTrue("超过旧上限的推理流不该让检测失败：$result", result is ApiResult.Success)
+            assertEquals("推理帧不得混进回答", "4 5 6 ", (result as ApiResult.Success).value)
+        }
+    }
+
+    @Test
     fun `an answer longer than the answer ceiling is truncated with its head intact`() {
         // The other half of the same trade: the wire ceiling stays for memory, and the
         // answer gets its own bound. Past it the stream is drained, not killed — an
@@ -261,7 +298,7 @@ class RelayApiStreamingTest {
                     ).toByteArray(),
             )
             // 4 KB per chunk over 40 chunks: ~160 KB of answer text, past the 64K ceiling
-            // and comfortably inside the 1 MB wire ceiling.
+            // and comfortably inside the wire ceiling.
             repeat(40) { index ->
                 out.write(chatChunk("$index ".repeat(1_000)).toByteArray())
             }
@@ -288,10 +325,11 @@ class RelayApiStreamingTest {
                         "Connection: close\r\n\r\n"
                     ).toByteArray(),
             )
-            // More than the reader's ceiling, in one unterminated line: the reader has to
-            // give up mid-line, which is the case a newline-oriented bound cannot cover.
-            val blob = "x".repeat(8_192)
-            repeat(140) { out.write(blob.toByteArray()) }
+            // ~1 MB in one unterminated line, over the reader's 8 MB ceiling only when
+            // repeated: 9 such blobs cross the bound mid-line, which is the case a
+            // newline-oriented bound cannot cover.
+            val blob = "x".repeat(1_048_576)
+            repeat(9) { out.write(blob.toByteArray()) }
         }.use { server ->
             val result = stream(server.port)
 

@@ -740,19 +740,39 @@ open class RelayApi(
          * How many raw stream bytes are read before the read is abandoned.
          *
          * The buffered path refuses a body past [MAX_RESPONSE_BYTES]; the streaming path
-         * gets the same bound on its wire bytes, and for the same reason — a relay that
-         * never sent `[DONE]`, or an endpoint that answered `text/event-stream` and then
-         * streamed something else, must hit a wall instead of growing a buffer forever.
+         * needs the same kind of wall — a relay that never sent `[DONE]`, or an endpoint
+         * that answered `text/event-stream` and then streamed something else, must hit a
+         * bound instead of growing a buffer forever — but it is not the same number, and
+         * the difference is the whole point of this constant.
          *
          * The ceiling's job is memory, not judging the answer. Reasoning models stream
-         * thousands of `reasoning_content`/`thinking` frames before any answer text, each
-         * frame a couple of hundred bytes of JSON framing; the old 256 KB wire bound
-         * measured that framing and killed perfectly sane challenges whose answer is
-         * ~300 numbers — a couple of kilobytes. Those frames are discarded per line by
-         * the extractor and never accumulate, so the bound that judges the answer itself
-         * is [MAX_STREAM_ANSWER_CHARS], not this one.
+         * thousands of `reasoning_content`/`thinking` frames before any answer text, and
+         * every frame pays JSON framing on the wire: measured 58 bytes for a two-character
+         * token frame, ~350 for a couple of hundred characters of reasoning. Those frames
+         * are discarded per line by the extractor and never accumulate, so a megabyte of
+         * this bound is spent after roughly three to seven thousand frames of reasoning —
+         * reachable by any long chain of thought, and the challenge it kills has an answer
+         * of ~300 numbers, a couple of kilobytes. The old 256 KB bound was this mistake one
+         * turn earlier; 1 MB only moved the wall to where a slow, thorough model still
+         * crosses it, and the user sees the same wrong verdict ("stream too large") for an
+         * answer that was never large.
+         *
+         * 8 MB is sized against the framing, not the answer. The challenge asks for a few
+         * hundred numbers, but it is sent `max_tokens = 8192`, and a reasoning model may
+         * spend every one of them thinking before it answers: at ~350 bytes per framed
+         * reasoning step that is ~2.9 MB of wire for an answer under 32 KB of text — the
+         * 1 MB bound could not hold one full-budget chain of thought. 8 MB holds that with
+         * ~2.7x headroom, i.e. ~25k-55k frames depending on step size, and matches
+         * [com.relaytester.app.core.fingerprint.FingerprintBankStore]'s own ceiling for a
+         * large file, so the app has one "biggest thing it will hold" number rather than
+         * two. The three challenges of a round run concurrently, so the transient worst
+         * case is three of these, ~24 MB, the same order as one detection package. A relay
+         * that crosses 8 MB inside the challenge's 245 s call timeout (>34 KB/s of framing)
+         * is not delivering an answer this app can score, and that timeout is the wall
+         * which catches it; this one is the guard against a stream that never ends. The
+         * bound that judges the answer itself is [MAX_STREAM_ANSWER_CHARS], not this one.
          */
-        const val MAX_STREAM_BYTES = 1_048_576L
+        const val MAX_STREAM_BYTES = 8_388_608L
 
         /**
          * How many characters of extracted answer text are accumulated before the rest
