@@ -26,13 +26,21 @@ import org.junit.Test
 /**
  * Reordering the suppliers.
  *
- * The order that matters is the profiles list's own, so what is pinned here is the whole
- * road: which slot a move lands in, that the state and the stored list agree, that a
- * refused write restores the order the user had, and that a drag event that no longer
- * resolves against the live list does nothing instead of moving something else.
+ * The primitive is "put this supplier in the slot at index k", and that being a **position**
+ * rather than a partner to swap with is the fix for the reported defect, so it is pinned
+ * here rather than described: the drag resolves its target from where the finger is, and a
+ * finger that has not moved names the same slot again. Under a positional primitive that
+ * repeat is a no-op; under the relative "swap with that row" this replaced it named the
+ * neighbour the row had just left and moved it straight back — two rows bouncing for as long
+ * as the finger stayed put, which is what the report showed.
  *
- * The panel itself (the drag threshold, the animation) is measured on the device; a JVM
- * test has no pointer and no layout.
+ * What the file pins is therefore: which slot a move lands in, that a repeat of the same
+ * target cannot undo it, that the state and the stored list agree, that a refused write
+ * restores the order the user had, and that a target outside the list is clamped instead of
+ * throwing.
+ *
+ * The panel itself (the finger-to-slot conversion, the animation) is a source contract in
+ * DialogWindowContractTest and a device measurement; a JVM test has no pointer and no layout.
  */
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class SupplierOrderTest {
@@ -48,14 +56,14 @@ class SupplierOrderTest {
         Dispatchers.resetMain()
     }
 
-    // ---- The move lands where it says --------------------------------------
+    // ---- The move lands in the slot it names ------------------------------
 
     @Test
-    fun `a move takes the slot of the supplier it names`() {
+    fun `a move puts the row in the slot it names`() {
         val store = RecordingStore()
         val subject = viewModel(store, "a", "b", "c")
 
-        subject.moveSupplier(supplierId = "c", targetId = "a")
+        subject.moveSupplierTo(supplierId = "c", targetIndex = 0)
 
         assertEquals(listOf("c", "a", "b"), subject.uiState.value.suppliers.map { it.id })
         // 落盘跑在 Dispatchers.IO 上（真调度器），测试调度器不会等它；与
@@ -72,22 +80,66 @@ class SupplierOrderTest {
         val store = RecordingStore()
         val subject = viewModel(store, "a", "b", "c")
 
-        subject.moveSupplier(supplierId = "a", targetId = "c")
+        subject.moveSupplierTo(supplierId = "a", targetIndex = 2)
 
         assertEquals(listOf("b", "c", "a"), subject.uiState.value.suppliers.map { it.id })
         assertEquals(listOf("b", "c", "a"), awaitSaved(store).map { it.id })
     }
 
+    // ---- The bounce cannot happen any more --------------------------------
+
     @Test
-    fun `a move onto itself changes nothing and writes nothing`() {
+    fun `a repeated event naming the same slot cannot move the row back`() {
+        // 这正是用户报的缺陷的回归用例。拖动时每个指针事件都算一次「指尖在哪一格」，手指停住
+        // 时这些事件反复报同一格；换位本身会让界面重排，落后于重排的事件也会报同一格。位置语义
+        // 下「在第 0 格」重复说出就是不动；原来的相对语义（「和那一行换」）会把同一句话说成
+        // 「回到刚才那行去」，两行于是来回替换。
+        val store = RecordingStore()
+        val subject = viewModel(store, "a", "b", "c")
+
+        subject.moveSupplierTo(supplierId = "c", targetIndex = 0)
+        assertEquals(listOf("c", "a", "b"), subject.uiState.value.suppliers.map { it.id })
+        awaitSaved(store)
+        val savesAfterFirstMove = store.saveCount
+
+        // 手指停在原地时接连到来的一串事件。
+        repeat(8) { subject.moveSupplierTo(supplierId = "c", targetIndex = 0) }
+        settle()
+
+        assertEquals(
+            "同一格被重复点名时行必须留在那一格：两行来回替换就是从这里来的",
+            listOf("c", "a", "b"),
+            subject.uiState.value.suppliers.map { it.id },
+        )
+        assertEquals("停在原地的重复事件不该再落盘", savesAfterFirstMove, store.saveCount)
+    }
+
+    @Test
+    fun `a move onto the slot the row already holds changes nothing and writes nothing`() {
         val store = RecordingStore()
         val subject = viewModel(store, "a", "b")
 
-        subject.moveSupplier(supplierId = "a", targetId = "a")
+        subject.moveSupplierTo(supplierId = "a", targetIndex = 0)
         settle()
 
         assertEquals(listOf("a", "b"), subject.uiState.value.suppliers.map { it.id })
         assertFalse("原地移动不该落盘", store.saveCount > 0)
+    }
+
+    @Test
+    fun `an index outside the list is clamped to its ends`() {
+        // 拖到列表外面就是「放到最前／最后」：换算越出可见行是常事，接受它并夹住比让调用方
+        // 自己保证范围更省事，也免得越界直接崩在 UI 事件里。
+        val store = RecordingStore()
+        val subject = viewModel(store, "a", "b", "c")
+
+        subject.moveSupplierTo(supplierId = "a", targetIndex = 99)
+        settle()
+        assertEquals(listOf("b", "c", "a"), subject.uiState.value.suppliers.map { it.id })
+
+        subject.moveSupplierTo(supplierId = "a", targetIndex = -3)
+        settle()
+        assertEquals(listOf("a", "b", "c"), subject.uiState.value.suppliers.map { it.id })
     }
 
     @Test
@@ -98,8 +150,7 @@ class SupplierOrderTest {
         val store = RecordingStore()
         val subject = viewModel(store, "a", "b")
 
-        subject.moveSupplier(supplierId = "a", targetId = "gone")
-        subject.moveSupplier(supplierId = "gone", targetId = "a")
+        subject.moveSupplierTo(supplierId = "gone", targetIndex = 1)
         settle()
 
         assertEquals(listOf("a", "b"), subject.uiState.value.suppliers.map { it.id })
@@ -114,7 +165,7 @@ class SupplierOrderTest {
         val subject = viewModel(store, "a", "b", "c")
         store.failSaves = true
 
-        subject.moveSupplier(supplierId = "c", targetId = "a")
+        subject.moveSupplierTo(supplierId = "c", targetIndex = 0)
         settle()
 
         assertEquals(
@@ -127,11 +178,11 @@ class SupplierOrderTest {
     @Test
     fun `a later move after a failed one still works`() {
         // The rollback restores the list, not a copy that the next move would append to:
-        // a failed swap must not corrupt the following one.
+        // a failed move must not corrupt the following one.
         val store = RecordingStore()
         val subject = viewModel(store, "a", "b", "c")
         store.failSaves = true
-        subject.moveSupplier(supplierId = "c", targetId = "a")
+        subject.moveSupplierTo(supplierId = "c", targetIndex = 0)
         settle()
         store.failSaves = false
 
@@ -139,7 +190,7 @@ class SupplierOrderTest {
         // baseline this assertion races the IO write and reads the empty list the refused
         // save left behind.
         val savesBefore = store.saveCount
-        subject.moveSupplier(supplierId = "b", targetId = "a")
+        subject.moveSupplierTo(supplierId = "b", targetIndex = 0)
 
         assertEquals(listOf("b", "a", "c"), subject.uiState.value.suppliers.map { it.id })
         assertEquals(listOf("b", "a", "c"), awaitSaved(store, savesBefore).map { it.id })
@@ -156,7 +207,7 @@ class SupplierOrderTest {
         val subject = viewModel(store, "a", "b", "c")
         setRunningForTest(subject)
 
-        subject.moveSupplier(supplierId = "c", targetId = "a")
+        subject.moveSupplierTo(supplierId = "c", targetIndex = 0)
         settle()
 
         assertEquals(
@@ -173,7 +224,7 @@ class SupplierOrderTest {
     fun `the stored order is what a fresh read returns`() {
         val store = RecordingStore()
         val subject = viewModel(store, "a", "b", "c")
-        subject.moveSupplier(supplierId = "c", targetId = "a")
+        subject.moveSupplierTo(supplierId = "c", targetIndex = 0)
 
         assertEquals(listOf("c", "a", "b"), awaitSaved(store).map { it.id })
     }

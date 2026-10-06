@@ -90,7 +90,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -102,7 +102,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -414,7 +416,7 @@ fun TesterScreen(
     if (showSupplierOrder) {
         SupplierOrderDialog(
             suppliers = state.suppliers,
-            onMove = viewModel::moveSupplier,
+            onMove = viewModel::moveSupplierTo,
             onDismiss = { showSupplierOrder = false },
         )
     }
@@ -602,9 +604,13 @@ private fun TesterContent(
     }
 }
 
-// 排序面板的行高：固定值让「位移 ÷ 行高」的换算稳定，拖动跨越几行就换几位，
+// 排序面板的行高：固定值让每格的高度一致，指尖落在哪一格就移到哪一格时几何才算得准，
 // 也免得名字长短不一时行高参差。
 private val SUPPLIER_ORDER_ROW_HEIGHT = 56.dp
+
+// 两行之间的行距。换位判据要的是「一格」的间距（行高 + 行距），它由列表的布局信息量出来，
+// 这个常量只在列表里只剩一行可量时兜底。
+private val SUPPLIER_ORDER_ROW_SPACING = 6.dp
 
 private const val INITIAL_DEFERRED_CONTENT_DELAY_MS = 350L
 private const val MAX_MODEL_SOURCES_PER_ENTRY = 32
@@ -959,21 +965,18 @@ private fun SupplierSelector(
  * [onMove] and the stored list follows; the test tab's cards, the balance grid and the
  * fingerprint picker (on its next tab entry) all render that one order.
  *
- * The drag works on ids, not positions: the pointer's target is resolved against the live
- * list when the event arrives, so an event that lands before the recomposition simply
- * resolves to no-op instead of swapping the same two rows back and forth. Rows animate to
- * their new places through `Modifier.animateItem`, and nothing is written until the finger
- * is up — the view model already applied each swap to the UI state on the way, so the
- * animation is the recomposition, not a delayed echo of the disk.
- *
- * The up/down buttons are not a fallback for the drag: a drag target is a fraction of a
- * row's height, which assistive technology cannot be asked to hit. They name the same
- * adjacent supplier the drag would land on.
+ * A drag is judged by **which slot the finger is over**, not by how far the row has
+ * travelled: the finger is converted to root coordinates (so the row's own movement, and
+ * the swap animation, cannot leak into the judgement) and mapped onto the row offsets the
+ * list reports. The target travels as a slot number and the view model clamps it against
+ * the live list, which makes a repeated event resolve to "already there" instead of
+ * swapping back — the bounce the travel-based version produced. Rows animate to their new
+ * places through `Modifier.animateItem`, and nothing is written until the finger is up.
  */
 @Composable
 private fun SupplierOrderDialog(
     suppliers: List<SupplierProfile>,
-    onMove: (String, String) -> Unit,
+    onMove: (String, Int) -> Unit,
     onDismiss: () -> Unit,
 ) {
     // 与供应商配置弹窗同一套几何：卡片占屏宽 94%，内容盒按窗口定尺，遮罩自绘。
@@ -981,6 +984,12 @@ private fun SupplierOrderDialog(
     val maxSheetHeight = (LocalConfiguration.current.screenHeightDp * 0.9f).dp
     val listState = rememberLazyListState()
     var draggingId by remember { mutableStateOf<String?>(null) }
+    // 指尖位置是在「列表视口」这个坐标系里判定的。列表自己不随换位移动，所以同一根手指停在
+    // 同一处，判定出的永远是同一格——换成累加被拖行自己的位移，换位会让行自己挪一格，位移里
+    // 就凭空多出一格，行会立刻往回换（两行来回跳的根因）。视口的顶边在根坐标里量一次即可。
+    var listTopInRoot by remember { mutableFloatStateOf(Float.NaN) }
+    // 只剩一行可量时兜底用的行距；正常路径下格子间距直接量自布局信息。
+    val spacingPx = with(LocalDensity.current) { SUPPLIER_ORDER_ROW_SPACING.toPx() }
 
     Dialog(
         onDismissRequest = onDismiss,
@@ -1017,9 +1026,10 @@ private fun SupplierOrderDialog(
                         LazyColumn(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .weight(1f, fill = false),
+                                .weight(1f, fill = false)
+                                .onGloballyPositioned { listTopInRoot = it.positionInRoot().y },
                             state = listState,
-                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(SUPPLIER_ORDER_ROW_SPACING),
                             contentPadding = PaddingValues(
                                 start = 12.dp,
                                 end = 12.dp,
@@ -1040,14 +1050,27 @@ private fun SupplierOrderDialog(
                                     isDragging = supplier.id == draggingId,
                                     onStartDrag = { draggingId = supplier.id },
                                     onStopDrag = { draggingId = null },
-                                    // 往下拖＝与 steps 行之后的那一行换位，往上拖＝与之前的换。
-                                    // 原语按 id 说，这里每次都按当前位置解引用：事件落在重组之前
-                                    // 就是空操作，不会把别的行换走。
-                                    onMoveOver = { movedId, steps ->
-                                        val at = suppliers.indexOfFirst { it.id == movedId }
-                                        val target = suppliers.getOrNull(at + steps)
-                                            ?: return@SupplierOrderRow
-                                        onMove(movedId, target.id)
+                                    // 换位判据是「指尖落在哪一格」，不是「行了多少行」：行自己会随着
+                                    // 换位挪动，累加它的位移会把换位本身算进去，越拖越乱；格子的位置
+                                    // 只由列表的布局决定，手指不动就不换。落在两格之间按最近的算，
+                                    // 越出列表按两端夹住——拖到列表外面就是「放到最前／最后」。
+                                    onDragAt = { movedId, pointerRootY ->
+                                        val visible = listState.layoutInfo.visibleItemsInfo
+                                        val anchor = visible.firstOrNull()
+                                        if (anchor == null || listTopInRoot.isNaN()) {
+                                            return@SupplierOrderRow
+                                        }
+                                        val pitch = if (visible.size >= 2) {
+                                            (visible[1].offset - visible[0].offset).toFloat()
+                                        } else {
+                                            anchor.size + spacingPx
+                                        }
+                                        if (pitch <= 0f) return@SupplierOrderRow
+                                        val fingerY = pointerRootY - listTopInRoot
+                                        val raw = anchor.index +
+                                            (fingerY - (anchor.offset + anchor.size / 2f)) / pitch
+                                        val slot = raw.roundToInt().coerceIn(0, suppliers.lastIndex)
+                                        onMove(movedId, slot)
                                     },
                                 )
                             }
@@ -1076,41 +1099,24 @@ private fun LazyItemScope.SupplierOrderRow(
     isDragging: Boolean,
     onStartDrag: () -> Unit,
     onStopDrag: () -> Unit,
-    onMoveOver: (String, Int) -> Unit,
+    onDragAt: (String, Float) -> Unit,
 ) {
-    var rowHeightPx by remember { mutableIntStateOf(0) }
-    // 拖动是用「位移除以行高」算的，不是用指针的绝对坐标：LazyColumn 有自己的内边距和滚动
-    // 偏移，拿绝对 y 找行会把两者都算进去（这是这类实现最常见的一处错）。位移只关心跨过了
-    // 几行，行高从测量拿到，与滚动位置无关。
-    //
+    // 指尖要换算到根坐标再交给判定，不能累加行本地的位移：行自己会随着换位挪动，行本地坐标系
+    // 跟着一起动，换位那一下就会在位移里凭空多出一格（反方向），行于是立刻又被换回去——这正是
+    // 「两行一直来回替换」的由来。根坐标只跟手指在哪有关，与行挪没挪无关。
+    var coordinates by remember { mutableStateOf<LayoutCoordinates?>(null) }
     // 手势挂在整行上，不是那个手柄图标上：手柄只有 44dp 宽，手指按住它再拖，起手的一点抖动
-    // 就会滑出它的边界，拖动随即断掉——这正是「拖不动」的由来。整行都是把手以后，按在哪都
-    // 能拖，图标退回成「这里可以拖」的提示。
+    // 就会滑出它的边界，拖动随即断掉。整行都是把手以后，按在哪都能拖，图标退回成「这里可以拖」
+    // 的提示。
     val dragModifier = Modifier.pointerInput(supplier.id) {
-        // 每次手势开始时归零：上一次的残留位移会把第一次换位提前触发。
-        var travelled = 0f
         detectDragGesturesAfterLongPress(
-            onDragStart = {
-                travelled = 0f
-                onStartDrag()
-            },
+            onDragStart = { onStartDrag() },
             onDragEnd = { onStopDrag() },
             onDragCancel = { onStopDrag() },
-            onDrag = { change, dragAmount ->
+            onDrag = { change, _ ->
                 change.consume()
-                travelled += dragAmount.y
-                val row = rowHeightPx
-                if (row <= 0) return@detectDragGesturesAfterLongPress
-                // 半个行高＝两行的中点，跨过它才换位；正负号就是方向——往下拖为正，
-                // 往上拖为负。步数带符号整段交给回调，一次跳到位：拆成逐行调用的话，
-                // 第二次解引用读到的还是重组前的同一份列表，两步会互相抵消。
-                val steps = (travelled / row).roundToInt()
-                if (steps != 0) {
-                    onMoveOver(supplier.id, steps)
-                    // 跨过的行数整段减掉：目标行不存在（已到列表边缘）时不换位，但位移
-                    // 照减，免得残量在边缘越积越多、一拖就连跳。
-                    travelled -= steps * row
-                }
+                val box = coordinates ?: return@detectDragGesturesAfterLongPress
+                onDragAt(supplier.id, box.localToRoot(change.position).y)
             },
         )
     }
@@ -1121,7 +1127,7 @@ private fun LazyItemScope.SupplierOrderRow(
             // 换位动画：供应商列表是这一份顺序的三个投影之一，交换位置时行是平移过去的，
             // 不是原地闪一下。
             .animateItem()
-            .onSizeChanged { rowHeightPx = it.height }
+            .onGloballyPositioned { coordinates = it }
             .then(dragModifier)
             .semantics { contentDescription = "拖动排序 ${supplier.name}" },
         color = if (isDragging) {

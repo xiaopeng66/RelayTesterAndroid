@@ -2069,28 +2069,33 @@ class TesterViewModel(
     }
 
     /**
-     * Moves one supplier into the slot another one currently occupies. That is the
-     * whole reorder primitive, stated by ids on purpose: a drag says "drop this row
-     * where that row sits" and the up/down buttons name the adjacent supplier, and
-     * because the resolution happens against the live list, a pointer event that
-     * arrives before the recomposition lands simply resolves to no-op instead of
-     * swapping the two rows back.
+     * Puts one supplier in the slot at [targetIndex], clamped to the list, resolved
+     * against the live list when the call lands.
      *
-     * Supplier order is the profiles list's own order — there is no separate rank
-     * field — so every surface that renders that list (the test tab's cards, the
-     * balance grid, the fingerprint picker after its tab-entry refresh) follows at
-     * once. The swap reaches the UI state before the save, because a drag must not
-     * wait on disk; a failed save rolls the whole move back, the same discipline as
-     * [deleteSupplier]. Rapid swaps inside one gesture queue behind the same write
-     * mutex and each snapshot carries every earlier one, so the last write lands the
-     * final order rather than an intermediate one.
+     * Stated as a **position** rather than as a partner to swap with, and that is the fix
+     * for a real defect rather than a style choice: the drag resolves its target from where
+     * the finger is, and a finger that has not moved keeps naming the same slot. A pointer
+     * event that arrives before the recomposition lands therefore asks for the slot the row
+     * already holds, which is a no-op here. The id-based move this replaces was relative —
+     * "swap with that neighbour" — so the same repeated event named the neighbour the row
+     * had just left and moved it straight back: two rows bouncing up and down for as long as
+     * the finger stayed put (or drifted slowly), which is exactly what it looked like.
+     *
+     * Supplier order is the profiles list's own order — there is no separate rank field — so
+     * every surface that renders that list (the test tab's cards, the balance grid, the
+     * fingerprint picker after its tab-entry refresh) follows at once. The move reaches the
+     * UI state before the save, because a drag must not wait on disk; a failed save rolls
+     * the whole move back, the same discipline as [deleteSupplier]. Rapid moves inside one
+     * gesture queue behind the same write mutex and each snapshot carries every earlier one,
+     * so the last write lands the final order rather than an intermediate one.
      */
-    fun moveSupplier(supplierId: String, targetId: String) {
+    fun moveSupplierTo(supplierId: String, targetIndex: Int) {
         if (runningOrInitializing()) return
         viewModelScope.launch {
             val from = profiles.indexOfFirst { it.id == supplierId }
-            val to = profiles.indexOfFirst { it.id == targetId }
-            if (from < 0 || to < 0 || from == to) return@launch
+            if (from < 0) return@launch
+            val to = targetIndex.coerceIn(0, profiles.lastIndex)
+            if (from == to) return@launch
             val previousProfiles = profiles.toMutableList()
             profiles.add(to, profiles.removeAt(from))
             _uiState.update { it.copy(suppliers = profiles.toList()) }

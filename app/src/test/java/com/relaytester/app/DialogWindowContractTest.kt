@@ -207,29 +207,38 @@ class DialogWindowContractTest {
     }
 
     @Test
-    fun `the drag converts its travel into rows, not into a fixed step`() {
-        // 拖动的换位判据是「位移除以行高」，行高来自测量。JVM 测试没有指针也没有布局，
-        // SupplierOrderTest 只能测原语，测不到这行换算——把它写死成 0（或任何常数）时那些
-        // 测试仍然是绿的，而排序在设备上会彻底失灵。所以这里钉住的是那行换算本身：它必须读
-        // 一个变化量、除以一个测量出来的高度，并且用四舍五入（半个行高＝两行中点）。
+    fun `the drag resolves the slot under the finger, from a frame the row cannot move`() {
+        // 拖动的换位判据是「指尖落在哪一格」。这句话有三个承重件，任何一件错了都只有设备上才
+        // 看得出来，而 SupplierOrderTest 只测得到原语（把换算写死成常数，那些测试照样全绿）：
+        //
+        // ① 指尖必须换算到根坐标。行自己会随着换位挪动，行本地坐标系跟着一起动，用行本地坐标
+        //    就等价于「累加被拖行自己的位移」——换位那一下会在位移里凭空多出一格，行立刻又被
+        //    换回去，两行就这么一直来回替换（用户报的就是这个）。
+        // ② 根坐标要减掉列表视口的顶边，换算到「列表内第几格」这个尺度上；视口自己不随换位
+        //    移动，所以手指不动，落格就不动。
+        // ③ 落格要四舍五入（半格＝两格中点），并夹在两端——拖出列表就是放到最前／最后。
+        //
+        // 格子间距量自列表布局（itemsInfo 的相邻 offset 之差），不是写死的行高：行距一改，
+        // 换算不该跟着失准。
         val file = File(sourceRoot, "com/relaytester/app/feature/tester/TesterScreen.kt")
         assertTrue("找不到 TesterScreen.kt：${file.absolutePath}", file.isFile)
         val text = code(file)
         assertTrue(
-            "排序面板里没有「位移 ÷ 行高」的换算：跨半行就换位这条手感失去了依据",
-            Regex("""val steps = \(travelled / row\)\.roundToInt\(\)""").containsMatchIn(text),
+            "指尖没有换算到根坐标（localToRoot）：用行本地坐标等于累加被拖行自己的位移，" +
+                "换位会在位移里凭空多出一格，两行会一直来回替换",
+            "localToRoot(change.position).y" in text,
         )
         assertTrue(
-            "行高没有从测量拿到（onSizeChanged）：换算会一直用 0，拖动完全不动",
-            "onSizeChanged { rowHeightPx = it.height }" in text,
+            "根坐标没有减掉列表视口的顶边：同一根手指在不同滚动位置上会算出不同的格子",
+            "pointerRootY - listTopInRoot" in text,
         )
         assertTrue(
-            "每次手势开始没有把位移归零：上一次的残留会让第一次换位提前触发",
-            "travelled = 0f" in text,
+            "没有用四舍五入落格：半格处不换位，拖到两行之间时换位会迟一格",
+            Regex("""\.roundToInt\(\)\.coerceIn\(0, suppliers\.lastIndex\)""").containsMatchIn(text),
         )
         assertTrue(
-            "拖动方向丢了符号：abs 之后的步数分不出往上还是往下，往上拖会与下一行换位",
-            "onMoveOver(supplier.id, steps)" in text,
+            "格子间距没有量自列表布局（相邻行的 offset 之差）：行距一改换算就失准",
+            "visible[1].offset - visible[0].offset" in text,
         )
     }
 
@@ -251,7 +260,7 @@ class DialogWindowContractTest {
             "contentDescription = \"拖动排序 " in text,
         )
         assertTrue(
-            "行高没有固定：名字长短不一时行高参差，「位移 ÷ 行高」的换算随之失准",
+            "行高没有固定：名字长短不一时行高参差，「指尖落在哪一格」的几何随之失准",
             "SUPPLIER_ORDER_ROW_HEIGHT" in text,
         )
     }
