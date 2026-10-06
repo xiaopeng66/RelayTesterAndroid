@@ -98,8 +98,20 @@ android {
         // instead of the top. A reasoning model's stream no longer fails the detection: the
         // wire ceiling stops judging the answer (reasoning frames used to spend it), and the
         // answer text gets its own bound instead.
-        versionCode = 10_702
-        versionName = "1.7.2"
+        // 10703 makes the reorder panel actually draggable: the gesture hung on the 44dp grip
+        // icon, so the first wobble slid off it and the drag died. The whole row is the handle
+        // now, the arrows are gone, the rows animate when they swap, and the panel's card no
+        // longer carries the 44dp top padding that pushed its footer off the screen (the
+        // template editor dialog had the same padding and the same clipped bottom). The
+        // balance editor's two selectors fill with the primary colour when chosen, its script
+        // field starts empty with a button that fills the example on demand, and a failed
+        // configuration write is retried once so the next save cannot store the order its
+        // caller just rolled back. Both supplier editors (config, balance credentials) close
+        // themselves once a save succeeds — the user used to have to tap 关闭 afterwards — and
+        // the save confirmation is a shared StatusToast drawn on the page, not a snackbar
+        // trapped under the still-open dialog's scrim.
+        versionCode = 10_703
+        versionName = "1.7.3"
         ndk {
             // arm64 only: the published update ships one APK, and every device the app is
             // meant for is arm64. The 32-bit and x86 ABIs would each add a copy of the two
@@ -164,6 +176,8 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
+    // 供应商排序面板的换位动画来自 foundation 的 animateItem（BOM 2024.12.01 起叫这个名字）。
+    implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.8.7")

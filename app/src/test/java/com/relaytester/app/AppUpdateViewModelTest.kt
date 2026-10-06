@@ -58,8 +58,16 @@ class AppUpdateViewModelTest {
 
     @After
     fun tearDown() {
+        // 每条用例都会把常驻定时器留在类共用的那个虚拟调度器上，而新用例通常不重新赋值
+        // scheduler（同一个实例贯穿全区）。测试类里跑出来的那条偶发红就落在这个缺口上，
+        // 所以这里统一收尾：不清就是二十来个定时器在同一个调度器上排队。
+        active.forEach { it.cancelPeriodicCheck() }
+        active.clear()
         Dispatchers.resetMain()
     }
+
+    /** 每个建出来的实例都登记在案，好在测试结束时把它的定时器停掉。 */
+    private val active = mutableListOf<AppUpdateViewModel>()
 
     private fun viewModel(
         fetcher: FakeHttpFetcher = FakeHttpFetcher(),
@@ -73,7 +81,7 @@ class AppUpdateViewModelTest {
         installed = installedVersion,
         ioDispatcher = dispatcher,
         clock = { now },
-    )
+    ).also(active::add)
 
     private fun settle(subject: AppUpdateViewModel) = runBlocking { subject.awaitIdle() }
 

@@ -153,6 +153,19 @@ class AppUpdateViewModel(
         preferenceJob?.join()
     }
 
+    /**
+     * Stops the periodic check; used by tests.
+     *
+     * The timer is started by [checkOnLaunch] and lives as long as the view model does. Every
+     * instance in a test class shares one virtual scheduler, so timers left running by the
+     * tests that came before are still queued on it while later tests run. [onCleared] is
+     * what does this in the app; it is protected, so tests need a door of their own rather
+     * than a reflection trick.
+     */
+    internal fun cancelPeriodicCheck() {
+        timerJob?.cancel()
+    }
+
     override fun onCleared() {
         // The timer is the only thing here that would otherwise outlive the activity.
         timerJob?.cancel()

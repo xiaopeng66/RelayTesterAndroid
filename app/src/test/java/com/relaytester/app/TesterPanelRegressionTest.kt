@@ -226,6 +226,112 @@ class TesterPanelRegressionTest {
         assertTrue("摘要必须标为错误", state.isMessageError)
     }
 
+    // ---- Switching suppliers reports whether it landed --------------------
+
+    @Test
+    fun `an idle switch reports success to the caller that armed an editor`() {
+        // 两个「编辑」入口都靠这个回报决定要不要记下弹窗 id。以前 selectSupplier 没有
+        // 回报，它们只能先记后切——切换被拒或写盘失败时 id 留在原地，之后这个站点因别
+        // 的原因变成活动站点时，编辑弹窗会自己蹦出来。
+        val subject = viewModel()
+        seedRunnableState(subject, secondSupplier = true)
+
+        var reported: Boolean? = null
+        subject.selectSupplier("supplier-2") { reported = it }
+        runBlocking { delay(300) }
+
+        assertEquals("成功的切换必须回报 true", true, reported)
+        assertEquals("supplier-2", subject.uiState.value.activeSupplierId)
+    }
+
+    @Test
+    fun `re-selecting the active supplier reports success without a write`() {
+        // 编辑入口对「当前站点」点开也必须能开：这条路径不碰磁盘，所以运行中也成立。
+        val subject = viewModel()
+        seedRunnableState(subject)
+
+        var reported: Boolean? = null
+        subject.selectSupplier("supplier-1") { reported = it }
+
+        assertEquals("已是活动站点＝成功", true, reported)
+    }
+
+    @Test
+    fun `a switch refused while a run is in flight reports failure`() {
+        val subject = viewModel()
+        seedRunnableState(subject, secondSupplier = true)
+        setRunningForTest(subject)
+
+        var reported: Boolean? = null
+        subject.selectSupplier("supplier-2") { reported = it }
+
+        assertEquals("被拒绝的切换必须回报 false", false, reported)
+        assertEquals("supplier-1", subject.uiState.value.activeSupplierId)
+    }
+
+    // ---- The picker's fetch result is visible inside the dialog -----------
+
+    @Test
+    fun `a failed catalog fetch leaves its reason where the dialog renders it`() {
+        // 拉取失败以前只写页面级 message，而那个 snackbar 住在活动窗口里、被弹窗自己的
+        // 窗口盖住：用户看到的是「转完圈后什么也没发生」。
+        val subject = viewModel(FailingModelsApi("连接供应商失败"))
+        seedEntry(subject, ModelSource("supplier-1", "model-a"))
+
+        subject.fetchCatalogModels("supplier-1")
+        runBlocking { delay(200) }
+
+        val state = subject.uiState.value
+        assertEquals("连接供应商失败", state.catalogPickerMessage)
+        assertTrue("失败必须标红", state.isCatalogPickerMessageError)
+        assertTrue("拉取已结束", !state.isCatalogFetching)
+    }
+
+    @Test
+    fun `a successful catalog fetch reports the count on the same line`() {
+        val subject = viewModel(ModelsApi(listOf("model-a", "model-b")))
+        seedEntry(subject, ModelSource("supplier-1", "model-a"))
+
+        subject.fetchCatalogModels("supplier-1")
+        runBlocking { delay(200) }
+
+        val state = subject.uiState.value
+        assertEquals("已拉取 2 个模型", state.catalogPickerMessage)
+        assertTrue("成功不得标红", !state.isCatalogPickerMessageError)
+    }
+
+    @Test
+    fun `an empty catalog answers on the same line and reads as a problem`() {
+        val subject = viewModel(ModelsApi(emptyList()))
+        seedEntry(subject, ModelSource("supplier-1", "model-a"))
+
+        subject.fetchCatalogModels("supplier-1")
+        runBlocking { delay(200) }
+
+        val state = subject.uiState.value
+        assertEquals("该供应商未返回模型", state.catalogPickerMessage)
+        assertTrue(state.isCatalogPickerMessageError)
+    }
+
+    @Test
+    fun `a fetch refused for a missing key answers where the dialog renders it`() {
+        // 这条拒绝也发生在弹窗开着时：只写页面级 message 的话，用户点「拉取」看到的是
+        // 什么都没发生。理由必须落进弹窗渲染的那条状态。
+        val subject = viewModel()
+        setProfileForTest(subject, apiKeySecretId = null)
+        setPickerStateForTest(subject)
+
+        subject.fetchCatalogModels("supplier-1")
+        runBlocking { delay(200) }
+
+        val state = subject.uiState.value
+        assertTrue(
+            "未保存 API Key 的拒绝没有落在弹窗状态上：${state.catalogPickerMessage}",
+            state.catalogPickerMessage?.contains("API Key") == true,
+        )
+        assertTrue(state.isCatalogPickerMessageError)
+    }
+
     // ---- Harness ---------------------------------------------------------
 
     private fun viewModel(
@@ -260,7 +366,7 @@ class TesterPanelRegressionTest {
         )
     }
 
-    private fun setProfileForTest(subject: TesterViewModel) {
+    private fun setProfileForTest(subject: TesterViewModel, apiKeySecretId: String? = "secret-1") {
         val field = TesterViewModel::class.java.getDeclaredField("profiles")
         field.isAccessible = true
         @Suppress("UNCHECKED_CAST")
@@ -270,10 +376,23 @@ class TesterPanelRegressionTest {
             name = "supplier-1",
             baseUrl = "https://relay.test/v1",
             protocol = com.relaytester.app.core.model.RelayProtocol.CHAT_COMPLETIONS,
-            apiKeySecretId = "secret-1",
+            apiKeySecretId = apiKeySecretId,
             models = listOf("model-a"),
             testSettings = TestSettings(),
         )
+    }
+
+    /**
+     * Clears the boot-time guard so a fetch can actually run. Deliberately leaves the draft
+     * empty: fetchCatalogModels then falls back to the stored secret, which is what the
+     * missing-key path has to answer for — a draft with a typed key would never reach it.
+     */
+    private fun setPickerStateForTest(subject: TesterViewModel) {
+        val field = TesterViewModel::class.java.getDeclaredField("_uiState")
+        field.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val state = field.get(subject) as MutableStateFlow<TesterUiState>
+        state.value = state.value.copy(isInitializing = false)
     }
 
     private fun setResultsForTest(subject: TesterViewModel, results: List<ModelTestResult>) {
@@ -282,6 +401,15 @@ class TesterPanelRegressionTest {
         @Suppress("UNCHECKED_CAST")
         val state = field.get(subject) as MutableStateFlow<TesterUiState>
         state.value = state.value.copy(isInitializing = false, results = results)
+    }
+
+    /** Puts the panel in the state a run leaves it in, which is what the guards read. */
+    private fun setRunningForTest(subject: TesterViewModel) {
+        val stateField = TesterViewModel::class.java.getDeclaredField("_uiState")
+        stateField.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val state = stateField.get(subject) as MutableStateFlow<TesterUiState>
+        state.value = state.value.copy(isRunning = true)
     }
 
     /**
@@ -346,7 +474,7 @@ class TesterPanelRegressionTest {
     }
 
     /** A panel with one real supplier, one ticked model, and an editable draft. */
-    private fun seedRunnableState(subject: TesterViewModel) {
+    private fun seedRunnableState(subject: TesterViewModel, secondSupplier: Boolean = false) {
         val profile = SupplierProfile(
             id = "supplier-1",
             name = "supplier-1",
@@ -361,7 +489,11 @@ class TesterPanelRegressionTest {
         val field = TesterViewModel::class.java.getDeclaredField("profiles")
         field.isAccessible = true
         @Suppress("UNCHECKED_CAST")
-        (field.get(subject) as MutableList<SupplierProfile>) += profile
+        val profiles = field.get(subject) as MutableList<SupplierProfile>
+        profiles += profile
+        if (secondSupplier) {
+            profiles += profile.copy(id = "supplier-2", name = "supplier-2", models = listOf("model-b"))
+        }
         val stateField = TesterViewModel::class.java.getDeclaredField("_uiState")
         stateField.isAccessible = true
         @Suppress("UNCHECKED_CAST")
@@ -375,8 +507,21 @@ class TesterPanelRegressionTest {
                 .copy(apiKeyDirty = true),
             activeSupplierId = profile.id,
             selectedModels = setOf("model-a"),
-            suppliers = listOf(profile),
+            suppliers = profiles.toList(),
         )
+        // 切换供应商的路径读的是 ViewModel 自己的 activeSupplierId 字段（不是 UI 状态），
+        // 与 seedBalanceState 一样要把它也种上，否则 persistDraft/persistBalanceCredentials
+        // 找不到活动站点、切换被当作失败回滚。
+        val activeIdField = TesterViewModel::class.java.getDeclaredField("activeSupplierId")
+        activeIdField.isAccessible = true
+        activeIdField.set(subject, profile.id)
+        // balanceOperationBlocked() 的门槛：BalanceUiState 默认从 initializing 起步，
+        // skipRestore 永远不会清它。
+        val balanceStateField = TesterViewModel::class.java.getDeclaredField("_balanceUiState")
+        balanceStateField.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val balanceState = balanceStateField.get(subject) as MutableStateFlow<com.relaytester.app.feature.tester.BalanceUiState>
+        balanceState.value = balanceState.value.copy(isInitializing = false)
     }
 
     private fun awaitCatalogIdle(subject: TesterViewModel) {
@@ -401,6 +546,21 @@ class TesterPanelRegressionTest {
             apiKey: String,
             timeoutSeconds: Int,
         ): ApiResult<List<String>> = ApiResult.Success(models)
+    }
+
+    /** A relay that refuses every directory fetch with [reason]. */
+    private class FailingModelsApi(private val reason: String) : RelayApi() {
+        override suspend fun fetchModels(
+            profile: SupplierProfile,
+            apiKey: String,
+            timeoutSeconds: Int,
+        ): ApiResult<List<String>> = ApiResult.Failure(
+            com.relaytester.app.core.model.TestError(
+                com.relaytester.app.core.model.ErrorKind.NETWORK,
+                reason,
+            ),
+            null,
+        )
     }
 
     /** A relay that answers every test after [holdMs], so a round stays in flight. */

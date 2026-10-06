@@ -35,12 +35,6 @@
 - 修复更新通道的提示（发现新版本、失败原因、安装错误）没有任何界面在读的问题。
 - 修复 `optimized` 变体的版本名带 `-optimized` 后缀、在更新页读起来像另一个版本的问题。
 
-## 说明
-
-- 检测结果是**参考库内的封闭集合排序，不是身份证明**：不在库中的模型同样会得到最接近的候选，同家族相邻版本尤其难以区分。
-- 应用自身更新的下载链路**不使用**供应商请求那条同源重定向策略，因为 GitHub 的资产会跳到 `objects.githubusercontent.com` 而这条链路不携带任何凭据。
-- 移植自 [lm-detector](https://github.com/Ikaleio/lm-detector)（MIT License, Copyright (c) 2026 xqy2006），检测包算法与上游 `shared-detector-v1` 对齐，端侧实现与参数量化带来的差异已在 `THIRD_PARTY_NOTICES.md` 中如实声明。
-
 ## 下载
 
 - 文件：`RelayTester-v1.6.0-android.apk`

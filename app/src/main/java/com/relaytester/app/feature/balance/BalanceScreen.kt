@@ -50,6 +50,7 @@ import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -70,6 +71,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -91,6 +93,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -112,10 +115,12 @@ import com.relaytester.app.feature.tester.TesterViewModel
 import com.relaytester.app.ui.navigation.AppDestination
 import com.relaytester.app.ui.components.DialogDismissScrim
 import com.relaytester.app.ui.components.RelayAppHeader
+import com.relaytester.app.ui.components.StatusToast
 import com.relaytester.app.ui.components.rememberDialogWindowBox
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
+import kotlinx.coroutines.launch
 
 private val BALANCE_SUPPLIER_CARD_HEIGHT = 112.dp
 private val BALANCE_RING_SLOT_SIZE = 44.dp
@@ -133,6 +138,16 @@ fun BalanceScreen(
     hasAppUpdate: Boolean = false,
 ) {
     val state by viewModel.balanceUiState.collectAsStateWithLifecycle()
+    // 切换供应商要重写草稿与凭据，ViewModel 在模型测试运行中会拒掉这个动作
+    // （runningOrInitializing）。余额页只收 balanceUiState，看不见那条链在跑；卡片亮着
+    // 而点击被吞，用户只会觉得「点了没反应」。把同一把锁的可见部分收在这里，拒绝时说
+    // 出原因。卡片本身不禁用：双击刷新走的是另一条链，测试在跑时仍然可用。
+    val testerState by viewModel.uiState.collectAsStateWithLifecycle()
+    val siteSwitchLocked = testerState.isRunning ||
+        testerState.isUnifiedTesting ||
+        testerState.isInitializing ||
+        testerState.isSecretsHydrating
+    val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
 
     LaunchedEffect(state.message) {
@@ -152,7 +167,16 @@ fun BalanceScreen(
         hasAppUpdate = hasAppUpdate,
         onQuery = viewModel::queryBalance,
         onQueryAll = viewModel::queryAllBalances,
-        onSelectSupplier = viewModel::selectSupplier,
+        onSelectSupplier = { supplierId, onActivated ->
+            if (siteSwitchLocked) {
+                scope.launch {
+                    snackbarHostState.showSnackbar("模型测试正在运行，暂时不能切换供应商")
+                }
+                onActivated(false)
+            } else {
+                viewModel.selectSupplier(supplierId, onActivated)
+            }
+        },
         onRefreshSupplierBalance = viewModel::refreshSupplierBalance,
         onAccessTokenChange = viewModel::updateBalanceAccessToken,
         onUserIdChange = viewModel::updateBalanceUserId,
@@ -164,6 +188,9 @@ fun BalanceScreen(
         onDeleteTemplate = viewModel::deleteBalanceTemplate,
         isQuerying = state.isQuerying,
         isSecretsHydrating = state.isSecretsHydrating,
+        // 编辑器开着时它自己托管同一个 state（消息要落在弹窗那一层窗口里）。两个宿主
+        // 同时在组合里会让同一条消息被渲染两次——与更新弹窗同一条互斥规则。
+        editorOpen = editor != null,
         snackbarHostState = snackbarHostState,
         modifier = modifier,
     )
@@ -204,11 +231,11 @@ private fun BalanceHome(
     hasAppUpdate: Boolean,
     onQuery: () -> Unit,
     onQueryAll: () -> Unit,
-    onSelectSupplier: (String) -> Unit,
+    onSelectSupplier: (String, (Boolean) -> Unit) -> Unit,
     onRefreshSupplierBalance: (String) -> Unit,
     onAccessTokenChange: (String) -> Unit,
     onUserIdChange: (String) -> Unit,
-    onSaveCredentials: () -> Unit,
+    onSaveCredentials: (() -> Unit) -> Unit,
     onDismissCredentials: () -> Unit,
     onTemplateSelected: (String) -> Unit,
     onNewTemplate: () -> Unit,
@@ -216,11 +243,16 @@ private fun BalanceHome(
     onDeleteTemplate: (String) -> Unit,
     isQuerying: Boolean,
     isSecretsHydrating: Boolean,
+    /** 模板编辑器开着时页面宿主让位：那条消息由编辑器窗口自己渲染。 */
+    editorOpen: Boolean,
     snackbarHostState: SnackbarHostState,
     modifier: Modifier,
 ) {
-    var templateToDelete by remember { mutableStateOf<BalanceQueryTemplate?>(null) }
+    // 存 id 而不是对象：旋转恢复时模板列表重新读入，旧实例对不上；与凭据弹窗的
+    // credentialsSupplierId 同为 saveable，旋转时确认框不能只剩一个空壳。
+    var templateToDeleteId by rememberSaveable { mutableStateOf<String?>(null) }
     var credentialsSupplierId by rememberSaveable { mutableStateOf<String?>(null) }
+    var credentialsSavedAt by rememberSaveable { mutableStateOf(0L) }
     val activeSupplier = state.suppliers.firstOrNull { it.id == state.activeSupplierId }
     val selectedTemplate = state.templates.firstOrNull { it.id == activeSupplier?.balanceTemplateId }
         ?: state.templates.firstOrNull()
@@ -238,71 +270,96 @@ private fun BalanceHome(
             )
         },
         snackbarHost = {
-            SnackbarHost(
-                hostState = snackbarHostState,
-                modifier = Modifier,
-            )
+            if (!editorOpen) {
+                SnackbarHost(
+                    hostState = snackbarHostState,
+                    modifier = Modifier,
+                )
+            }
         },
     ) { innerPadding ->
-        if (state.isInitializing) {
-            Box(
-                modifier = Modifier.fillMaxSize().padding(innerPadding),
-                contentAlignment = Alignment.Center,
-            ) {
-                CircularProgressIndicator()
+        Box(modifier = Modifier.fillMaxSize()) {
+            if (state.isInitializing) {
+                Box(
+                    modifier = Modifier.fillMaxSize().padding(innerPadding),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    CircularProgressIndicator()
+                }
+            } else {
+                BalanceContent(
+                    suppliers = state.suppliers,
+                    activeSupplier = activeSupplier,
+                    selectedTemplate = selectedTemplate,
+                    templates = state.templates,
+                    snapshots = state.balanceSnapshots,
+                    errors = state.balanceErrors,
+                    isQuerying = isQuerying,
+                    isSecretsHydrating = isSecretsHydrating,
+                    queryingSupplierIds = state.queryingSupplierIds,
+                    batchProgressDone = state.batchProgressDone,
+                    batchProgressTotal = state.batchProgressTotal,
+                    onQuery = onQuery,
+                    onQueryAll = onQueryAll,
+                    onSelectSupplier = onSelectSupplier,
+                    onRefreshSupplierBalance = onRefreshSupplierBalance,
+                    onEditCredentials = { supplierId ->
+                        // 先切站点、切成功才记 id：与测试页同一处修正——切换被拒或写盘
+                        // 失败时留下 id，之后这个站点变成活动站点时弹窗会自己蹦出来。
+                        onSelectSupplier(supplierId) { activated ->
+                            if (activated) credentialsSupplierId = supplierId
+                        }
+                    },
+                    onDismissCredentials = onDismissCredentials,
+                    onTemplateSelected = onTemplateSelected,
+                    onNewTemplate = onNewTemplate,
+                    onEditTemplate = onEditTemplate,
+                    onDeleteTemplate = { templateToDeleteId = it.id },
+                    contentPadding = innerPadding,
+                )
             }
-        } else {
-            BalanceContent(
-                suppliers = state.suppliers,
-                activeSupplier = activeSupplier,
-                selectedTemplate = selectedTemplate,
-                templates = state.templates,
-                snapshots = state.balanceSnapshots,
-                errors = state.balanceErrors,
-                isQuerying = isQuerying,
-                isSecretsHydrating = isSecretsHydrating,
-                queryingSupplierIds = state.queryingSupplierIds,
-                batchProgressDone = state.batchProgressDone,
-                batchProgressTotal = state.batchProgressTotal,
-                onQuery = onQuery,
-                onQueryAll = onQueryAll,
-                onSelectSupplier = onSelectSupplier,
-                onRefreshSupplierBalance = onRefreshSupplierBalance,
-                onEditCredentials = { supplierId ->
-                    credentialsSupplierId = supplierId
-                    onSelectSupplier(supplierId)
-                },
-                onDismissCredentials = onDismissCredentials,
-                onTemplateSelected = onTemplateSelected,
-                onNewTemplate = onNewTemplate,
-                onEditTemplate = onEditTemplate,
-                onDeleteTemplate = { templateToDelete = it },
-                contentPadding = innerPadding,
-            )
+            // 与模型测试页同一条规则：保存成功的提示条画在页面这一层，同一个组件、
+            // 同一个位置、同一个消失时机。以前它走页面底部的 snackbar，会被还开着的
+            // 弹窗压在遮罩下面。
+            //
+            // 纵坐标要叠上 innerPadding：这一层 Box 从窗口顶算起，只按窗口顶 +4dp
+            // 定位，整条提示会藏进不透明的顶栏背后——保存成功也看不见。
+            if (credentialsSavedAt > 0L) {
+                StatusToast(
+                    message = "余额查询凭据已保存",
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = innerPadding.calculateTopPadding() + 4.dp),
+                    onToastShown = { credentialsSavedAt = 0L },
+                )
+            }
         }
     }
 
-    templateToDelete?.let { template ->
-        AlertDialog(
-            onDismissRequest = { templateToDelete = null },
-            title = { Text("删除余额模板？") },
-            text = { Text("解除「${template.name}」与所有供应商的绑定，无法撤销。") },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        templateToDelete = null
-                        onDeleteTemplate(template.id)
-                    },
-                    modifier = Modifier.heightIn(min = 48.dp),
-                ) { Text("删除", color = MaterialTheme.colorScheme.error) }
-            },
-            dismissButton = {
-                TextButton(
-                    onClick = { templateToDelete = null },
-                    modifier = Modifier.heightIn(min = 48.dp),
-                ) { Text("取消") }
-            },
-        )
+    templateToDeleteId?.let { templateId ->
+        val template = state.templates.firstOrNull { it.id == templateId }
+        if (template != null) {
+            AlertDialog(
+                onDismissRequest = { templateToDeleteId = null },
+                title = { Text("删除余额模板？") },
+                text = { Text("解除「${template.name}」与所有供应商的绑定，无法撤销。") },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            templateToDeleteId = null
+                            onDeleteTemplate(template.id)
+                        },
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) { Text("删除", color = MaterialTheme.colorScheme.error) }
+                },
+                dismissButton = {
+                    TextButton(
+                        onClick = { templateToDeleteId = null },
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) { Text("取消") }
+                },
+            )
+        }
     }
     credentialsSupplierId?.let { supplierId ->
         if (activeSupplier?.id == supplierId && !isSecretsHydrating) {
@@ -317,7 +374,12 @@ private fun BalanceHome(
                 },
                 onAccessTokenChange = onAccessTokenChange,
                 onUserIdChange = onUserIdChange,
-                onSave = onSaveCredentials,
+                onSave = {
+                    onSaveCredentials {
+                        credentialsSavedAt = System.currentTimeMillis()
+                        credentialsSupplierId = null
+                    }
+                },
             )
         }
     }
@@ -338,7 +400,7 @@ private fun BalanceContent(
     batchProgressTotal: Int,
     onQuery: () -> Unit,
     onQueryAll: () -> Unit,
-    onSelectSupplier: (String) -> Unit,
+    onSelectSupplier: (String, (Boolean) -> Unit) -> Unit,
     onRefreshSupplierBalance: (String) -> Unit,
     onEditCredentials: (String) -> Unit,
     onDismissCredentials: () -> Unit,
@@ -386,7 +448,7 @@ private fun BalanceContent(
                 selected = supplier.id == activeSupplier?.id,
                 isQuerying = supplier.id in queryingSupplierIds,
                 enabled = !isSecretsHydrating,
-                onClick = { onSelectSupplier(supplier.id) },
+                onClick = { onSelectSupplier(supplier.id) { } },
                 onDoubleClick = { onRefreshSupplierBalance(supplier.id) },
                 onEditCredentials = { onEditCredentials(supplier.id) },
             )
@@ -1262,7 +1324,6 @@ private fun BalanceTemplateEditor(
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(top = 44.dp)
                         .heightIn(max = maxSheetHeight),
                     shape = MaterialTheme.shapes.extraLarge,
                     tonalElevation = 6.dp,
@@ -1349,11 +1410,11 @@ private fun BalanceTemplateEditor(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         BalanceQueryMode.entries.forEach { mode ->
-                            FilterChip(
+                            ModeChoiceChip(
                                 selected = draft.queryMode == mode,
+                                label = mode.label,
                                 onClick = { onModeChange(mode) },
-                                label = { Text(mode.label) },
-                                modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                                modifier = Modifier.weight(1f),
                             )
                         }
                     }
@@ -1373,11 +1434,11 @@ private fun BalanceTemplateEditor(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         BalanceHttpMethod.entries.forEach { method ->
-                            FilterChip(
+                            ModeChoiceChip(
                                 selected = draft.method == method,
+                                label = method.label,
                                 onClick = { onMethodChange(method) },
-                                label = { Text(method.label) },
-                                modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                                modifier = Modifier.weight(1f),
                             )
                         }
                     }
@@ -1510,7 +1571,7 @@ private fun BalanceTemplateEditor(
                             enabled = !isQuerying,
                             modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                         ) {
-                            Text("恢复 new-api 示例脚本")
+                            Text("填写 new-api 示例脚本")
                         }
                     }
                 }
@@ -1584,8 +1645,61 @@ private fun BalanceTemplateEditor(
                     }
                 }
             }
+            // 校验失败的消息（「请先修正模板配置」等）写进的是页面级 SnackbarHostState，
+            // 而那个宿主在活动窗口里、被这个弹窗盖着——编辑器不自己托管，消息就等于没有。
+            // 与更新弹窗同一做法：弹窗托管同一个 state，消息落在这一层窗口里。
+            SnackbarHost(
+                hostState = snackbarHostState,
+                modifier = Modifier.align(Alignment.BottomCenter),
+            )
         }
     }
+}
+
+/**
+ * A two-or-three way choice: 配置方式 and 请求方法. The Material default draws the
+ * selected chip as a filled *surface-variant* — a hair off the background, so on a
+ * bright screen you cannot tell which one is on without hunting for the check mark.
+ * Filling it with the primary colour and bolding the label makes the choice the
+ * loudest thing in the section, which is what a selector is for.
+ *
+ * The unselected chip keeps a transparent container but gains an outline: two
+ * transparent chips side by side read as labels, not as buttons.
+ */
+@Composable
+private fun ModeChoiceChip(
+    selected: Boolean,
+    label: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    FilterChip(
+        selected = selected,
+        onClick = onClick,
+        colors = FilterChipDefaults.filterChipColors(
+            selectedContainerColor = MaterialTheme.colorScheme.primary,
+            selectedLabelColor = MaterialTheme.colorScheme.onPrimary,
+            containerColor = Color.Transparent,
+        ),
+        border = FilterChipDefaults.filterChipBorder(
+            enabled = true,
+            selected = selected,
+            borderColor = MaterialTheme.colorScheme.outline,
+            selectedBorderColor = MaterialTheme.colorScheme.primary,
+        ),
+        label = {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelLarge.copy(
+                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                ),
+                maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Ellipsis,
+            )
+        },
+        modifier = modifier.heightIn(min = 48.dp),
+    )
 }
 
 @Composable

@@ -13,7 +13,6 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
-import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -32,6 +31,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.wrapContentSize
+import androidx.compose.foundation.lazy.LazyItemScope
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
@@ -50,11 +50,10 @@ import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Download
+import androidx.compose.material.icons.outlined.DragHandle
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.EditNote
 import androidx.compose.material.icons.outlined.Fingerprint
-import androidx.compose.material.icons.outlined.KeyboardArrowDown
-import androidx.compose.material.icons.outlined.KeyboardArrowUp
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
@@ -146,6 +145,7 @@ import com.relaytester.app.ui.navigation.AppDestination
 import com.relaytester.app.ui.components.DialogDismissScrim
 import com.relaytester.app.ui.components.QuietIconButton
 import com.relaytester.app.ui.components.RelayAppHeader
+import com.relaytester.app.ui.components.StatusToast
 import com.relaytester.app.ui.components.copyToClipboard
 import com.relaytester.app.ui.components.rememberDialogWindowBox
 import java.io.OutputStreamWriter
@@ -273,64 +273,86 @@ fun TesterScreen(
             )
         },
     ) { innerPadding ->
-        if (state.isInitializing || state.draft == null) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(innerPadding),
-                contentAlignment = Alignment.Center,
-            ) {
-                CircularProgressIndicator()
+        Box(modifier = Modifier.fillMaxSize()) {
+            if (state.isInitializing || state.draft == null) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(innerPadding),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    CircularProgressIndicator()
+                }
+            } else {
+                TesterContent(
+                    state = state,
+                    visibleResults = remember(
+                        state.results,
+                        state.filter,
+                        state.sort,
+                        state.resultQuery,
+                        state.selectedQuickFilterTerms,
+                    ) { viewModel.visibleResults() },
+                    onSettingChange = viewModel::updateSetting,
+                    onToggleQuickFilter = viewModel::toggleQuickFilterTerm,
+                    onAddQuickFilters = viewModel::addQuickFilterTerms,
+                    onRemoveQuickFilter = viewModel::removeQuickFilterTerm,
+                    onSelectSupplier = { supplierId -> viewModel.selectSupplier(supplierId) },
+                    onRefreshSupplierModels = viewModel::refreshSupplierModels,
+                    onFetchAllSupplierModels = viewModel::fetchAllSupplierModels,
+                    onEditSupplier = { supplierId ->
+                        // 先切站点、成功才记 id：切不过去（测试占着 / 写盘失败）时不能把
+                        // id 留成悬空状态——那样等到别的操作把这个站点变成活动站点，配置
+                        // 弹窗会自己蹦出来。
+                        viewModel.selectSupplier(supplierId) { activated ->
+                            if (activated) configurationSupplierId = supplierId
+                        }
+                    },
+                    onAddSupplier = viewModel::addSupplier,
+                    onReorderSuppliers = { showSupplierOrder = true },
+                    onFetchModels = viewModel::fetchModels,
+                    onStartTest = viewModel::startTest,
+                    onToggleModel = viewModel::toggleModelSelection,
+                    onSelectAll = viewModel::selectAllModels,
+                    onClearAll = viewModel::clearAllModels,
+                    onCancelRun = viewModel::cancelRun,
+                    onCancelUnifiedRun = viewModel::cancelUnifiedCatalogTest,
+                    onRetryFailed = viewModel::retryFailed,
+                    onRetestAll = viewModel::retestAll,
+                    onFilterChange = viewModel::updateFilter,
+                    onSortChange = viewModel::updateSort,
+                    onQueryChange = viewModel::updateResultQuery,
+                    onCopy = { label, values -> copyNames(context, label, values) },
+                    onExport = {
+                        val export = viewModel.buildExportPayload()
+                        if (export == null) {
+                            Toast.makeText(context, "没有可导出的测试结果", Toast.LENGTH_SHORT).show()
+                        } else {
+                            pendingExport = export
+                            createDocument.launch(export.fileName)
+                        }
+                    },
+                    onOpenModelCatalog = { showModelCatalog = true },
+                    onFingerprintModel = onFingerprintModel,
+                    showDeferredContent = showDeferredContent,
+                    contentPadding = innerPadding,
+                )
             }
-        } else {
-            TesterContent(
-                state = state,
-                visibleResults = remember(
-                    state.results,
-                    state.filter,
-                    state.sort,
-                    state.resultQuery,
-                    state.selectedQuickFilterTerms,
-                ) { viewModel.visibleResults() },
-                onSettingChange = viewModel::updateSetting,
-                onToggleQuickFilter = viewModel::toggleQuickFilterTerm,
-                onAddQuickFilters = viewModel::addQuickFilterTerms,
-                onRemoveQuickFilter = viewModel::removeQuickFilterTerm,
-                onSelectSupplier = viewModel::selectSupplier,
-                onRefreshSupplierModels = viewModel::refreshSupplierModels,
-                onFetchAllSupplierModels = viewModel::fetchAllSupplierModels,
-                onEditSupplier = { supplierId ->
-                    configurationSupplierId = supplierId
-                    viewModel.selectSupplier(supplierId)
-                },
-                onAddSupplier = viewModel::addSupplier,
-                onReorderSuppliers = { showSupplierOrder = true },
-                onFetchModels = viewModel::fetchModels,
-                onStartTest = viewModel::startTest,
-                onToggleModel = viewModel::toggleModelSelection,
-                onSelectAll = viewModel::selectAllModels,
-                onClearAll = viewModel::clearAllModels,
-                onCancelRun = viewModel::cancelRun,
-                onRetryFailed = viewModel::retryFailed,
-                onRetestAll = viewModel::retestAll,
-                onFilterChange = viewModel::updateFilter,
-                onSortChange = viewModel::updateSort,
-                onQueryChange = viewModel::updateResultQuery,
-                onCopy = { label, values -> copyNames(context, label, values) },
-                onExport = {
-                    val export = viewModel.buildExportPayload()
-                    if (export == null) {
-                        Toast.makeText(context, "没有可导出的测试结果", Toast.LENGTH_SHORT).show()
-                    } else {
-                        pendingExport = export
-                        createDocument.launch(export.fileName)
-                    }
-                },
-                onOpenModelCatalog = { showModelCatalog = true },
-                onFingerprintModel = onFingerprintModel,
-                showDeferredContent = showDeferredContent,
-                contentPadding = innerPadding,
-            )
+            // 保存成功的提示条画在页面这一层，不住在弹窗里：保存成功弹窗就关，
+            // 跟着弹窗走的提示条会一起消失。余额页的保存提示用同一个组件、同一个位置。
+            //
+            // 纵坐标要叠上 innerPadding：这一层 Box 从窗口顶算起（Scaffold 把不透明的
+            // 顶栏画在 content 之上），只按窗口顶 +4dp 定位，整条提示会藏进顶栏背后——
+            // 保存成功的那一刻，屏幕上什么也没发生。
+            if (saveCompletedAt > 0L) {
+                StatusToast(
+                    message = "供应商配置已保存",
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = innerPadding.calculateTopPadding() + 4.dp),
+                    onToastShown = { saveCompletedAt = 0L },
+                )
+            }
         }
     }
     if (showModelCatalog && state.draft != null) {
@@ -381,11 +403,11 @@ fun TesterScreen(
                 onTestingDisabledChange = viewModel::updateTestingDisabled,
                 onSave = {
                     viewModel.saveCurrentSupplier {
+                        // 保存成功＝收工：弹窗自己关，提示条交给页面这一层。
                         saveCompletedAt = System.currentTimeMillis()
+                        configurationSupplierId = null
                     }
                 },
-                saveCompletedAt = saveCompletedAt,
-                onToastShown = { saveCompletedAt = 0L },
             )
         }
     }
@@ -451,6 +473,7 @@ private fun TesterContent(
     onSelectAll: (Collection<String>?) -> Unit,
     onClearAll: (Collection<String>?) -> Unit,
     onCancelRun: () -> Unit,
+    onCancelUnifiedRun: () -> Unit,
     onRetryFailed: () -> Unit,
     onRetestAll: () -> Unit,
     onFilterChange: (ResultFilter) -> Unit,
@@ -532,8 +555,10 @@ private fun TesterContent(
                     onStartTest = onStartTest,
                     onOpenModelCatalog = onOpenModelCatalog,
                     onCancel = onCancelRun,
+                    onCancelUnifiedTest = onCancelUnifiedRun,
                     isFetchingModels = state.isFetchingModels,
                     isRunning = state.isRunning,
+                    isUnifiedTesting = state.isUnifiedTesting,
                 )
             }
             if (state.results.isNotEmpty()) {
@@ -576,6 +601,10 @@ private fun TesterContent(
         }
     }
 }
+
+// 排序面板的行高：固定值让「位移 ÷ 行高」的换算稳定，拖动跨越几行就换几位，
+// 也免得名字长短不一时行高参差。
+private val SUPPLIER_ORDER_ROW_HEIGHT = 56.dp
 
 private const val INITIAL_DEFERRED_CONTENT_DELAY_MS = 350L
 private const val MAX_MODEL_SOURCES_PER_ENTRY = 32
@@ -963,7 +992,6 @@ private fun SupplierOrderDialog(
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(top = 44.dp)
                         .heightIn(max = maxSheetHeight),
                     shape = MaterialTheme.shapes.extraLarge,
                     tonalElevation = 6.dp,
@@ -981,7 +1009,7 @@ private fun SupplierOrderDialog(
                         ) {
                             Text("供应商排序", style = MaterialTheme.typography.headlineSmall)
                             Text(
-                                "按住右侧手柄拖动，或用箭头上下移；顺序在所有页面一致。",
+                                "按住任意一行拖动即可换位；顺序在模型测试、余额查询与指纹检测三处一致。",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -991,6 +1019,7 @@ private fun SupplierOrderDialog(
                                 .fillMaxWidth()
                                 .weight(1f, fill = false),
                             state = listState,
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
                             contentPadding = PaddingValues(
                                 start = 12.dp,
                                 end = 12.dp,
@@ -998,18 +1027,28 @@ private fun SupplierOrderDialog(
                                 bottom = 8.dp,
                             ),
                         ) {
-                            itemsIndexed(suppliers, key = { _, supplier -> supplier.id }) { index, supplier ->
+                            itemsIndexed(
+                                items = suppliers,
+                                key = { _, supplier -> supplier.id },
+                                // 换位是两行交换位置：没有动画时第二行是「跳」过去的，看不出谁换到了哪。
+                                // key 已经给了稳定身份，item 动画就能把这次交换演成一次平滑的位移。
+                                contentType = { _, _ -> "supplier-order-row" },
+                            ) { index, supplier ->
                                 SupplierOrderRow(
                                     supplier = supplier,
                                     position = index + 1,
-                                    canMoveUp = index > 0,
-                                    canMoveDown = index < suppliers.lastIndex,
                                     isDragging = supplier.id == draggingId,
                                     onStartDrag = { draggingId = supplier.id },
                                     onStopDrag = { draggingId = null },
-                                    onMoveOver = { overId -> onMove(supplier.id, overId) },
-                                    onMoveUp = { suppliers.getOrNull(index - 1)?.let { up -> onMove(supplier.id, up.id) } },
-                                    onMoveDown = { suppliers.getOrNull(index + 1)?.let { down -> onMove(supplier.id, down.id) } },
+                                    // 往下拖＝与 steps 行之后的那一行换位，往上拖＝与之前的换。
+                                    // 原语按 id 说，这里每次都按当前位置解引用：事件落在重组之前
+                                    // 就是空操作，不会把别的行换走。
+                                    onMoveOver = { movedId, steps ->
+                                        val at = suppliers.indexOfFirst { it.id == movedId }
+                                        val target = suppliers.getOrNull(at + steps)
+                                            ?: return@SupplierOrderRow
+                                        onMove(movedId, target.id)
+                                    },
                                 )
                             }
                         }
@@ -1031,22 +1070,22 @@ private fun SupplierOrderDialog(
 }
 
 @Composable
-private fun SupplierOrderRow(
+private fun LazyItemScope.SupplierOrderRow(
     supplier: SupplierProfile,
     position: Int,
-    canMoveUp: Boolean,
-    canMoveDown: Boolean,
     isDragging: Boolean,
     onStartDrag: () -> Unit,
     onStopDrag: () -> Unit,
-    onMoveOver: (String) -> Unit,
-    onMoveUp: () -> Unit,
-    onMoveDown: () -> Unit,
+    onMoveOver: (String, Int) -> Unit,
 ) {
     var rowHeightPx by remember { mutableIntStateOf(0) }
     // 拖动是用「位移除以行高」算的，不是用指针的绝对坐标：LazyColumn 有自己的内边距和滚动
     // 偏移，拿绝对 y 找行会把两者都算进去（这是这类实现最常见的一处错）。位移只关心跨过了
     // 几行，行高从测量拿到，与滚动位置无关。
+    //
+    // 手势挂在整行上，不是那个手柄图标上：手柄只有 44dp 宽，手指按住它再拖，起手的一点抖动
+    // 就会滑出它的边界，拖动随即断掉——这正是「拖不动」的由来。整行都是把手以后，按在哪都
+    // 能拖，图标退回成「这里可以拖」的提示。
     val dragModifier = Modifier.pointerInput(supplier.id) {
         // 每次手势开始时归零：上一次的残留位移会把第一次换位提前触发。
         var travelled = 0f
@@ -1062,79 +1101,67 @@ private fun SupplierOrderRow(
                 travelled += dragAmount.y
                 val row = rowHeightPx
                 if (row <= 0) return@detectDragGesturesAfterLongPress
-                // 半个行高＝两行的中点，跨过它才换位；一次手势里跨过几行就换几位。
+                // 半个行高＝两行的中点，跨过它才换位；正负号就是方向——往下拖为正，
+                // 往上拖为负。步数带符号整段交给回调，一次跳到位：拆成逐行调用的话，
+                // 第二次解引用读到的还是重组前的同一份列表，两步会互相抵消。
                 val steps = (travelled / row).roundToInt()
                 if (steps != 0) {
-                    repeat(kotlin.math.abs(steps)) { onMoveOver(supplier.id) }
-                    // 只减掉已经兑现的那几行：剩下的零头留着，跨回半行就能换回去，
-                    // 不会出现「换过去就换不回来」的死区。
+                    onMoveOver(supplier.id, steps)
+                    // 跨过的行数整段减掉：目标行不存在（已到列表边缘）时不换位，但位移
+                    // 照减，免得残量在边缘越积越多、一拖就连跳。
                     travelled -= steps * row
                 }
             },
         )
     }
 
-    Row(
+    Surface(
         modifier = Modifier
             .fillMaxWidth()
+            // 换位动画：供应商列表是这一份顺序的三个投影之一，交换位置时行是平移过去的，
+            // 不是原地闪一下。
+            .animateItem()
             .onSizeChanged { rowHeightPx = it.height }
-            .graphicsLayer { alpha = if (isDragging) 0.6f else 1f }
-            .background(
-                color = MaterialTheme.colorScheme.surface,
-                shape = MaterialTheme.shapes.medium,
-            )
-            .padding(horizontal = 4.dp),
-        verticalAlignment = Alignment.CenterVertically,
+            .then(dragModifier)
+            .semantics { contentDescription = "拖动排序 ${supplier.name}" },
+        color = if (isDragging) {
+            MaterialTheme.colorScheme.secondaryContainer
+        } else {
+            MaterialTheme.colorScheme.surface
+        },
+        shape = MaterialTheme.shapes.medium,
+        tonalElevation = if (isDragging) 4.dp else 0.dp,
     ) {
-        Text(
-            text = position.toString(),
-            style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.width(24.dp),
-            textAlign = TextAlign.Center,
-        )
-        Column(
+        Row(
             modifier = Modifier
-                .weight(1f)
-                .padding(vertical = 12.dp),
+                .fillMaxWidth()
+                .height(SUPPLIER_ORDER_ROW_HEIGHT)
+                .padding(horizontal = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
+            // 序号用主色并加粗：一眼能看出「这是第几位」，灰色小字在浅底上几乎是装饰。
+            Text(
+                text = position.toString(),
+                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.width(28.dp),
+                textAlign = TextAlign.Center,
+            )
+            Spacer(Modifier.width(8.dp))
             Text(
                 text = supplier.name,
-                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+                style = MaterialTheme.typography.bodyLarge,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
             )
-            Text(
-                text = protocolShortLabel(supplier.protocol),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
+            Icon(
+                imageVector = Icons.Outlined.DragHandle,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(24.dp),
             )
         }
-        IconButton(
-            onClick = onMoveUp,
-            enabled = canMoveUp,
-            modifier = Modifier.size(44.dp),
-        ) {
-            Icon(Icons.Outlined.KeyboardArrowUp, contentDescription = "上移 ${supplier.name}")
-        }
-        IconButton(
-            onClick = onMoveDown,
-            enabled = canMoveDown,
-            modifier = Modifier.size(44.dp),
-        ) {
-            Icon(Icons.Outlined.KeyboardArrowDown, contentDescription = "下移 ${supplier.name}")
-        }
-        Text(
-            text = "⠿",
-            color = if (isDragging) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier
-                .size(44.dp)
-                .clip(MaterialTheme.shapes.small)
-                .then(dragModifier)
-                .semantics { contentDescription = "拖动排序 ${supplier.name}" }
-                .wrapContentSize(Alignment.Center),
-        )
     }
 }
 
@@ -1144,8 +1171,6 @@ private fun SupplierConfigurationDialog(
     errors: FormErrors,
     enabled: Boolean,
     isSecretsHydrating: Boolean,
-    saveCompletedAt: Long,
-    onToastShown: () -> Unit,
     onDismiss: () -> Unit,
     onDelete: () -> Unit,
     deleteEnabled: Boolean,
@@ -1176,7 +1201,6 @@ private fun SupplierConfigurationDialog(
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(top = 44.dp)
                         .heightIn(max = maxSheetHeight),
                     shape = MaterialTheme.shapes.extraLarge,
                     tonalElevation = 6.dp,
@@ -1263,15 +1287,6 @@ private fun SupplierConfigurationDialog(
                             ) { Text("保存供应商") }
                         }
                     }
-                }
-                if (saveCompletedAt > 0L) {
-                    Toast(
-                        message = "供应商配置已保存",
-                        modifier = Modifier
-                            .align(Alignment.TopCenter)
-                            .padding(top = 4.dp),
-                        onToastShown = onToastShown,
-                    )
                 }
             }
         }
@@ -1447,34 +1462,6 @@ private fun PullOnlyModeRow(
     }
 }
 
-@Composable
-private fun Toast(
-    message: String,
-    modifier: Modifier = Modifier,
-    onToastShown: () -> Unit,
-) {
-    LaunchedEffect(message) {
-        delay(1600L)
-        onToastShown()
-    }
-    Surface(
-        modifier = modifier,
-        shape = MaterialTheme.shapes.small,
-        color = Color(0xE6000000),
-        tonalElevation = 0.dp,
-        shadowElevation = 6.dp,
-    ) {
-        Text(
-            message,
-            color = Color.White,
-            style = MaterialTheme.typography.labelLarge,
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
-            maxLines = 1,
-            softWrap = false,
-        )
-    }
-}
-
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun TestSettingsCard(
@@ -1492,13 +1479,17 @@ private fun TestSettingsCard(
     onStartTest: () -> Unit,
     onOpenModelCatalog: () -> Unit,
     onCancel: () -> Unit,
+    onCancelUnifiedTest: () -> Unit,
     isFetchingModels: Boolean,
     isRunning: Boolean,
+    isUnifiedTesting: Boolean,
 ) {
     var showAdvanced by rememberSaveable(draft.id) { mutableStateOf(false) }
     var showQuickFilterDialog by rememberSaveable(draft.id) { mutableStateOf(false) }
     var quickFilterInput by rememberSaveable(draft.id) { mutableStateOf("") }
-    var quickFilterToDelete by remember { mutableStateOf<String?>(null) }
+    // 与同组三个 saveable 对齐：旋转时弹窗本身（showQuickFilterDialog 的兄弟态）会留下，
+    // 待确认的词却跟着 remember 没了，看起来像确认框自己消失了。
+    var quickFilterToDelete by rememberSaveable { mutableStateOf<String?>(null) }
     ElevatedCard {
         Column(
             modifier = Modifier.fillMaxWidth().padding(16.dp),
@@ -1514,7 +1505,10 @@ private fun TestSettingsCard(
                 }
                 OutlinedButton(
                     onClick = onOpenModelCatalog,
-                    enabled = enabled,
+                    // 统一测试跑着的时候，这个按钮是回弹窗看进度、取消测试的唯一入口：
+                    // 关掉弹窗后主界面没有任何进行中指示，再禁掉它，用户就被锁在一轮
+                    // 看不见的测试外面了。普通批量测试运行中它仍然禁用（那是另一条链）。
+                    enabled = enabled || isUnifiedTesting,
                     contentPadding = PaddingValues(horizontal = 10.dp),
                     modifier = Modifier
                         .heightIn(min = 40.dp, max = 44.dp)
@@ -1522,7 +1516,11 @@ private fun TestSettingsCard(
                 ) {
                     Icon(Icons.Outlined.Tune, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(4.dp))
-                    Text("高级测试", maxLines = 1, softWrap = false)
+                    Text(
+                        if (isUnifiedTesting) "统一测试中…" else "高级测试",
+                        maxLines = 1,
+                        softWrap = false,
+                    )
                 }
             }
             NumberRow(
@@ -1714,7 +1712,22 @@ private fun TestSettingsCard(
                 )
             }
             HorizontalDivider()
-            if (isRunning) {
+            if (isUnifiedTesting) {
+                // 统一测试与批量测试是两条链，取消的是各自那一条。这个按钮让「关掉弹窗
+                // 之后还能回来停掉它」成立——以前只有弹窗里有取消，主界面一片安静。
+                Button(
+                    onClick = onCancelUnifiedTest,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = MaterialTheme.colorScheme.onError,
+                    ),
+                ) {
+                    Icon(Icons.Outlined.StopCircle, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("取消统一测试")
+                }
+            } else if (isRunning) {
                 Button(
                     onClick = onCancel,
                     modifier = Modifier.fillMaxWidth(),
@@ -1993,6 +2006,9 @@ private fun LazyListScope.resultSection(
     }
     item(key = "result_selection", contentType = "result_selection") {
         val visibleModels = visibleResults.map { it.model }
+        // 与 ViewModel 的守卫同一把锁：勾选与批量动作在统一测试进行中同样会被丢弃
+        // （runningOrInitializing 两者都认），界面上少禁一个就是「点得动、没反应」。
+        val selectionLocked = state.isRunning || state.isUnifiedTesting
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -2009,12 +2025,12 @@ private fun LazyListScope.resultSection(
             )
             TextButton(
                 onClick = { onSelectAll(visibleModels) },
-                enabled = !state.isRunning && visibleModels.any { it !in state.selectedModels },
+                enabled = !selectionLocked && visibleModels.any { it !in state.selectedModels },
                 modifier = Modifier.heightIn(min = 48.dp),
             ) { Text("全选") }
             TextButton(
                 onClick = { onClearAll(visibleModels) },
-                enabled = !state.isRunning && visibleModels.any { it in state.selectedModels },
+                enabled = !selectionLocked && visibleModels.any { it in state.selectedModels },
                 modifier = Modifier.heightIn(min = 48.dp),
             ) { Text("取消全选") }
         }
@@ -2035,7 +2051,7 @@ private fun LazyListScope.resultSection(
                 result = result,
                 selectable = true,
                 selected = result.model in state.selectedModels,
-                enabled = !state.isRunning,
+                enabled = !state.isRunning && !state.isUnifiedTesting,
                 // 勾选框在整批运行期间仍然冻结，但这一行自己的两个动作只看这一行：
                 // 它一旦有结论（成功/失败）就能点，不必等整张列表跑完。
                 actionsEnabled = result.status != TestStatus.PENDING,
@@ -2476,6 +2492,10 @@ private fun ResultActions(
     }
     val selectedFailed = failed.filter { it in state.selectedModels }
     val selectedResults = state.results.count { it.model in state.selectedModels }
+    // 重测与导出同样要认统一测试：ViewModel 的守卫是两者都拒，界面只认 isRunning 时
+    // 按钮亮着而点击被吞。导出尤其要挡住——统一测试跑着时它导的是批量结果，不是用户
+    // 以为的当前整份。
+    val runLocked = state.isRunning || state.isUnifiedTesting
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -2483,7 +2503,7 @@ private fun ResultActions(
         ) {
             OutlinedButton(
                 onClick = onRetestAll,
-                enabled = !state.isRunning && selectedResults > 0,
+                enabled = !runLocked && selectedResults > 0,
                 modifier = Modifier.weight(1f),
             ) {
                 Icon(Icons.Outlined.Refresh, contentDescription = null)
@@ -2492,7 +2512,7 @@ private fun ResultActions(
             }
             OutlinedButton(
                 onClick = onRetryFailed,
-                enabled = !state.isRunning && selectedFailed.isNotEmpty(),
+                enabled = !runLocked && selectedFailed.isNotEmpty(),
                 modifier = Modifier.weight(1f),
             ) {
                 Text("重测已选失败")
@@ -2522,7 +2542,7 @@ private fun ResultActions(
         }
         Button(
             onClick = onExport,
-            enabled = !state.isRunning,
+            enabled = !runLocked,
             modifier = Modifier.fillMaxWidth(),
         ) {
             Icon(Icons.Outlined.Download, contentDescription = null)
@@ -2815,9 +2835,17 @@ private fun ModelCatalogDialog(
     }
     var catalogSearchKeyword by rememberSaveable { mutableStateOf("") }
     var editingSearchKeyword by rememberSaveable { mutableStateOf("") }
-    var selectedSearchKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
-    var sourceToDelete by remember { mutableStateOf<ModelSource?>(null) }
-    var entryToDeleteId by remember { mutableStateOf<String?>(null) }
+    // 这三处与编辑器同组：弹窗开着时旋转，之前只有它们跟着 remember 丢——勾选的检索结果
+    // 全清、待确认的移除/删除框连同它的目标一起消失，看起来像确认框自己关了。
+    // Set 与 ModelSource 都用扁平化的可存形式（与 modelSourcesSaver 同一做法）。
+    var selectedSearchKeys by rememberSaveable(
+        stateSaver = listSaver<Set<String>, String>(
+            save = { it.toList() },
+            restore = { it.toSet() },
+        ),
+    ) { mutableStateOf<Set<String>>(emptySet()) }
+    var sourceToDeleteKey by rememberSaveable { mutableStateOf<String?>(null) }
+    var entryToDeleteId by rememberSaveable { mutableStateOf<String?>(null) }
     var supplierMenuExpanded by rememberSaveable { mutableStateOf(false) }
     var modelMenuExpanded by rememberSaveable { mutableStateOf(false) }
     val selectedSupplier = state.suppliers.firstOrNull { it.id == selectedSupplierId }
@@ -3155,6 +3183,22 @@ private fun ModelCatalogDialog(
                                         )
                                     }
                                 }
+                                // 拉取的结果就印在这行按钮底下：页面级的 snackbar 住在活动
+                                // 窗口里、被这个弹窗盖着，失败只写那边时用户看到的是「转完圈
+                                // 后什么也没发生」。
+                                if (!state.isCatalogFetching && state.catalogPickerMessage != null) {
+                                    Text(
+                                        state.catalogPickerMessage,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = if (state.isCatalogPickerMessageError) {
+                                            MaterialTheme.colorScheme.error
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurfaceVariant
+                                        },
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
                             }
                         }
                         if (pendingSources.isNotEmpty()) {
@@ -3180,7 +3224,10 @@ private fun ModelCatalogDialog(
                                             overflow = TextOverflow.Ellipsis,
                                         )
                                         IconButton(
-                                            onClick = { sourceToDelete = source },
+                                            onClick = {
+                                                sourceToDeleteKey =
+                                                    source.supplierId + "\u0000" + source.modelId
+                                            },
                                             enabled = editingEnabled,
                                             modifier = Modifier.size(44.dp),
                                         ) {
@@ -3301,28 +3348,35 @@ private fun ModelCatalogDialog(
                 }
             }
         }
-        sourceToDelete?.let { source ->
-            val supplierName = state.suppliers.firstOrNull { it.id == source.supplierId }?.name ?: "未知供应商"
-            AlertDialog(
-                onDismissRequest = { sourceToDelete = null },
-                title = { Text("移除供应商来源？") },
-                text = { Text("将移除「$supplierName · ${source.modelId}」；已保存配置不受影响。") },
-                confirmButton = {
-                    TextButton(
-                        onClick = {
-                            sourceToDelete = null
-                            pendingSources = pendingSources - source
-                        },
-                        modifier = Modifier.heightIn(min = 48.dp),
-                    ) { Text("移除", color = MaterialTheme.colorScheme.error) }
-                },
-                dismissButton = {
-                    TextButton(
-                        onClick = { sourceToDelete = null },
-                        modifier = Modifier.heightIn(min = 48.dp),
-                    ) { Text("取消") }
-                },
-            )
+        sourceToDeleteKey?.let { sourceKey ->
+            // 按 key 对当前草稿解引用：旋转恢复后列表已经重新读入，直接存对象会指向旧实例；
+            // 对不上（草稿已变）就当确认框已过期，静默收起。
+            val source = pendingSources.firstOrNull {
+                it.supplierId + "\u0000" + it.modelId == sourceKey
+            }
+            if (source != null) {
+                val supplierName = state.suppliers.firstOrNull { it.id == source.supplierId }?.name ?: "未知供应商"
+                AlertDialog(
+                    onDismissRequest = { sourceToDeleteKey = null },
+                    title = { Text("移除供应商来源？") },
+                    text = { Text("将移除「$supplierName · ${source.modelId}」；已保存配置不受影响。") },
+                    confirmButton = {
+                        TextButton(
+                            onClick = {
+                                sourceToDeleteKey = null
+                                pendingSources = pendingSources - source
+                            },
+                            modifier = Modifier.heightIn(min = 48.dp),
+                        ) { Text("移除", color = MaterialTheme.colorScheme.error) }
+                    },
+                    dismissButton = {
+                        TextButton(
+                            onClick = { sourceToDeleteKey = null },
+                            modifier = Modifier.heightIn(min = 48.dp),
+                        ) { Text("取消") }
+                    },
+                )
+            }
         }
         entryToDeleteId?.let { entryId ->
             val entry = state.modelCatalog.firstOrNull { it.id == entryId }

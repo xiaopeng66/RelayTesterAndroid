@@ -135,10 +135,14 @@ class SupplierOrderTest {
         settle()
         store.failSaves = false
 
+        // The refused save already consumed one count; wait for the one after it. Without the
+        // baseline this assertion races the IO write and reads the empty list the refused
+        // save left behind.
+        val savesBefore = store.saveCount
         subject.moveSupplier(supplierId = "b", targetId = "a")
 
         assertEquals(listOf("b", "a", "c"), subject.uiState.value.suppliers.map { it.id })
-        assertEquals(listOf("b", "a", "c"), awaitSaved(store).map { it.id })
+        assertEquals(listOf("b", "a", "c"), awaitSaved(store, savesBefore).map { it.id })
     }
 
     // ---- Reordering is not allowed to race a run ---------------------------
@@ -176,12 +180,18 @@ class SupplierOrderTest {
 
     // ---- Harness -----------------------------------------------------------
 
-    /** Waits for the write that runs on the real IO dispatcher to land. */
-    private fun awaitSaved(store: RecordingStore): List<SupplierProfile> =
+    /**
+     * Waits for a write beyond [before] to land on the real IO dispatcher.
+     *
+     * The baseline matters: a save that was refused has already bumped the count by the time
+     * this is called, so waiting for "any save" would return the previous write's contents —
+     * which is exactly how the failed-then-retry test read an empty list under load.
+     */
+    private fun awaitSaved(store: RecordingStore, before: Int = 0): List<SupplierProfile> =
         kotlinx.coroutines.runBlocking {
             withContext(Dispatchers.Default) {
                 withTimeout(5_000) {
-                    while (store.saveCount == 0) {
+                    while (store.saveCount <= before) {
                         kotlinx.coroutines.delay(5)
                     }
                     store.saved

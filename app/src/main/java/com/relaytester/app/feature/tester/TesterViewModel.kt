@@ -223,6 +223,12 @@ data class TesterUiState(
     val catalogPickerSupplierId: String? = null,
     val catalogPickerModels: List<String> = emptyList(),
     val isCatalogFetching: Boolean = false,
+    /**
+     * 最近一次「拉取」的结论，画在弹窗里拉取按钮旁。页面级的 snackbar 住在活动窗口里，
+     * 被弹窗自己的窗口盖住——失败只写 message 时，用户看到的是转圈结束后什么也没发生。
+     */
+    val catalogPickerMessage: String? = null,
+    val isCatalogPickerMessageError: Boolean = false,
     /** Cross-supplier model search results shown by the advanced test dialog. */
     val catalogSearchResults: List<CatalogSearchResult> = emptyList(),
     val isCatalogSearching: Boolean = false,
@@ -372,7 +378,10 @@ data class BalanceTemplateDraft(
             name = "自定义余额模板",
             description = "",
             queryMode = BalanceQueryMode.FORM,
-            scriptCode = defaultScript(),
+            // 新建时脚本留空：不是所有站点都用 new-api 的响应形状，先塞一段示例，
+            // 用户第一件事就是把它整段删掉。空着的输入框配一个「填写示例脚本」的按钮，
+            // 要示例的人一键拿到，不要示例的人不用删。
+            scriptCode = "",
             method = BalanceHttpMethod.GET,
             endpointTemplate = "/api/balance",
             headersText = "Authorization: Bearer {{apiKey}}",
@@ -395,7 +404,9 @@ data class BalanceTemplateDraft(
             name = if (copied) "${template.name} 副本" else template.name,
             description = template.description,
             queryMode = template.queryMode,
-            scriptCode = template.scriptCode.orEmpty().ifBlank(::defaultScript),
+            // 已有模板按原样回填，不再用示例脚本顶替空值：脚本是模板自己的内容，
+            // 这里替一段示例等于悄悄改了用户的模板。
+            scriptCode = template.scriptCode.orEmpty(),
             method = template.method,
             endpointTemplate = template.endpointTemplate,
             headersText = template.headers.joinToString("\n") { "${it.name}: ${it.valueTemplate}" },
@@ -664,7 +675,14 @@ class TesterViewModel(
                 }
             }
             if (apiKey.isBlank()) {
-                showMessage("请先保存 ${profile.name} 的 API Key", isError = true)
+                // 与下拉取的失败同一条规则：这条拒绝也发生在弹窗开着时，页面级 snackbar
+                // 会被弹窗自己的窗口盖住——理由要写进弹窗渲染的那条状态。
+                _uiState.update {
+                    it.copy(
+                        catalogPickerMessage = "请先保存 ${profile.name} 的 API Key",
+                        isCatalogPickerMessageError = true,
+                    )
+                }
                 return@launch
             }
             _uiState.update {
@@ -672,6 +690,10 @@ class TesterViewModel(
                     isCatalogFetching = true,
                     catalogPickerSupplierId = supplierId,
                     catalogPickerModels = emptyList(),
+                    // 上一次拉取的结论先撤下：拉取中的转圈与旧结论并存会让人以为
+                    // 那是这次的结果。
+                    catalogPickerMessage = null,
+                    isCatalogPickerMessageError = false,
                     message = null,
                 )
             }
@@ -682,12 +704,19 @@ class TesterViewModel(
                 is ApiResult.Success -> {
                     // Keep the picker independent from the active supplier form;
                     // adding a source never changes the current test selection.
+                    //
+                    // 结论写在弹窗自己的状态行上，不再只塞页面级 message：那个 snackbar
+                    // 住在活动窗口里、被弹窗盖住，用户看到的是「拉取转完圈后什么也没发生」。
                     _uiState.update {
                         it.copy(
                             isCatalogFetching = false,
                             catalogPickerModels = result.value,
-                            message = if (result.value.isEmpty()) "该供应商未返回模型" else "已拉取 ${result.value.size} 个模型",
-                            isMessageError = result.value.isEmpty(),
+                            catalogPickerMessage = if (result.value.isEmpty()) {
+                                "该供应商未返回模型"
+                            } else {
+                                "已拉取 ${result.value.size} 个模型"
+                            },
+                            isCatalogPickerMessageError = result.value.isEmpty(),
                         )
                     }
                 }
@@ -695,8 +724,8 @@ class TesterViewModel(
                     it.copy(
                         isCatalogFetching = false,
                         catalogPickerModels = emptyList(),
-                        message = result.error.message,
-                        isMessageError = true,
+                        catalogPickerMessage = result.error.message,
+                        isCatalogPickerMessageError = true,
                     )
                 }
             }
@@ -708,6 +737,8 @@ class TesterViewModel(
             it.copy(
                 catalogPickerSupplierId = null,
                 catalogPickerModels = emptyList(),
+                catalogPickerMessage = null,
+                isCatalogPickerMessageError = false,
                 catalogSearchResults = emptyList(),
                 catalogSearchMessage = null,
                 isCatalogSearchError = false,
@@ -720,6 +751,10 @@ class TesterViewModel(
             it.copy(
                 catalogPickerSupplierId = null,
                 catalogPickerModels = emptyList(),
+                // 换供应商时旧结论跟着旧供应商走，否则「已拉取 12 个模型」会挂在
+                // 一个还没拉过的供应商名下。
+                catalogPickerMessage = null,
+                isCatalogPickerMessageError = false,
             )
         }
     }
@@ -1300,10 +1335,11 @@ class TesterViewModel(
         }
     }
 
-    fun saveBalanceCredentials() {
+    fun saveBalanceCredentials(onSaved: () -> Unit = {}) {
         if (balanceOperationBlocked()) return
         viewModelScope.launch {
-            persistBalanceCredentials(showSuccessMessage = true)
+            // 成功与否由调用方拿回调分辨：失败时弹窗留在原地看错误，成功时弹窗自己关。
+            if (persistBalanceCredentials() != null) onSaved()
         }
     }
 
@@ -1837,12 +1873,34 @@ class TesterViewModel(
         }
     }
 
-    fun selectSupplier(id: String) {
-        if (runningOrInitializing() || id == _uiState.value.activeSupplierId) return
+    /**
+     * Activates a supplier and reports whether the switch actually landed.
+     *
+     * The report exists for callers that arm something on the new supplier — the two
+     * 「编辑」 affordances open their editor only when the switch succeeded. They used to
+     * set their pending id *before* asking, so a refused activation (a run in flight) or a
+     * failed write left the id armed: the editor then popped open uninvited the next time
+     * that supplier became active for any other reason. Reporting back keeps the two facts
+     * in the same order plus the same transaction.
+     */
+    fun selectSupplier(id: String, onActivated: (Boolean) -> Unit = {}) {
+        // Already active first: nothing to persist and nothing to refuse. Re-selecting the
+        // active site is how the two 「编辑」 affordances open their editor on it — the
+        // tester's config card legitimately opens read-only while a run is in flight, and
+        // the balance one while a balance query runs.
+        if (id == _uiState.value.activeSupplierId) {
+            onActivated(true)
+            return
+        }
+        if (runningOrInitializing()) {
+            onActivated(false)
+            return
+        }
         viewModelScope.launch {
-            supplierActivationMutex.withLock {
+            val activated = supplierActivationMutex.withLock {
                 activateSupplier(id)
             }
+            onActivated(activated)
         }
     }
 
@@ -3523,9 +3581,7 @@ class TesterViewModel(
         return saveProfiles()
     }
 
-    private suspend fun persistBalanceCredentials(
-        showSuccessMessage: Boolean = false,
-    ): SupplierProfile? = credentialTransactionMutex.withLock {
+    private suspend fun persistBalanceCredentials(): SupplierProfile? = credentialTransactionMutex.withLock {
         try {
             val activeId = activeSupplierId ?: return@withLock null
             val existing = profiles.firstOrNull { it.id == activeId } ?: return@withLock null
@@ -3562,8 +3618,10 @@ class TesterViewModel(
                 it.copy(
                     credentials = BalanceCredentialsDraft.from(profile, credentials.accessToken.trim()),
                     credentialErrors = BalanceCredentialsErrors(),
-                    message = if (showSuccessMessage) "余额查询凭据已保存" else it.message,
-                    isMessageError = if (showSuccessMessage) false else it.isMessageError,
+                    // 保存成功的提示走页面层的 StatusToast（与模型测试页同一组件），
+                    // 不再经过 message/snackbar：那条黑色提示条会被还开着的弹窗压在遮罩下。
+                    message = it.message,
+                    isMessageError = it.isMessageError,
                 )
             }
             profile
@@ -3597,7 +3655,25 @@ class TesterViewModel(
 
     private suspend fun saveProfiles(
         invalidatedBalanceSupplierIds: Set<String> = emptySet(),
-    ): Boolean = configurationWriteMutex.withLock {
+    ): Boolean {
+        // 写失败不再把状态锁在「半改」上：调用方拿到 false 会立刻回滚 profiles，而回滚与这次
+        // 写读到的列表是同一份。重试放在锁外、只发一次，是为了让「界面回滚」与「磁盘最终收敛
+        // 到用户要的顺序」各归各的：调用方照旧按失败处理，存储在下一次落盘窗口里追上。
+        configurationWriteMutex.withLock {
+            if (writeProfiles(invalidatedBalanceSupplierIds)) return true
+        }
+        // 走到这里说明是真正的写错误（取消会直接抛出）。
+        viewModelScope.launch {
+            configurationWriteMutex.withLock { writeProfiles(invalidatedBalanceSupplierIds) }
+        }
+        return false
+    }
+
+    /**
+     * One attempt at the configuration write. Caller holds [configurationWriteMutex]: the
+     * state is sampled under the lock so a queued save cannot read a half-applied mutation.
+     */
+    private suspend fun writeProfiles(invalidatedBalanceSupplierIds: Set<String>): Boolean {
         val stateToSave = SupplierStoreState(
             suppliers = profiles.toList(),
             activeSupplierId = activeSupplierId,
@@ -3617,14 +3693,14 @@ class TesterViewModel(
             // older secret reference.
             showMessage("本地配置保存失败，请检查存储空间", isError = true)
             showBalanceMessage("本地配置保存失败，请检查存储空间", isError = true)
-            return@withLock false
+            return false
         }
-        // Publish invalidation before releasing the lock so queued saves sample the new state.
+        // Publish invalidation while the lock is still held so queued saves sample the new state.
         _balanceUiState.update { state ->
             state.copy(balanceSnapshots = state.balanceSnapshots - invalidatedBalanceSupplierIds)
         }
         publishBalanceState()
-        true
+        return true
     }
 
     /**

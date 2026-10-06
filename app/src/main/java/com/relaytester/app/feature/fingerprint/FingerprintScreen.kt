@@ -556,6 +556,10 @@ private fun ReferenceBankCard(
 ) {
     val context = LocalContext.current
     val busy = state.isCheckingBankUpdate || state.isInstallingBank || state.isRunning
+    // 删除检测包是本卡片唯一的破坏性动作，此前点一下就执行——同页「清空历史」、别处的
+    // 删除供应商/模板/模型来源全都有确认，只有它没有。删掉之后检测功能要重新下载才能
+    // 用，一次误触的代价是整包重下，所以补上同一套确认。
+    var confirmRemove by rememberSaveable { mutableStateOf(false) }
     // 只有静默检查占用状态行：状态行是它唯一的迹象（这个标志以前没人读，一次静默检查看
     // 起来就像什么都没发生）。用户自己点的那次，进度只画在按钮上——两处同时转圈很难看，
     // 而状态行里「上次检查：…」比「正在检查更新…」信息更多，不该被顶掉。
@@ -694,7 +698,7 @@ private fun ReferenceBankCard(
                     // 有框一个没有，看着像没画完（用户反馈）。要能跟下面「查看支持的模型」
                     // 区分开，靠的是那个按钮的 primary 色描边加图标，不是这两栏的不对称。
                     OutlinedButton(
-                        onClick = onRemovePackage,
+                        onClick = { confirmRemove = true },
                         enabled = !busy,
                         modifier = Modifier.weight(1f).heightIn(min = 48.dp),
                     ) {
@@ -791,6 +795,29 @@ private fun ReferenceBankCard(
                 )
             }
         }
+    }
+
+    if (confirmRemove) {
+        AlertDialog(
+            onDismissRequest = { confirmRemove = false },
+            title = { Text("删除检测包？") },
+            text = { Text("删除后检测功能需要重新下载检测包才能使用，此操作无法撤销。") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        confirmRemove = false
+                        onRemovePackage()
+                    },
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) { Text("删除", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { confirmRemove = false },
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) { Text("取消") }
+            },
+        )
     }
 }
 
