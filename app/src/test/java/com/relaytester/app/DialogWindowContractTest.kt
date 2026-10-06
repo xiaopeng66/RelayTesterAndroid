@@ -249,6 +249,23 @@ class DialogWindowContractTest {
             "格子间距没有量自列表布局（相邻行的 offset 之差）：行距一改换算就失准",
             "visible[1].offset - visible[0].offset" in text,
         )
+        // ④ 判定用的那一帧在手指按下时采一次，整次拖动不再重读（设备实测的第二类缺陷：
+        //    被拖的行如果是列表第一可见那行，换位会让列表跟着滚一格，逐帧重读就把这次滚动
+        //    算成指尖的位移——手指只走一格、判定说走两格，行越拖越跑）。
+        assertTrue(
+            "按下时没有采样判定帧：逐帧重读布局会把列表滚动（列表跟着第一可见行的 key 走）" +
+                "算进指尖位移，手指走一格、判定说走两格",
+            "dragFrame = currentSupplierDragFrame(" in text,
+        )
+        assertTrue(
+            "判定没有用按下时采的那一帧：布局一变，同一根手指就算出不同的格子",
+            "val frame = dragFrame ?: return@SupplierOrderRow" in text,
+        )
+        assertTrue(
+            "拖动期间没有把窗口钉回按下时的位置：被拖的是第一可见行时，窗口会跟着换位往下滚，" +
+                "行被钉在原地不跟手",
+            "scrollToItem(frame.scrollIndex, frame.scrollOffset)" in text,
+        )
     }
 
     @Test

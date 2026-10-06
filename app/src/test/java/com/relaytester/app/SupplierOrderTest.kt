@@ -327,6 +327,43 @@ class SupplierOrderTest {
         assertEquals("漏掉内边距时同一指尖被算成第 2 格（这就是那个缺陷）", 2, slotAt(justAboveTheLine, 0))
     }
 
+    @Test
+    fun `a gesture is judged in the frame it started in, not the one the list has scrolled to`() {
+        // 第二类缺陷，只能在设备上抓到：列表会跟着「第一可见行」的 key 保持位置。被拖的行如果
+        // 就是那一行，每次换位列表都往下滚一格，锚点的 offset 从 0 变成 -163（设备 log 实测），
+        // 指尖没动、判定基准却整体下移一格。逐帧重读布局就把它算成指尖的位移：手指走了一格，
+        // 判定说走了两格，行于是越拖越跑。
+        //
+        // 这里把两种读法都算出来：按下时采下的一帧（修好后的行为）说 1，滚动后重读的一帧
+        // （修法之前的写法）说 2。数值全部来自那条设备 log：listTop 253、viewportStartOffset
+        // -21、行高 147、格距 163、按下时指尖在 root 362。
+        fun slotAt(fingerRootY: Float, anchorOffset: Int): Int = supplierSlotUnderFinger(
+            fingerRootY = fingerRootY,
+            listTopInRoot = 253f,
+            viewportStartOffset = -21,
+            anchorIndex = 0,
+            anchorOffset = anchorOffset,
+            anchorSize = 147,
+            pitch = 163f,
+            lastIndex = 6,
+        )
+
+        val pressedAt = 362f
+        val travelledOneRow = pressedAt + 163f
+
+        assertEquals("按下时指尖落在被拖的那一格", 0, slotAt(pressedAt, anchorOffset = 0))
+        assertEquals(
+            "手指下移一格就该换到下一格（按下时采下的那一帧）",
+            1,
+            slotAt(travelledOneRow, anchorOffset = 0),
+        )
+        assertEquals(
+            "同一根手指、同一段位移，只是列表跟着换位滚了一格——重读布局就把它算成两格，这就是那个缺陷",
+            2,
+            slotAt(travelledOneRow, anchorOffset = -163),
+        )
+    }
+
     // ---- Harness -----------------------------------------------------------
 
     /**

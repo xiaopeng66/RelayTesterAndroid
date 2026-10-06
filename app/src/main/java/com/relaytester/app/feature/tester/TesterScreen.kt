@@ -34,6 +34,7 @@ import androidx.compose.foundation.layout.wrapContentSize
 import androidx.compose.foundation.lazy.LazyItemScope
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -646,6 +647,65 @@ internal fun supplierSlotUnderFinger(
     return raw.roundToInt().coerceIn(0, lastIndex)
 }
 
+/**
+ * The frame one gesture judges the finger in, sampled once when the finger goes down.
+ *
+ * The list reports item offsets from the **start of its content**, so the finger's place in
+ * the list is `fingerRootY - listTopInRoot + viewportStartOffset`, and the slot's centre is
+ * the anchor's offset plus [anchorSize] / 2, a whole [pitch] between neighbours. Every one
+ * of those numbers moves while the drag is running — a reorder scrolls the list whenever the
+ * dragged row is its scroll anchor (the first visible one), and the anchor's offset then
+ * changes by exactly one row. Re-reading them per event bills that scroll to the finger: a
+ * finger that travelled one row is judged one row further, and each further event adds
+ * another, so the row runs away from the hand. Fixed at the start of the gesture, the
+ * mapping depends on the finger's travel alone, which is the only thing the user controls.
+ */
+private data class SupplierDragFrame(
+    val listTopInRoot: Float,
+    val viewportStartOffset: Int,
+    val anchorIndex: Int,
+    val anchorOffset: Int,
+    val anchorSize: Int,
+    val pitch: Float,
+    val scrollIndex: Int,
+    val scrollOffset: Int,
+)
+
+/**
+ * Samples the frame a drag started in: [supplierSlotUnderFinger]'s inputs as the layout stood
+ * when the finger went down, plus the list's own scroll state so the window can be put back
+ * where it was. Sampling the scroll state instead of deriving it from item offsets keeps this
+ * free of the padding arithmetic that [supplierSlotUnderFinger] deals with: the two fields are
+ * exactly what `scrollToItem` takes. See [SupplierDragFrame] for why the frame is captured
+ * once per gesture rather than read back per event.
+ */
+private fun currentSupplierDragFrame(
+    listState: LazyListState,
+    listTopInRoot: Float,
+    spacingPx: Float,
+): SupplierDragFrame? {
+    val info = listState.layoutInfo
+    val visible = info.visibleItemsInfo
+    val anchor = visible.firstOrNull() ?: return null
+    if (listTopInRoot.isNaN()) return null
+    val pitch = if (visible.size >= 2) {
+        (visible[1].offset - visible[0].offset).toFloat()
+    } else {
+        anchor.size + spacingPx
+    }
+    if (pitch <= 0f) return null
+    return SupplierDragFrame(
+        listTopInRoot = listTopInRoot,
+        viewportStartOffset = info.viewportStartOffset,
+        anchorIndex = anchor.index,
+        anchorOffset = anchor.offset,
+        anchorSize = anchor.size,
+        pitch = pitch,
+        scrollIndex = listState.firstVisibleItemIndex,
+        scrollOffset = listState.firstVisibleItemScrollOffset,
+    )
+}
+
 private const val INITIAL_DEFERRED_CONTENT_DELAY_MS = 350L
 private const val MAX_MODEL_SOURCES_PER_ENTRY = 32
 
@@ -1002,10 +1062,14 @@ private fun SupplierSelector(
  * A drag is judged by **which slot the finger is over**, not by how far the row has
  * travelled: the finger is converted to root coordinates (so the row's own movement, and
  * the swap animation, cannot leak into the judgement) and mapped onto the row offsets the
- * list reports. The target travels as a slot number and the view model clamps it against
- * the live list, which makes a repeated event resolve to "already there" instead of
- * swapping back — the bounce the travel-based version produced. Rows animate to their new
- * places through `Modifier.animateItem`, and nothing is written until the finger is up.
+ * list reported when the finger went down — the frame is sampled once per gesture, because a
+ * reorder of the list's scroll anchor scrolls the list and would otherwise be billed to the
+ * finger, moving the row a slot further with every event. The target travels as a slot number
+ * and the view model clamps it against the live list, which makes a repeated event resolve to
+ * "already there" instead of swapping back — the bounce the travel-based version produced.
+ * Rows animate to their new places through `Modifier.animateItem`. Each slot crossing is
+ * committed as it happens (the view model writes the list and rolls that crossing back if the
+ * write fails), so a drag that never leaves its slot writes nothing at all.
  */
 @Composable
 private fun SupplierOrderDialog(
@@ -1022,8 +1086,21 @@ private fun SupplierOrderDialog(
     // 同一处，判定出的永远是同一格——换成累加被拖行自己的位移，换位会让行自己挪一格，位移里
     // 就凭空多出一格，行会立刻往回换（两行来回跳的根因）。视口的顶边在根坐标里量一次即可。
     var listTopInRoot by remember { mutableFloatStateOf(Float.NaN) }
+    // 判定用的那一帧在手指按下时采一次，整次拖动不再重读。被拖的行如果是列表的滚动锚点
+    // （第一行可见的就是它），换位会让列表跟着滚一格：布局里的锚点位移于是凭空少一格/多一格，
+    // 逐帧重读就把这次滚动算进指尖的位移里，手指只走了一格、判定却说走了两格，行越拖越跑。
+    var dragFrame by remember { mutableStateOf<SupplierDragFrame?>(null) }
     // 只剩一行可量时兜底用的行距；正常路径下格子间距直接量自布局信息。
     val spacingPx = with(LocalDensity.current) { SUPPLIER_ORDER_ROW_SPACING.toPx() }
+    // 拖动期间把窗口按「第几行」钉住。列表自己会跟着第一可见那行的 key 保持位置：被拖的行如果
+    // 就是它，换位一次列表就往下滚一格，行被钉在按下的位置不动、内容从手下滑走，看起来像行不跟手
+    // （手指走了一格、行还在原地）。每次顺序变化后把窗口恢复成按下时的那一格，画面里就只剩行
+    // 在动；手指不动时恢复成同一个位置，等于没恢复。放下之后不再干预，列表照常可以自己滚。
+    LaunchedEffect(draggingId, suppliers) {
+        val frame = dragFrame ?: return@LaunchedEffect
+        if (draggingId == null) return@LaunchedEffect
+        listState.scrollToItem(frame.scrollIndex, frame.scrollOffset)
+    }
 
     Dialog(
         onDismissRequest = onDismiss,
@@ -1082,35 +1159,34 @@ private fun SupplierOrderDialog(
                                     supplier = supplier,
                                     position = index + 1,
                                     isDragging = supplier.id == draggingId,
-                                    onStartDrag = { draggingId = supplier.id },
-                                    onStopDrag = { draggingId = null },
+                                    onStartDrag = {
+                                        draggingId = supplier.id
+                                        dragFrame = currentSupplierDragFrame(
+                                            listState,
+                                            listTopInRoot,
+                                            spacingPx,
+                                        )
+                                    },
+                                    onStopDrag = {
+                                        draggingId = null
+                                        dragFrame = null
+                                    },
                                     // 换位判据是「指尖落在哪一格」，不是「行了多少行」：行自己会随着
                                     // 换位挪动，累加它的位移会把换位本身算进去，越拖越乱；格子的位置
                                     // 只由列表的布局决定，手指不动就不换。落在两格之间按最近的算，
                                     // 越出列表按两端夹住——拖到列表外面就是「放到最前／最后」。
                                     onDragAt = { movedId, pointerRootY ->
-                                        val info = listState.layoutInfo
-                                        val visible = info.visibleItemsInfo
-                                        val anchor = visible.firstOrNull()
-                                        if (anchor == null || listTopInRoot.isNaN()) {
-                                            return@SupplierOrderRow
-                                        }
-                                        val pitch = if (visible.size >= 2) {
-                                            (visible[1].offset - visible[0].offset).toFloat()
-                                        } else {
-                                            anchor.size + spacingPx
-                                        }
-                                        if (pitch <= 0f) return@SupplierOrderRow
+                                        val frame = dragFrame ?: return@SupplierOrderRow
                                         onMove(
                                             movedId,
                                             supplierSlotUnderFinger(
                                                 fingerRootY = pointerRootY,
-                                                listTopInRoot = listTopInRoot,
-                                                viewportStartOffset = info.viewportStartOffset,
-                                                anchorIndex = anchor.index,
-                                                anchorOffset = anchor.offset,
-                                                anchorSize = anchor.size,
-                                                pitch = pitch,
+                                                listTopInRoot = frame.listTopInRoot,
+                                                viewportStartOffset = frame.viewportStartOffset,
+                                                anchorIndex = frame.anchorIndex,
+                                                anchorOffset = frame.anchorOffset,
+                                                anchorSize = frame.anchorSize,
+                                                pitch = frame.pitch,
                                                 lastIndex = suppliers.lastIndex,
                                             ),
                                         )
