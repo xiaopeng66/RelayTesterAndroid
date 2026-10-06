@@ -92,6 +92,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -213,7 +214,7 @@ fun TesterScreen(
     var showModelCatalog by rememberSaveable { mutableStateOf(false) }
     var configurationSupplierId by rememberSaveable { mutableStateOf<String?>(null) }
     var showSupplierOrder by rememberSaveable { mutableStateOf(false) }
-    var saveCompletedAt by rememberSaveable { mutableStateOf(0L) }
+    var saveCompletedAt by rememberSaveable { mutableLongStateOf(0L) }
     var supplierToDeleteId by rememberSaveable { mutableStateOf<String?>(null) }
     // The configuration card already fills the first viewport. Keeping the
     // below-fold form out of the first composition prevents LazyColumn's

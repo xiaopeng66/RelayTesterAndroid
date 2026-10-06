@@ -40,7 +40,12 @@ import androidx.compose.ui.unit.dp
  * **必须在弹窗外面调用**（就是创建 Dialog 的那层组合，比如弹窗函数自己的函数体）：读的是这个
  * 组合里的内边距，而弹窗自己的窗口夹在状态栏与导航栏之间，在它内部 WindowInsets 一律报 0，
  * 那样算出来就等于整屏尺寸，这个修复就白做了。传进去的 Modifier 是普通值，可以跨进弹窗内容。
+ *
+ * 这是个 `remember` 帮助函数而不是 Modifier 工厂：它按窗口尺寸算出一个**值**，没有可链式的
+ * 上游 Modifier 可用，也不该被写成 `Modifier.xxx()` 那样的扩展（接收者会永远被丢弃）。lint 的
+ * ModifierFactoryExtensionFunction 只看「返回 Modifier 又不是扩展」，因此在这里是误报。
  */
+@Suppress("ModifierFactoryExtensionFunction")
 @Composable
 fun rememberDialogWindowBox(): Modifier {
     val configuration = LocalConfiguration.current

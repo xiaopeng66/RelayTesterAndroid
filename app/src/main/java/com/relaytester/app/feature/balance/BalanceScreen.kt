@@ -69,6 +69,7 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -252,7 +253,7 @@ private fun BalanceHome(
     // credentialsSupplierId 同为 saveable，旋转时确认框不能只剩一个空壳。
     var templateToDeleteId by rememberSaveable { mutableStateOf<String?>(null) }
     var credentialsSupplierId by rememberSaveable { mutableStateOf<String?>(null) }
-    var credentialsSavedAt by rememberSaveable { mutableStateOf(0L) }
+    var credentialsSavedAt by rememberSaveable { mutableLongStateOf(0L) }
     val activeSupplier = state.suppliers.firstOrNull { it.id == state.activeSupplierId }
     val selectedTemplate = state.templates.firstOrNull { it.id == activeSupplier?.balanceTemplateId }
         ?: state.templates.firstOrNull()
