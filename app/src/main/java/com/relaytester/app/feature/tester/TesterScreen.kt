@@ -612,6 +612,40 @@ private val SUPPLIER_ORDER_ROW_HEIGHT = 56.dp
 // 这个常量只在列表里只剩一行可量时兜底。
 private val SUPPLIER_ORDER_ROW_SPACING = 6.dp
 
+/**
+ * Which slot the finger at [fingerRootY] is over, as an index into the supplier list.
+ *
+ * Arithmetic on purpose: this is the one part of the drag that [SupplierOrderTest] can pin
+ * with numbers instead of a source-contract regex, and it is exactly where a real defect
+ * hid. The list reports item offsets from the **start of its content**, while the finger is
+ * captured against the list's own top edge; the gap between the two is the list's leading
+ * content padding, which the layout publishes as a negative [viewportStartOffset]. Judging
+ * the finger without it puts it one padding lower than it is — on the device that was 8dp
+ * (21px), so every slot boundary fired 21px early and a finger resting on a boundary moved
+ * the row one slot too far.
+ *
+ * The rest of the mapping is what makes the target a pure function of where the finger is:
+ * the anchor's own geometry fixes the frame, and every other visible row sits a whole
+ * [pitch] away from it. A finger that has not moved therefore resolves to the same slot
+ * however much the rows have shifted underneath, which is what stops the rows bouncing.
+ * Slots outside the list are clamped to its ends, so dragging past an end means "put it
+ * first/last" rather than being dropped.
+ */
+internal fun supplierSlotUnderFinger(
+    fingerRootY: Float,
+    listTopInRoot: Float,
+    viewportStartOffset: Int,
+    anchorIndex: Int,
+    anchorOffset: Int,
+    anchorSize: Int,
+    pitch: Float,
+    lastIndex: Int,
+): Int {
+    val fingerInContent = fingerRootY - listTopInRoot + viewportStartOffset
+    val raw = anchorIndex + (fingerInContent - (anchorOffset + anchorSize / 2f)) / pitch
+    return raw.roundToInt().coerceIn(0, lastIndex)
+}
+
 private const val INITIAL_DEFERRED_CONTENT_DELAY_MS = 350L
 private const val MAX_MODEL_SOURCES_PER_ENTRY = 32
 
@@ -1055,7 +1089,8 @@ private fun SupplierOrderDialog(
                                     // 只由列表的布局决定，手指不动就不换。落在两格之间按最近的算，
                                     // 越出列表按两端夹住——拖到列表外面就是「放到最前／最后」。
                                     onDragAt = { movedId, pointerRootY ->
-                                        val visible = listState.layoutInfo.visibleItemsInfo
+                                        val info = listState.layoutInfo
+                                        val visible = info.visibleItemsInfo
                                         val anchor = visible.firstOrNull()
                                         if (anchor == null || listTopInRoot.isNaN()) {
                                             return@SupplierOrderRow
@@ -1066,11 +1101,19 @@ private fun SupplierOrderDialog(
                                             anchor.size + spacingPx
                                         }
                                         if (pitch <= 0f) return@SupplierOrderRow
-                                        val fingerY = pointerRootY - listTopInRoot
-                                        val raw = anchor.index +
-                                            (fingerY - (anchor.offset + anchor.size / 2f)) / pitch
-                                        val slot = raw.roundToInt().coerceIn(0, suppliers.lastIndex)
-                                        onMove(movedId, slot)
+                                        onMove(
+                                            movedId,
+                                            supplierSlotUnderFinger(
+                                                fingerRootY = pointerRootY,
+                                                listTopInRoot = listTopInRoot,
+                                                viewportStartOffset = info.viewportStartOffset,
+                                                anchorIndex = anchor.index,
+                                                anchorOffset = anchor.offset,
+                                                anchorSize = anchor.size,
+                                                pitch = pitch,
+                                                lastIndex = suppliers.lastIndex,
+                                            ),
+                                        )
                                     },
                                 )
                             }

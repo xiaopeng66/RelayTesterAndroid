@@ -10,6 +10,7 @@ import com.relaytester.app.core.storage.SupplierStore
 import com.relaytester.app.core.storage.SupplierStoreState
 import com.relaytester.app.feature.tester.TesterUiState
 import com.relaytester.app.feature.tester.TesterViewModel
+import com.relaytester.app.feature.tester.supplierSlotUnderFinger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.withContext
@@ -227,6 +228,103 @@ class SupplierOrderTest {
         subject.moveSupplierTo(supplierId = "c", targetIndex = 0)
 
         assertEquals(listOf("c", "a", "b"), awaitSaved(store).map { it.id })
+    }
+
+    // ---- Where the finger is, in slot numbers ------------------------------
+
+    /**
+     * The finger-to-slot mapping, with the numbers the device produced.
+     *
+     * Real defect this pins: the list reports item offsets from the start of its content,
+     * but the finger was measured against the list's top edge, and the two differ by the
+     * list's leading content padding — 8dp here, published as `viewportStartOffset = -21px`.
+     * Leaving that term out judged the finger one padding too low, so every boundary fired
+     * 21px early: on the device a finger resting on a slot boundary moved the row one slot
+     * past it. These are the measured coordinates (root px, density 2.625, row 147px, pitch
+     * 163px, 8dp = 21px), not invented ones.
+     */
+    @Test
+    fun `the slot under the finger is measured from the same origin the list reports`() {
+        // Row 0 sits at root y 573..720, the list's own top edge is 552, so the content
+        // starts 21px below it: viewportStartOffset = -21.
+        val rowTop = 573f
+        val rowHeight = 147
+        val pitch = 163f
+        val listTop = 552f
+
+        fun slotAt(fingerRootY: Float, last: Int = 6): Int = supplierSlotUnderFinger(
+            fingerRootY = fingerRootY,
+            listTopInRoot = listTop,
+            viewportStartOffset = -21,
+            anchorIndex = 0,
+            anchorOffset = 0,
+            anchorSize = rowHeight,
+            pitch = pitch,
+            lastIndex = last,
+        )
+
+        // The exact device reading: finger at root 809 while row 0 was the anchor -> slot 1.
+        assertEquals(1, slotAt(809f))
+        // Each row's centre must name that row, and nothing in between may drift.
+        for (slot in 0..6) {
+            val centre = rowTop + slot * pitch + rowHeight / 2f
+            assertEquals("指尖落在第 $slot 行中心", slot, slotAt(centre))
+        }
+        // A finger resting just short of a boundary still names the row it is over. This is
+        // the assertion the missing term failed: rows are 147px with a 16px gap, so the true
+        // midline between row k and k+1 sits 155px below row k's top, and judging the finger
+        // 21px too low pushed anything within 21px above that line into the next slot.
+        val gap = pitch - rowHeight
+        for (slot in 0..5) {
+            val midline = rowTop + slot * pitch + rowHeight + gap / 2f
+            assertEquals("指尖压在第 $slot / ${slot + 1} 行之间的中线偏上侧", slot, slotAt(midline - 4f))
+            assertEquals("指尖压在中线偏下侧", slot + 1, slotAt(midline + 4f))
+        }
+    }
+
+    @Test
+    fun `a finger past either end of the list names the end slot`() {
+        fun slotAt(fingerRootY: Float): Int = supplierSlotUnderFinger(
+            fingerRootY = fingerRootY,
+            listTopInRoot = 552f,
+            viewportStartOffset = -21,
+            anchorIndex = 0,
+            anchorOffset = 0,
+            anchorSize = 147,
+            pitch = 163f,
+            lastIndex = 6,
+        )
+        assertEquals("拖到列表上方＝放到最前", 0, slotAt(-5000f))
+        assertEquals("拖到列表下方＝放到最后", 6, slotAt(5000f))
+    }
+
+    @Test
+    fun `a scrolled list is judged against the anchor the layout reports`() {
+        // Landscape with 7 suppliers: the window shows four rows and the anchor is not the
+        // first. Device reading: anchor index 1 at offset -52 (the first visible row is
+        // already half scrolled away), list top 205, viewportStartOffset -21, finger at
+        // root 290 -> slot 2. A mapping that ignored the anchor's own offset would name a
+        // slot relative to the window instead of to the list.
+        fun slotAt(fingerRootY: Float, viewportStartOffset: Int): Int = supplierSlotUnderFinger(
+            fingerRootY = fingerRootY,
+            listTopInRoot = 205f,
+            viewportStartOffset = viewportStartOffset,
+            anchorIndex = 1,
+            anchorOffset = -52,
+            anchorSize = 147,
+            pitch = 163f,
+            lastIndex = 6,
+        )
+        assertEquals(2, slotAt(450f, -21))
+
+        // And the regression itself: this finger sits a few px above the boundary between
+        // slots 1 and 2 in the content frame, and the term is what decides which side of the
+        // line the code thinks it is. Ignore the padding and the same finger is judged 21px
+        // lower, i.e. past the line — the off-by-one whose device symptom was a row moved one
+        // slot too far when the finger rested near a boundary.
+        val justAboveTheLine = 324f
+        assertEquals("带上内边距时指尖仍属第 1 格", 1, slotAt(justAboveTheLine, -21))
+        assertEquals("漏掉内边距时同一指尖被算成第 2 格（这就是那个缺陷）", 2, slotAt(justAboveTheLine, 0))
     }
 
     // ---- Harness -----------------------------------------------------------

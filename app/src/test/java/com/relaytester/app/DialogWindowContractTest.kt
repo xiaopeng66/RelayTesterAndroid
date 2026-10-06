@@ -208,18 +208,19 @@ class DialogWindowContractTest {
 
     @Test
     fun `the drag resolves the slot under the finger, from a frame the row cannot move`() {
-        // 拖动的换位判据是「指尖落在哪一格」。这句话有三个承重件，任何一件错了都只有设备上才
-        // 看得出来，而 SupplierOrderTest 只测得到原语（把换算写死成常数，那些测试照样全绿）：
+        // 拖动的换位判据是「指尖落在哪一格」。几个承重件任何一件错了都只有设备上才看得出来：
         //
         // ① 指尖必须换算到根坐标。行自己会随着换位挪动，行本地坐标系跟着一起动，用行本地坐标
         //    就等价于「累加被拖行自己的位移」——换位那一下会在位移里凭空多出一格，行立刻又被
         //    换回去，两行就这么一直来回替换（用户报的就是这个）。
-        // ② 根坐标要减掉列表视口的顶边，换算到「列表内第几格」这个尺度上；视口自己不随换位
-        //    移动，所以手指不动，落格就不动。
-        // ③ 落格要四舍五入（半格＝两格中点），并夹在两端——拖出列表就是放到最前／最后。
+        // ② 换算交给 supplierSlotUnderFinger：它把指尖与 itemsInfo 的 offset 放到同一个基准上
+        //    （offset 从视口起点量起，向上还隔着列表的上内边距），四舍五入落格再夹到两端。
+        //    这一条上一版漏了内边距，设备实测每格提前 21px 翻转——数值回归在 SupplierOrderTest。
+        // ③ 手势挂在整行上（见下一条），拖动才起得来。
         //
         // 格子间距量自列表布局（itemsInfo 的相邻 offset 之差），不是写死的行高：行距一改，
-        // 换算不该跟着失准。
+        // 换算不该跟着失准。这几条是源码事实；能算的那部分已经搬进 SupplierOrderTest 的数值
+        // 用例，这里只留「这几种写法必须继续存在于源码里」。
         val file = File(sourceRoot, "com/relaytester/app/feature/tester/TesterScreen.kt")
         assertTrue("找不到 TesterScreen.kt：${file.absolutePath}", file.isFile)
         val text = code(file)
@@ -229,12 +230,20 @@ class DialogWindowContractTest {
             "localToRoot(change.position).y" in text,
         )
         assertTrue(
-            "根坐标没有减掉列表视口的顶边：同一根手指在不同滚动位置上会算出不同的格子",
-            "pointerRootY - listTopInRoot" in text,
+            "指尖没有换算到列表内容这个基准（漏掉上内边距）：指尖会被算低一个内边距",
+            "supplierSlotUnderFinger(" in text,
+        )
+        assertTrue(
+            "落格函数没有减掉列表顶边与上内边距：同一根手指在不同滚动位置上会算出不同的格子",
+            "fingerRootY - listTopInRoot + viewportStartOffset" in text,
         )
         assertTrue(
             "没有用四舍五入落格：半格处不换位，拖到两行之间时换位会迟一格",
-            Regex("""\.roundToInt\(\)\.coerceIn\(0, suppliers\.lastIndex\)""").containsMatchIn(text),
+            Regex("""\.roundToInt\(\)\.coerceIn\(0, lastIndex\)""").containsMatchIn(text),
+        )
+        assertTrue(
+            "指尖与 offset 没有换到同一基准：offset 从视口起点量起，漏掉上内边距就会算低一格",
+            "+ viewportStartOffset" in text,
         )
         assertTrue(
             "格子间距没有量自列表布局（相邻行的 offset 之差）：行距一改换算就失准",
