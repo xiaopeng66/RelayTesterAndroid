@@ -7,9 +7,10 @@ package com.relaytester.app.core.fingerprint
  * per process rather than per detection. Which copy gets parsed — the installed one or
  * nothing — is [FingerprintBankStore]'s decision, not this class's.
  *
- * Scoring is a port of upstream's `shared-detector-v1`: see [SharedScoring] for the
- * algorithm and its two deviations, both of which only drop upstream's artifact-hash
- * binding (our package *is* that binding).
+ * Scoring is a port of upstream's `shared-detector-v2` for the current package format
+ * and of `shared-detector-v1` for the older one; see [SharedScoring] for both formulas,
+ * for why the package format picks between them, and for the two deviations (both of
+ * which only drop upstream's artifact-hash binding — our package *is* that binding).
  */
 class FingerprintBank private constructor(
     val modelIds: List<String>,
@@ -23,6 +24,12 @@ class FingerprintBank private constructor(
     private val weights: DetectorWeights,
 ) {
     val modelCount: Int get() = modelIds.size
+
+    /**
+     * The upstream detector schema the package was built from, or empty for a package
+     * that predates the field. Always [SUPPORTED_SCHEMA] for a package this class accepts.
+     */
+    val detectorSchema: String get() = weights.detectorSchema
 
     /**
      * Scores one round of answers and returns candidates ordered by ranking score.
@@ -104,7 +111,21 @@ class FingerprintBank private constructor(
         /** Upstream accepts an answer at 55% of the requested integer count. */
         const val VALIDITY_RATIO = 0.55
 
-        private const val MAGIC = "LMFPA003"
+        /**
+         * The current package format: a v2 ranker, so the package carries the positional
+         * head and the blend alongside the frequency-side numbers.
+         */
+        private const val MAGIC = "LMFPA004"
+
+        /**
+         * The format published while upstream was still on `shared-detector-v1`.
+         *
+         * A device that has not re-downloaded its package still holds one of these, and
+         * its numbers were fitted for the v1 ranking, so it is scored with the v1 formula
+         * (see [SharedScoring]). Nothing is missing from the reader's point of view: the
+         * only difference is that the v1 fields are the whole ranker.
+         */
+        private const val V1_MAGIC = "LMFPA003"
 
         /**
          * The format published before upstream dropped its verifier scorer.
@@ -116,9 +137,27 @@ class FingerprintBank private constructor(
          */
         private const val LEGACY_MAGIC = "LMFPA002"
 
+        /** The one upstream schema this app implements; a package saying otherwise is newer. */
+        private const val SUPPORTED_SCHEMA = "shared-detector-v2"
+
         /** Width of the ordered-block half of the feature vector upstream's detector emits. */
         private const val ORDERED_DIMENSION = 74
         private const val FEATURE_DIMENSION = NumberFeatures.DIMENSION + ORDERED_DIMENSION
+
+        /**
+         * The positional head's four blocks, in ranker order: frequency, ordered-block,
+         * position kernel, sequence. Their widths are structural (each is a different
+         * feature construction), so a package whose block widths differ was built for a
+         * detector this reader does not understand.
+         */
+        private val POSITIONAL_BLOCK_DIMENSIONS = intArrayOf(
+            NumberFeatures.DIMENSION,
+            ORDERED_DIMENSION,
+            NumberFeatures.POSITION_KERNEL_DIMENSION,
+            NumberFeatures.SEQUENCE_DIMENSION,
+        )
+        private val POSITIONAL_DIMENSION = POSITIONAL_BLOCK_DIMENSIONS.sum()
+
         /**
          * Parses packed package bytes.
          *
@@ -130,7 +169,10 @@ class FingerprintBank private constructor(
         fun fromPackageBytes(bytes: ByteArray): FingerprintBank {
             val reader = BankReader(bytes)
             val magic = reader.magic()
-            if (magic != MAGIC && magic != LEGACY_MAGIC) throw IllegalArgumentException("指纹检测包格式不匹配")
+            when (magic) {
+                MAGIC, V1_MAGIC, LEGACY_MAGIC -> Unit
+                else -> throw IllegalArgumentException("指纹检测包格式不匹配")
+            }
             reader.expectMagic(magic)
             val legacyVerifier = magic == LEGACY_MAGIC
             reader.string() // source reference digest, informational
@@ -179,6 +221,22 @@ class FingerprintBank private constructor(
 
             if (legacyVerifier) skipVerifier(reader)
 
+            // The v2 tail: the blend, the positional head, and the upstream schema the
+            // package was built from. Read last so the frequency-side layout above stays
+            // byte-for-byte what it was.
+            var blend: RankerBlend? = null
+            var positional: PositionalHead? = null
+            var schema = ""
+            if (magic == MAGIC) {
+                blend = RankerBlend(reader.float64(), reader.float64())
+                positional = PositionalHead(
+                    params = readParams(reader, "位置"),
+                    weights = reader.u32().let { rows -> reader.matrix(rows, reader.u32()) },
+                    bias = reader.floats(reader.u32()),
+                )
+                schema = reader.string()
+            }
+
             // Every count above came out of the file, so a file that stops early or
             // carries trailing junk is rejected here instead of scoring nonsense later.
             require(reader.fullyRead) { "指纹检测包长度与内容不一致" }
@@ -193,6 +251,9 @@ class FingerprintBank private constructor(
                 environments = environments,
                 references = references,
                 tau = tau,
+                positional = positional,
+                blend = blend,
+                detectorSchema = schema,
             )
             validate(ids, weights, modelCount)
 
@@ -308,6 +369,44 @@ class FingerprintBank private constructor(
             require(weights.references.all { it.columns == FEATURE_DIMENSION }) {
                 "指纹检测包的 kNN 参考维度不是 $FEATURE_DIMENSION"
             }
+            val positional = weights.positional
+            val blend = weights.blend
+            require((positional == null) == (blend == null)) {
+                "指纹检测包的位置判别块不完整：混合权重与位置头要么都有、要么都没有"
+            }
+            if (positional != null && blend != null) {
+                // The package's own statement of which algorithm its numbers were fitted
+                // for. A schema this app does not implement means the numbers mean
+                // something else; installing it would score every answer with the wrong
+                // formula, which looks exactly like a working detector. Refusing here is
+                // the only place that can be caught, so it is a hard stop with a message
+                // the panel can show — and its own exception type, because "update the app"
+                // is a different answer from "this file is broken".
+                if (weights.detectorSchema != SUPPORTED_SCHEMA) {
+                    throw BankSchemaTooNewException(weights.detectorSchema, SUPPORTED_SCHEMA)
+                }
+                require(blend.frequency.isFinite() && blend.positional.isFinite()) {
+                    "指纹检测包的混合权重不是有效数值"
+                }
+                require(positional.params.size == POSITIONAL_BLOCK_DIMENSIONS.size) {
+                    "指纹检测包的位置标准化块数量不是 ${POSITIONAL_BLOCK_DIMENSIONS.size}"
+                }
+                for (index in POSITIONAL_BLOCK_DIMENSIONS.indices) {
+                    val expected = POSITIONAL_BLOCK_DIMENSIONS[index]
+                    require(
+                        positional.params[index].mean.size == expected &&
+                            positional.params[index].scale.size == expected,
+                    ) {
+                        "指纹检测包的位置标准化第 $index 块维度不是 $expected"
+                    }
+                }
+                require(positional.weights.size == modelCount && positional.bias.size == modelCount) {
+                    "指纹检测包的位置权重与模型数量不一致"
+                }
+                require(positional.weights.all { it.size == POSITIONAL_DIMENSION }) {
+                    "指纹检测包的位置权重维度不是 $POSITIONAL_DIMENSION"
+                }
+            }
             require(ids.distinct().size == modelCount) { "指纹检测包的模型 id 有重复" }
         }
 
@@ -365,3 +464,23 @@ class FingerprintBank private constructor(
         }
     }
 }
+
+/**
+ * The package is well-formed but was built for a detector schema this app does not implement.
+ *
+ * Kept apart from the other parse failures on purpose: the bytes are fine and a newer app
+ * scores them correctly, so the answer to the user is "update the app" — not "the publisher
+ * sent a broken file". A manifest's format version cannot carry that distinction: it gates on
+ * the package *shape*, while a publisher can ship a shape this app knows with numbers fitted
+ * against a ranking it does not (upstream changing its schema without changing the shape).
+ *
+ * Thrown by [FingerprintBank.fromPackageBytes], and mapped to its own install message by
+ * [FingerprintBankStore.install].
+ */
+class BankSchemaTooNewException(val schema: String, val supported: String) : IllegalArgumentException(
+    if (schema.isBlank()) {
+        "检测包未标注打分 schema，无法确认它按哪套公式打分：请重新下载检测包"
+    } else {
+        "检测包按 $schema 生成，本版本 App 只实现了 $supported：请先更新 App"
+    },
+)

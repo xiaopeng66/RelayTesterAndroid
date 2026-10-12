@@ -10,6 +10,7 @@ import com.relaytester.app.core.storage.SupplierStore
 import com.relaytester.app.core.storage.SupplierStoreState
 import com.relaytester.app.feature.tester.TesterUiState
 import com.relaytester.app.feature.tester.TesterViewModel
+import com.relaytester.app.feature.tester.overlayOffsetY
 import com.relaytester.app.feature.tester.supplierAutoScrollStep
 import com.relaytester.app.feature.tester.supplierSlotUnderFinger
 import kotlinx.coroutines.Dispatchers
@@ -444,6 +445,29 @@ class SupplierOrderTest {
         assertEquals("拖出视口之外仍是满速（一直滚到顶/底）", -maxStep, stepAt(top - 400f), 0.0001f)
         // 视口还没量出来（NaN）时不滚：不能凭一个 NaN 去推动列表。
         assertEquals("视口未测量时不滚", 0f, stepAt(Float.NaN), 0.0001f)
+    }
+
+    /**
+     * 浮层与指尖的几何：捏住行的哪一处，行就停在哪一处。
+     *
+     * 被拖的那一行画在列表之外，位置只由指尖决定（`SupplierOrderDialog` 的浮层）。这一条就是
+     * 「看起来像被提着走，而不是整行跳到指尖中心」的全部内容，也能脱离设备算出来。
+     */
+    @Test
+    fun `the carried row keeps the fingertip where it was grabbed`() {
+        // Device geometry (density 2.625, 48dp rows): the finger pressed 40px below the row's
+        // top edge, and that edge sat 200px below the top of the list box.
+        assertEquals("捏在行顶下 40px：行顶停在指尖上方 40px", 160, overlayOffsetY(200f, 40f))
+        assertEquals(
+            "指尖移到 500px：行顶跟到 460px，捏住的那一点仍贴着指尖",
+            460,
+            overlayOffsetY(500f, 40f),
+        )
+        assertEquals(
+            "指尖还没落位（NaN）时给 0：roundToInt 对 NaN 会抛异常，而这个偏移每帧都要算一遍",
+            0,
+            overlayOffsetY(Float.NaN, 40f),
+        )
     }
 
 

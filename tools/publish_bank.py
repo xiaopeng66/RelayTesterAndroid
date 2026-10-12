@@ -55,14 +55,17 @@ MAGIC_LENGTH = 8
 # this to the working tree's versionCode would advertise a requirement for an app that does
 # not exist yet, and every installed device would be told to update the app before it may
 # use a package it can already read. Raise it only when a package starts using something an
-# older app cannot parse, and raise it to the version that learned to — the current fleet's
-# code, which is 10600.
-MIN_APP_VERSION_CODE = 10_600
+# older app cannot parse, and raise it to the version that learned to — which is 10801, the
+# first app that reads the v2 ranker (LMFPA004). Until that APK is out, publishing a 004
+# package would hand every installed device a manifest its app refuses as "too new"; the
+# order is therefore: release the app, then let the pipeline publish.
+MIN_APP_VERSION_CODE = 10_801
 # The manifest's formatVersion is read off the package's own magic rather than being a
-# constant here: two shapes are live while the fleet upgrades (format 2 still carries
-# upstream's removed verifier block, format 3 does not), and a publish that hardcoded
-# the number could advertise the wrong one and have the app reject a valid package.
-FORMAT_BY_MAGIC = {b"LMFPA002": 2, b"LMFPA003": 3}
+# constant here: three shapes are live while the fleet upgrades (format 2 still carries
+# upstream's removed verifier block, format 3 dropped it, format 4 carries the v2 ranker's
+# positional head), and a publish that hardcoded the number could advertise the wrong one
+# and have the app reject a valid package.
+FORMAT_BY_MAGIC = {b"LMFPA002": 2, b"LMFPA003": 3, b"LMFPA004": 4}
 
 RELEASE_BODY = """指纹检测包的发布源，供「指纹检测」面板的「检查更新」按钮读取。
 

@@ -563,13 +563,47 @@ class FingerprintBankStoreTest {
     }
 
     @Test
+    fun `a package for a newer detector schema says to update the app`() {
+        // The reader produces a specific message for this case ("update the app", naming both
+        // schemas). The install path is where it has to survive: a valid package reported as
+        // "not a valid package" would tell the user the publisher sent garbage and leave them
+        // with nothing to do about it.
+        val files = MemoryBankFileSystem(installed = null)
+
+        val result = files.store().install(bankWithSchema("shared-detector-v3"))
+
+        val rejected = result as BankInstallResult.Rejected
+        assertTrue("拒绝原因必须点名 schema：${rejected.reason}", rejected.reason.contains("shared-detector-v3"))
+        assertFalse(
+            "不得把「App 太旧」说成「文件无效」：${rejected.reason}",
+            rejected.reason.contains("不是有效的检测包"),
+        )
+        assertNull("被拒的包不得留下文件", files.installed)
+    }
+
+    @Test
+    fun `a v2-shaped package without a schema cannot claim to be scorable`() {
+        // The schema field is what the reader trusts to decide the formula, so a package that
+        // carries the v2 tail but no schema name is not scorable either — and "republish it"
+        // is a different answer from "update the app". Blanked in place (same length), which
+        // is the only shape of this that a hand-built package could have.
+        val files = MemoryBankFileSystem(installed = null)
+
+        val result = files.store().install(bankWithSchema(" ".repeat("shared-detector-v2".length)))
+
+        val rejected = result as BankInstallResult.Rejected
+        assertTrue("拒绝原因必须说明缺少 schema：${rejected.reason}", rejected.reason.contains("未标注"))
+        assertNull(files.installed)
+    }
+
+    @Test
     fun `a package whose header count disagrees with its body is rejected`() {
         // The model count is the field every later array is sized against, so a package
         // that declares two models but carries six cannot parse into anything coherent.
         // Upstream expresses this as a hash binding; here it is structural.
         val files = MemoryBankFileSystem(installed = null)
         val reader = BankReader(fixtureBankBytes())
-        reader.expectMagic("LMFPA003")
+        reader.expectMagic("LMFPA004")
         reader.string() // source reference digest
         reader.string() // build stamp
         reader.string() // reference digest

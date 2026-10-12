@@ -32,7 +32,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.wrapContentSize
-import androidx.compose.foundation.lazy.LazyItemScope
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyListState
@@ -95,6 +94,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -108,7 +108,6 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalConfiguration
@@ -132,10 +131,12 @@ import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.compose.ui.zIndex
 import kotlin.math.floor
 import kotlin.math.roundToInt
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -802,13 +803,14 @@ internal fun supplierAutoScrollStep(
  *
  * The list reports item offsets from the **start of its content**, so the finger's place in
  * the list is `fingerRootY - listTopInRoot + viewportStartOffset`, and the slot's centre is
- * the anchor's offset plus [anchorSize] / 2, a whole [pitch] between neighbours. Every one
- * of those numbers moves while the drag is running — a reorder scrolls the list whenever the
- * dragged row is its scroll anchor (the first visible one), and the anchor's offset then
- * changes by exactly one row. Re-reading them per event bills that scroll to the finger: a
- * finger that travelled one row is judged one row further, and each further event adds
- * another, so the row runs away from the hand. Fixed at the start of the gesture, the
- * mapping depends on the finger's travel alone, which is the only thing the user controls.
+ * the anchor's offset plus [anchorSize] / 2, a whole [pitch] between neighbours. Sampling the
+ * frame once and never re-reading it is what makes the mapping depend on the finger's travel
+ * alone: reading it per event bills any movement of the rows themselves to the finger, which
+ * used to happen every time a reorder made the list scroll by one row (the row then ran away
+ * from the hand). Nothing moves the rows during a drag any more — the order is committed on
+ * release, see [SupplierOrderDialog] — so the frame is simply valid for the whole gesture;
+ * the one thing that does move the content, the edge auto-scroll, travels separately as
+ * [supplierSlotUnderFinger]'s `autoScrolledPx`.
  */
 private data class SupplierDragFrame(
     val listTopInRoot: Float,
@@ -817,17 +819,13 @@ private data class SupplierDragFrame(
     val anchorOffset: Int,
     val anchorSize: Int,
     val pitch: Float,
-    val scrollIndex: Int,
-    val scrollOffset: Int,
 )
 
 /**
  * Samples the frame a drag started in: [supplierSlotUnderFinger]'s inputs as the layout stood
- * when the finger went down, plus the list's own scroll state so the window can be put back
- * where it was. Sampling the scroll state instead of deriving it from item offsets keeps this
- * free of the padding arithmetic that [supplierSlotUnderFinger] deals with: the two fields are
- * exactly what `scrollToItem` takes. See [SupplierDragFrame] for why the frame is captured
- * once per gesture rather than read back per event.
+ * when the finger went down. The pitch is measured from the layout (the gap between two
+ * neighbouring item offsets) rather than taken from the row height, so a change to the row
+ * spacing cannot silently skew the judgement.
  */
 private fun currentSupplierDragFrame(
     listState: LazyListState,
@@ -851,8 +849,40 @@ private fun currentSupplierDragFrame(
         anchorOffset = anchor.offset,
         anchorSize = anchor.size,
         pitch = pitch,
-        scrollIndex = listState.firstVisibleItemIndex,
-        scrollOffset = listState.firstVisibleItemScrollOffset,
+    )
+}
+
+/** The row a drag starts on: its id, its index, and where its top edge sits in root coordinates. */
+private data class SupplierRowHit(val id: String, val index: Int, val topInRoot: Float)
+
+/**
+ * Which row the finger at [fingerRootY] is over, or null when it is over none of them.
+ *
+ * The drag gesture lives on the list box rather than on a row — a row is exactly the node
+ * LazyColumn recycles, and a gesture dies with the node it hangs on — so the row to pick up is
+ * found by hit-testing the layout instead of by the node the event arrived at. The finger's
+ * content coordinate uses the same expression [supplierSlotUnderFinger] uses (`- listTopInRoot
+ * + viewportStartOffset`), which is what puts the comparison against the published item offsets
+ * on one origin. A press between two rows, on the list's padding or up on the title names no
+ * row and starts no drag, so a long press there cannot pick one at random.
+ *
+ * The returned top edge is what the floating row is aligned to, so the row stays under the
+ * fingertip exactly where it was grabbed rather than jumping its centre onto it.
+ */
+private fun supplierRowUnderFinger(
+    listState: LazyListState,
+    fingerRootY: Float,
+    frame: SupplierDragFrame,
+): SupplierRowHit? {
+    val fingerInContent = fingerRootY - frame.listTopInRoot + frame.viewportStartOffset
+    val item = listState.layoutInfo.visibleItemsInfo.firstOrNull {
+        fingerInContent >= it.offset && fingerInContent < it.offset + it.size
+    } ?: return null
+    val id = item.key as? String ?: return null
+    return SupplierRowHit(
+        id = id,
+        index = item.index,
+        topInRoot = frame.listTopInRoot - frame.viewportStartOffset + item.offset,
     )
 }
 
@@ -1204,20 +1234,32 @@ private fun SupplierSelector(
  * Reorders the suppliers, and through them every surface that lists them.
  *
  * The list is the profiles list's own order — there is no rank field — so the panel sends
- * [onMove] and the stored list follows; the test tab's cards, the balance grid and the
- * fingerprint picker (on its next tab entry) all render that one order.
+ * [onMove] once, when the finger comes up, and the stored list follows; the test tab's cards,
+ * the balance grid and the fingerprint picker (on its next tab entry) all render that one
+ * order.
  *
- * A drag is judged by **which slot the finger is over**, not by how far the row has
- * travelled: the finger is converted to root coordinates (so the row's own movement, and
- * the swap animation, cannot leak into the judgement) and mapped onto the row offsets the
- * list reported when the finger went down — the frame is sampled once per gesture, because a
- * reorder of the list's scroll anchor scrolls the list and would otherwise be billed to the
- * finger, moving the row a slot further with every event. The target travels as a slot number
- * and the view model clamps it against the live list, which makes a repeated event resolve to
- * "already there" instead of swapping back — the bounce the travel-based version produced.
- * Rows animate to their new places through `Modifier.animateItem`. Each slot crossing is
- * committed as it happens (the view model writes the list and rolls that crossing back if the
- * write fails), so a drag that never leaves its slot writes nothing at all.
+ * 拖动的三条地基，是用户报的两个症状（到边缘闪屏、偶尔断触拖不到最顶/最底）的根治：
+ *
+ *  * **手势挂在列表盒上，不挂在行上。** Compose 只把事件送给按下那一刻命中的节点，而
+ *    LazyColumn 一旦把某行划出视口就把它整个丢出组合：被拖的行被回收，挂在它身上的手势
+ *    跟着一起消失——手指还在屏幕上，行却不再跟手，这就是「断触」。列表盒在整个弹窗存活期内
+ *    都在组合里，手势挂在这里，行的高矮进退与它无关。代价是盒子是列表的父节点，指针事件先送
+ *    子节点（LazyColumn 自己的滚动在盒子的手势之前），所以拖动期间必须关掉列表的用户滚动
+ *    （`userScrollEnabled`）：不关，滚动手势会先把手移动吃掉，盒子上的拖动根本起不来。
+ *    哪一行被拿起来，由 `supplierRowUnderFinger` 命中测试布局得出，不再由事件落在谁身上决定。
+ *  * **拖动期间不换位。** 以前每跨一格就写一次列表，而 LazyColumn 会跟着「第一可见行」的 key
+ *    保持窗口位置：被拖的行换进第一格的那一次，窗口被拽下一格、行当场出视口（同一类断触）；
+ *    为压住这次滚动又得逐帧把窗口「钉」回去，于是滚动与钉窗成了同一帧上的两个写手，谁最后
+ *    落地取决于测量顺序——用户看到的就是边缘那一段一直闪。现在顺序在松手时写一次，窗口除了
+ *    指尖自己的边缘滚动之外没有任何东西动它：钉窗、滚动互斥、换位动画抢帧这一整类问题不存在了。
+ *  * **被拖的行画在列表之外（浮层）。** 它跟着手指走，列表里原来那一格留一个等高的空位。
+ *    浮层不在 LazyColumn 里，滚多远都不会被回收；它只跟手指有关，与换位之后的行位置无关，
+ *    也就没有「行自己挪一格」这回事。
+ *
+ * 判定没变，还是「指尖落在哪一格」：[supplierSlotUnderFinger] 拿按下时采下的那一帧
+ * （[SupplierDragFrame]）算——拖动期间列表不动，这一帧就不会过期；指尖贴住边缘时列表由
+ * [supplierAutoScrollStep] 逐帧自己滚，滚过的距离按实际消费量补进判定。落点以「第几格」的
+ * 形式在松手时交给 [onMove]，视图模型再夹一次到活列表上，所以一次没离开原格的拖动一个字都不写。
  */
 @Composable
 private fun SupplierOrderDialog(
@@ -1230,19 +1272,20 @@ private fun SupplierOrderDialog(
     val maxSheetHeight = (LocalConfiguration.current.screenHeightDp * 0.9f).dp
     val listState = rememberLazyListState()
     var draggingId by remember { mutableStateOf<String?>(null) }
-    // 指尖位置是在「列表视口」这个坐标系里判定的。列表自己不随换位移动，所以同一根手指停在
-    // 同一处，判定出的永远是同一格——换成累加被拖行自己的位移，换位会让行自己挪一格，位移里
-    // 就凭空多出一格，行会立刻往回换（两行来回跳的根因）。视口的上下边在根坐标里各量一次即可。
+    // 落点：指尖现在指着第几格。整次拖动只改这一个数，列表的顺序等松手才写。
+    var targetSlot by remember { mutableIntStateOf(0) }
+    // 指尖在列表盒里的纵坐标（盒子的局部坐标，与任何一行无关）；NaN = 手指还没按下。
+    var pointerYInBox by remember { mutableFloatStateOf(Float.NaN) }
+    // 按下时指尖落在被拖行内的位置：浮层用它把行的上沿对齐到手指底下，行才像被捏着走，
+    // 而不是整行跳到指尖中心。
+    var grabOffsetPx by remember { mutableFloatStateOf(0f) }
+    // 手势盒与列表视口各自在根坐标里的位置，两个都量：手势的坐标属于盒子，滚动的边界属于视口。
+    var boxTopInRoot by remember { mutableFloatStateOf(Float.NaN) }
     var listTopInRoot by remember { mutableFloatStateOf(Float.NaN) }
     var listBottomInRoot by remember { mutableFloatStateOf(Float.NaN) }
-    // 判定用的那一帧在手指按下时采一次，整次拖动不再重读。被拖的行如果是列表的滚动锚点
-    // （第一行可见的就是它），换位会让列表跟着滚一格：布局里的锚点位移于是凭空少一格/多一格，
-    // 逐帧重读就把这次滚动算进指尖的位移里，手指只走了一格、判定却说走了两格，行越拖越跑。
+    // 判定用的那一帧在手指按下时采一次，整次拖动不再重读（见 [SupplierDragFrame]）。
     var dragFrame by remember { mutableStateOf<SupplierDragFrame?>(null) }
-    // 自动滚动：指尖贴住视口上下边缘时列表自己走。指尖最后一个位置（每帧的滚动方向由它算）、
-    // 以及这一趟已经滚过的像素——判定要用它把「内容从手指底下滑过去」的那部分补上，每帧的
-    // 钉窗也要以它为偏移（见下）。
-    var pointerRootY by remember { mutableFloatStateOf(Float.NaN) }
+    // 这一趟已经滚过的像素：内容从手指底下滑过去的距离要补进判定，否则指尖不动、格子一直在走。
     var autoScrollPx by remember { mutableFloatStateOf(0f) }
     // 只剩一行可量时兜底用的行距；正常路径下格子间距直接量自布局信息。
     val spacingPx = with(LocalDensity.current) { SUPPLIER_ORDER_ROW_SPACING.toPx() }
@@ -1250,13 +1293,13 @@ private fun SupplierOrderDialog(
     // 「指尖底下是第几格」的判定收口成一处：拖动事件与自动滚动都走它。闭包里 suppliers 的
     // 数目在弹窗存活期内不变（弹窗开着时增删不了供应商），其余输入全是状态，读到的永远是
     // 当前值——所以这个闭包被逐帧循环抓着用也不会陈旧。
-    val judgeSlot: (Float) -> Int? = { fingerY ->
+    val judgeSlot: (Float) -> Int? = { fingerRootY ->
         val frame = dragFrame
         if (frame == null) {
             null
         } else {
             supplierSlotUnderFinger(
-                fingerRootY = fingerY,
+                fingerRootY = fingerRootY,
                 listTopInRoot = frame.listTopInRoot,
                 viewportStartOffset = frame.viewportStartOffset,
                 anchorIndex = frame.anchorIndex,
@@ -1269,41 +1312,24 @@ private fun SupplierOrderDialog(
             )
         }
     }
-    // 换位会把列表的滚动锚点一起挪：被拖的行如果是第一可见那行，换位一次列表就跟着滚一格，
-    // 行被钉在按下的位置不动、内容从手下滑走，看起来像行不跟手；更要命的是被拖行换进第一格
-    // 的那一次，锚点跟随把窗口拽下一格，被拖行（就在第一格）当场整个滚出视口——行被裁出组合，
-    // 长按手势立刻断掉（设备实测：拖到顶边的行总在第一次换位后断）。窗口要在换位落地的同一次
-    // 测量里就恢复成「按下那一格 + 手指让列表滚过的距离」。用 requestScrollToItem 而不是
-    // scrollToItem 滚回去：后者参与滚动互斥，会取消正在进行的逐帧滚动（循环就是这么死的），
-    // 它与补滚之间还可能渲染一帧按下时的窗口。请求式钉窗不参与互斥、不打断滚动，只规定下一
-    // 次测量的位置；每帧重发一次，任何一次测量（换位的也好、滚动的也好）看到的都是正确窗口。
-    // 行高等长，目标位置折成「整行数 + 行内偏移」；列表顶端之上只有上内边距可滚，目标位置
-    // 不许越过它——否则折出来的行号是负的，请求无效，换位落地的那次测量没人挡着。
-    fun pinWindow() {
-        val frame = dragFrame ?: return
-        val target = (frame.scrollIndex * frame.pitch + frame.scrollOffset + autoScrollPx)
-            .coerceAtLeast(frame.viewportStartOffset.toFloat())
-        var index = floor(target / frame.pitch).toInt()
-        var offset = target - index * frame.pitch
-        if (index < 0) {
-            // 目标落在第 0 行上缘之上（上内边距里）：第 0 行顶在视口起点之下，偏移为负。
-            index = 0
-            offset = target
-        } else if (offset >= frame.anchorSize) {
-            // 行距 = 行高 + 间隔：偏移落到「行高与行距之间」时那一行其实已完全滚出视口。
-            offset -= frame.anchorSize
-            index += 1
-        }
-        listState.requestScrollToItem(index, offset.roundToInt())
+    // 松手（或手势被系统取消）：落点写一次，然后把拖动状态清干净。取消不写——用户没有表达
+    // 落点，顺序就该原样留着。
+    fun endDrag(draggedId: String?, commit: Boolean) {
+        if (commit && draggedId != null) onMove(draggedId, targetSlot)
+        draggingId = null
+        dragFrame = null
+        pointerYInBox = Float.NaN
+        autoScrollPx = 0f
     }
     // 指尖贴着视口边缘时列表跟着手指滚，一直滚到顶/底：手指停在边缘不动也不会中断
-    // （滚不动时消费为 0，累积不再增长，判定就停在那一格）。逐帧步进，不是一次跳一屏。
-    // 滚动发生的那一帧必须重判一次指尖底下的格子——手指不动、内容在动，只靠拖动事件
-    // 判定的行会停在原地被内容推走（设备实测：按住下边缘，列表滚过五行，行没跟上）。
+    // （滚不动时消费为 0，累积不再增长，落点就停在那一格）。逐帧步进，不是一次跳一屏。
+    // 滚动发生的那一帧必须重判一次指尖底下的格子——手指不动、内容在动，只靠拖动事件判定的
+    // 落点会停在原地被内容推走（设备实测：按住下边缘，列表滚过五行，落点没跟上）。
     LaunchedEffect(draggingId) {
-        val draggedId = draggingId ?: return@LaunchedEffect
+        if (draggingId == null) return@LaunchedEffect
         while (true) {
             withFrameNanos { }
+            val pointerRootY = boxTopInRoot + pointerYInBox
             val step = supplierAutoScrollStep(
                 fingerRootY = pointerRootY,
                 viewportTop = listTopInRoot,
@@ -1316,13 +1342,40 @@ private fun SupplierOrderDialog(
                 listState.scroll { consumed = scrollBy(step) }
                 autoScrollPx += consumed
                 if (consumed != 0f) {
-                    judgeSlot(pointerRootY)?.let { onMove(draggedId, it) }
+                    judgeSlot(pointerRootY)?.let { targetSlot = it }
                 }
             }
-            // 每帧都钉：换位的数据下一帧才落地，落地的测量必须已经有人规定好窗口，
-            // 锚点跟随才没有露脸的机会（请求是最后一笔，落地的测量一定消费到它）。
-            pinWindow()
         }
+    }
+    // 长按列表里的任意一行即可拖动，押在整行上而不是右端那个 44dp 的手柄上：手柄太小，手指
+    // 按住它再拖，起手一点抖动就滑出它的边界，手势当场取消（更早那一版的「拖不动」）。
+    // 键取行距：它在整次拖动里不会变，键一变这个块就重启、手势跟着断。
+    val dragModifier = Modifier.pointerInput(spacingPx) {
+        detectDragGesturesAfterLongPress(
+            onDragStart = { start ->
+                val frame = currentSupplierDragFrame(listState, listTopInRoot, spacingPx)
+                val rootY = boxTopInRoot + start.y
+                val hit = frame?.let { supplierRowUnderFinger(listState, rootY, it) }
+                // 押在两行之间、押在列表的内边距或标题上：没有行可以拿起来，这一下不成为拖动
+                // （也就不会消费这串事件，列表照旧能滚）。
+                if (frame != null && hit != null) {
+                    pointerYInBox = start.y
+                    grabOffsetPx = rootY - hit.topInRoot
+                    dragFrame = frame
+                    targetSlot = hit.index
+                    autoScrollPx = 0f
+                    draggingId = hit.id
+                }
+            },
+            onDragEnd = { endDrag(draggingId, commit = true) },
+            onDragCancel = { endDrag(draggingId, commit = false) },
+            onDrag = { change, _ ->
+                if (draggingId == null) return@detectDragGesturesAfterLongPress
+                change.consume()
+                pointerYInBox = change.position.y
+                judgeSlot(boxTopInRoot + change.position.y)?.let { targetSlot = it }
+            },
+        )
     }
 
     Dialog(
@@ -1353,64 +1406,75 @@ private fun SupplierOrderDialog(
                             // 面板上只有一种操作，行右边就是拖动手柄，说明文字只是占地方。
                             Text("供应商排序", style = MaterialTheme.typography.headlineSmall)
                         }
-                        LazyColumn(
+                        // 列表与浮层共用一个盒子、一套局部坐标：手势挂在这个盒子上（行会被回收，
+                        // 盒子不会），浮层也在这个盒子里按它的坐标摆。
+                        Box(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .weight(1f, fill = false)
-                                .onGloballyPositioned {
-                                    listTopInRoot = it.positionInRoot().y
-                                    listBottomInRoot = it.positionInRoot().y + it.size.height
-                                },
-                            state = listState,
-                            verticalArrangement = Arrangement.spacedBy(SUPPLIER_ORDER_ROW_SPACING),
-                            contentPadding = PaddingValues(
-                                start = 12.dp,
-                                end = 12.dp,
-                                top = 8.dp,
-                                bottom = 8.dp,
-                            ),
+                                .onGloballyPositioned { boxTopInRoot = it.positionInRoot().y }
+                                .then(dragModifier),
                         ) {
-                            itemsIndexed(
-                                items = suppliers,
-                                key = { _, supplier -> supplier.id },
-                                // 换位是两行交换位置：没有动画时第二行是「跳」过去的，看不出谁换到了哪。
-                                // key 已经给了稳定身份，item 动画就能把这次交换演成一次平滑的位移。
-                                contentType = { _, _ -> "supplier-order-row" },
-                            ) { index, supplier ->
-                                SupplierOrderRow(
-                                    supplier = supplier,
-                                    position = index + 1,
-                                    isDragging = supplier.id == draggingId,
-                                    onStartDrag = {
-                                        draggingId = supplier.id
-                                        pointerRootY = Float.NaN
-                                        autoScrollPx = 0f
-                                        dragFrame = currentSupplierDragFrame(
-                                            listState,
-                                            listTopInRoot,
-                                            spacingPx,
+                            LazyColumn(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .onGloballyPositioned {
+                                        listTopInRoot = it.positionInRoot().y
+                                        listBottomInRoot = it.positionInRoot().y + it.size.height
+                                    },
+                                state = listState,
+                                // 拖动期间关掉列表自己的滚动，理由见函数头：指针事件先送子节点，
+                                // 不关就会把手指的移动吃掉，盒子上的拖动起不来。边缘自动滚动走的是
+                                // 程序滚动（listState.scroll），不受这个开关影响。
+                                userScrollEnabled = draggingId == null,
+                                verticalArrangement = Arrangement.spacedBy(SUPPLIER_ORDER_ROW_SPACING),
+                                contentPadding = PaddingValues(
+                                    start = 12.dp,
+                                    end = 12.dp,
+                                    top = 8.dp,
+                                    bottom = 8.dp,
+                                ),
+                            ) {
+                                itemsIndexed(
+                                    items = suppliers,
+                                    key = { _, supplier -> supplier.id },
+                                    // 松手落地时行是平移过去的，不是原地闪一下；animateItem 需要
+                                    // 稳定身份，key 已经给了。
+                                    contentType = { _, _ -> "supplier-order-row" },
+                                ) { index, supplier ->
+                                    if (supplier.id == draggingId) {
+                                        // 被拖的这一行此刻画在浮层上，这里只留一个等高的空位：
+                                        // 列表的几何（因此还有判定用的那一帧）整次拖动都不变，
+                                        // 松手之前也不会有任何一行挪位置。
+                                        Spacer(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .height(SUPPLIER_ORDER_ROW_HEIGHT)
+                                                .animateItem(),
                                         )
-                                    },
-                                    onStopDrag = {
-                                        draggingId = null
-                                        dragFrame = null
-                                        pointerRootY = Float.NaN
-                                        autoScrollPx = 0f
-                                    },
-                                    // 换位判据是「指尖落在哪一格」，不是「行了多少行」：行自己会随着
-                                    // 换位挪动，累加它的位移会把换位本身算进去，越拖越乱；格子的位置
-                                    // 只由列表的布局决定，手指不动就不换。落在两格之间按最近的算，
-                                    // 越出视口按边缘夹住——再往外拖由自动滚动把格子送到指尖底下。
-                                    // 判定本体在 judgeSlot：逐帧循环与这里共用同一份。钉窗必须紧跟
-                                    // 换位发出去：换位的数据在事件线程当场写好，下一次测量就是换位
-                                    // 落地的那次——晚一帧的话，锚点跟随会在那一帧把被拖行拽出视口。
-                                    onDragAt = { movedId, fingerRootY ->
-                                        pointerRootY = fingerRootY
-                                        judgeSlot(fingerRootY)?.let {
-                                            onMove(movedId, it)
-                                            pinWindow()
-                                        }
-                                    },
+                                    } else {
+                                        SupplierOrderRow(
+                                            supplier = supplier,
+                                            position = index + 1,
+                                            isDragging = false,
+                                            modifier = Modifier.animateItem(),
+                                        )
+                                    }
+                                }
+                            }
+                            val dragged = suppliers.firstOrNull { it.id == draggingId }
+                            if (dragged != null) {
+                                // 浮层：位置只由指尖决定，与这一行在列表里的位置无关。序号显示
+                                // 它将落到的位置，「手指在哪儿、会落到第几位」一眼可见。
+                                SupplierOrderRow(
+                                    supplier = dragged,
+                                    position = targetSlot + 1,
+                                    isDragging = true,
+                                    modifier = Modifier
+                                        .zIndex(1f)
+                                        .offset {
+                                            IntOffset(0, overlayOffsetY(pointerYInBox, grabOffsetPx))
+                                        },
                                 )
                             }
                         }
@@ -1431,43 +1495,37 @@ private fun SupplierOrderDialog(
     }
 }
 
+/**
+ * 浮层的纵坐标：手指按下时捏住行内的那一点要一直贴在指尖下，行才像被捏着走。
+ *
+ * 指尖还没落位（NaN）时给 0：`roundToInt` 对 NaN 会抛异常，而这个偏移每帧都要算一遍。
+ * 纯函数，为的是「捏在哪、行就停在哪」这条几何能脱离设备被钉住。
+ */
+internal fun overlayOffsetY(pointerYInBox: Float, grabOffsetPx: Float): Int {
+    if (pointerYInBox.isNaN()) return 0
+    return (pointerYInBox - grabOffsetPx).roundToInt()
+}
+
+/**
+ * 排序面板里的一行——拖动时也在浮层上充当被提着的那一行。
+ *
+ * 它现在只负责画，换位的手势挂在列表盒上（见 [SupplierOrderDialog]）。两条理由让它回不去
+ * 「行自己带着手势」：手势跟着挂载它的节点一起死，而行正是 LazyColumn 会回收的那个节点；
+ * 一行也判断不出押在它身上的手指是压着它还是压着邻行，那要整张列表的布局信息。
+ *
+ * 整行都是把手，不是右端那个手柄图标：图标只有 44dp 宽，手指按住它再拖，起手一点抖动就滑出
+ * 它的边界，手势当场取消——图标退回成「这里可以拖」的提示，语义另外给读屏用。
+ */
 @Composable
-private fun LazyItemScope.SupplierOrderRow(
+private fun SupplierOrderRow(
     supplier: SupplierProfile,
     position: Int,
     isDragging: Boolean,
-    onStartDrag: () -> Unit,
-    onStopDrag: () -> Unit,
-    onDragAt: (String, Float) -> Unit,
+    modifier: Modifier = Modifier,
 ) {
-    // 指尖要换算到根坐标再交给判定，不能累加行本地的位移：行自己会随着换位挪动，行本地坐标系
-    // 跟着一起动，换位那一下就会在位移里凭空多出一格（反方向），行于是立刻又被换回去——这正是
-    // 「两行一直来回替换」的由来。根坐标只跟手指在哪有关，与行挪没挪无关。
-    var coordinates by remember { mutableStateOf<LayoutCoordinates?>(null) }
-    // 手势挂在整行上，不是那个手柄图标上：手柄只有 44dp 宽，手指按住它再拖，起手的一点抖动
-    // 就会滑出它的边界，拖动随即断掉。整行都是把手以后，按在哪都能拖，图标退回成「这里可以拖」
-    // 的提示。
-    val dragModifier = Modifier.pointerInput(supplier.id) {
-        detectDragGesturesAfterLongPress(
-            onDragStart = { onStartDrag() },
-            onDragEnd = { onStopDrag() },
-            onDragCancel = { onStopDrag() },
-            onDrag = { change, _ ->
-                change.consume()
-                val box = coordinates ?: return@detectDragGesturesAfterLongPress
-                onDragAt(supplier.id, box.localToRoot(change.position).y)
-            },
-        )
-    }
-
     Surface(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
-            // 换位动画：供应商列表是这一份顺序的三个投影之一，交换位置时行是平移过去的，
-            // 不是原地闪一下。
-            .animateItem()
-            .onGloballyPositioned { coordinates = it }
-            .then(dragModifier)
             .semantics { contentDescription = "拖动排序 ${supplier.name}" },
         color = if (isDragging) {
             MaterialTheme.colorScheme.secondaryContainer
@@ -1476,6 +1534,8 @@ private fun LazyItemScope.SupplierOrderRow(
         },
         shape = MaterialTheme.shapes.medium,
         tonalElevation = if (isDragging) 4.dp else 0.dp,
+        // 浮层是「提起来」的那一行：投影把它与列表分开，不再需要靠换位动画表达「它在动」。
+        shadowElevation = if (isDragging) 6.dp else 0.dp,
     ) {
         Row(
             modifier = Modifier

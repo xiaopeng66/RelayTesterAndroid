@@ -248,6 +248,11 @@ class FingerprintBankStore(
      *
      * The file is parsed in full before anything is written, so a rejected download
      * leaves the panel on the copy it was already using.
+     *
+     * A package for a newer detector schema is reported with its own message rather than
+     * the generic "not a valid package": it is a valid package, and the only thing that can
+     * be done about it is updating the app. Without this the specific message the reader
+     * produces never reaches anyone — the generic one would win every time.
      */
     @Synchronized
     fun install(bytes: ByteArray): BankInstallResult {
@@ -256,8 +261,13 @@ class FingerprintBankStore(
                 "文件过大（${bytes.size} 字节），超过 ${maxInstalledBytes / 1024 / 1024} MB 上限",
             )
         }
-        val bank = parse(bytes)
-            ?: return BankInstallResult.Rejected("文件不是有效的检测包，已放弃安装")
+        val bank = try {
+            FingerprintBank.fromPackageBytes(bytes)
+        } catch (error: BankSchemaTooNewException) {
+            return BankInstallResult.Rejected(error.message ?: "检测包需要更新版本的 App")
+        } catch (error: Exception) {
+            return BankInstallResult.Rejected("文件不是有效的检测包，已放弃安装")
+        }
         val digest = sha256Hex(bytes)
         try {
             files.writeInstalled(bytes)

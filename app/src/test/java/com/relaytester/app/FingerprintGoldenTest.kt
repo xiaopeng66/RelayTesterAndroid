@@ -1,5 +1,6 @@
 package com.relaytester.app
 
+import com.relaytester.app.core.fingerprint.BankSchemaTooNewException
 import com.relaytester.app.core.fingerprint.ChallengeGenerator
 import com.relaytester.app.core.fingerprint.FingerprintBank
 import com.relaytester.app.core.fingerprint.FingerprintScoring
@@ -23,6 +24,10 @@ import org.junit.Test
  * generator refuses to run when the package's build stamp and the detector's disagree —
  * a mismatch there would silently fall back to upstream's legacy ranker, and the vectors
  * would then describe a different algorithm.
+ *
+ * The fixture and these vectors are the v2 pair (`shared-detector-v2`, the positional head
+ * and the blend). The two earlier package shapes keep their own pinned vectors in
+ * [FingerprintV1PackageTest] and [FingerprintLegacyPackageTest].
  *
  * A numerical port fails quietly: a swapped coefficient or an off-by-one index still
  * yields a plausible-looking ranking. Asserting the candidate order *and* the per-model
@@ -48,6 +53,23 @@ class FingerprintGoldenTest {
         assertEquals(6, bank.modelCount)
         assertTrue("检测包构建时间不应为空", bank.referenceBuiltAt.isNotBlank())
         assertEquals("检测包推荐三条回答", 3, bank.recommendedAnswers)
+        assertEquals("夹具必须是 v2 包", "shared-detector-v2", bank.detectorSchema)
+    }
+
+    @Test
+    fun `a package built for a newer schema is refused rather than scored`() {
+        // The package states which ranking its numbers were fitted for, and the app can
+        // only detect a mismatch there. Scoring a newer package with this formula would
+        // look exactly like a working detector, so the install has to fail instead — with
+        // its own exception type, because "update the app" is a different answer from
+        // "this file is broken" and the panel shows one of them verbatim.
+        val error = runCatching {
+            FingerprintBank.fromPackageBytes(bankWithSchema("shared-detector-v3"))
+        }.exceptionOrNull()
+        val tooNew = error as? BankSchemaTooNewException
+        assertNotNull("更新的 schema 必须被拒绝，实际 $error", tooNew)
+        assertEquals("shared-detector-v3", tooNew?.schema)
+        assertEquals("shared-detector-v2", tooNew?.supported)
     }
 
     @Test
@@ -58,7 +80,7 @@ class FingerprintGoldenTest {
         }
         // A port that only ever took the full path would never prove the partial one.
         assertTrue("向量必须覆盖部分样本路径", methods.any { it == "shared-ranker-partial-v1" })
-        assertTrue("向量必须覆盖完整三条回答路径", methods.any { it == "shared-detector-v1" })
+        assertTrue("向量必须覆盖完整三条回答路径", methods.any { it == "shared-detector-v2" })
     }
 
     @Test
@@ -138,7 +160,7 @@ class FingerprintGoldenTest {
             val expected = case.getJSONObject("expected")
             val analysis = bank.analyze(answers(case), expectedCounts(case))
 
-            val full = expected.getString("method") == "shared-detector-v1"
+            val full = expected.getString("method") == "shared-detector-v2"
             assertEquals(
                 "$name：评分路径不一致",
                 if (full) FingerprintScoring.FULL else FingerprintScoring.PARTIAL,
@@ -317,11 +339,10 @@ class FingerprintGoldenTest {
          * The package quantises every dense float to 1e-6 and the reference tensors to
          * 16 bits per row, and the score vector is a chain of z-scores and unit
          * normalisations over those values, so accumulated error is orders of magnitude
-         * above the quantisation step. The measured worst deviation on this fixture is
-         * 2.5e-5 in a ranking score and 1.2e-5 in a probability; 1e-4 is still far
-         * tighter than the gap between any two distinct models on these vectors.
+         * above the quantisation step. See [GOLDEN_SCORE_TOLERANCE] for the measured
+         * deviation and why the bound sits where it does.
          */
-        const val SCORE_TOLERANCE = 1.0e-4
-        const val PROBABILITY_TOLERANCE = 1.0e-4
+        const val SCORE_TOLERANCE = GOLDEN_SCORE_TOLERANCE
+        const val PROBABILITY_TOLERANCE = GOLDEN_SCORE_TOLERANCE
     }
 }

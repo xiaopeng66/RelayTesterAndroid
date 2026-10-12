@@ -54,11 +54,13 @@ object BankManifestParser {
     /**
      * Package shapes this app can install, oldest first.
      *
-     * Two are live while the fleet upgrades: format 2 is the pre-verifier-removal package
-     * and format 3 dropped that block. A manifest may advertise either, and both are
-     * installable — the app detects the actual shape from the file's magic, so accepting
-     * the older manifest only avoids making a fleet-wide upgrade out of a republish. An
-     * app older than this build sees `minAppVersionCode` and offers the app update instead.
+     * Three are live while the fleet upgrades: format 2 is the pre-verifier-removal package,
+     * format 3 dropped that block, and format 4 is the v2 ranker with its positional head.
+     * A manifest may advertise any of them, and all three are installable — the app detects
+     * the actual shape from the file's magic and scores each with the formula its numbers
+     * were fitted for, so accepting the older manifests only avoids making a fleet-wide
+     * upgrade out of a republish. An app older than this build sees `minAppVersionCode` and
+     * offers the app update instead.
      *
      * A shape *newer* than [MAX_SUPPORTED_FORMAT] is not a plain error either: the
      * publisher bumps the format when it needs app support for it, so it is reported as
@@ -67,7 +69,7 @@ object BankManifestParser {
     const val MIN_SUPPORTED_FORMAT = 2
 
     /** Newest package shape this app understands. */
-    const val MAX_SUPPORTED_FORMAT = 3
+    const val MAX_SUPPORTED_FORMAT = 4
 
     fun parse(text: String): BankManifest {
         val root = try {

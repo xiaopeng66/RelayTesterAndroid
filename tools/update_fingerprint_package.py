@@ -3,8 +3,9 @@
 
 One command does the whole round trip:
 
-    1. ask GitHub which revision of `data/shared_detector.json` upstream is on,
-    2. download that revision's `shared_detector.json` + `unified_bank.json` (cached),
+    1. ask GitHub which revision of upstream's detector artifact we are on,
+    2. download that revision's detector (`shared_detector.bin` since 2026-10-11, the
+       JSON before that — both are read) + `unified_bank.json` (cached),
     3. rebuild the package with `build_fingerprint_asset.py`,
     4. compare it with the manifest already published on the `bank` release,
     5. publish it — and only if the digest actually changed.
@@ -51,6 +52,7 @@ import urllib.request
 
 import publish_bank
 import retry
+import upstream_detector
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 PROJECT = os.path.dirname(TOOLS)
@@ -58,9 +60,13 @@ BUILDER = os.path.join(TOOLS, "build_fingerprint_asset.py")
 UPSTREAM = "https://github.com/Ikaleio/lm-detector"
 UPSTREAM_API = "https://api.github.com/repos/Ikaleio/lm-detector"
 RAW = "https://raw.githubusercontent.com/Ikaleio/lm-detector"
-#: The two files the builder needs, and the one whose revision defines "upstream moved".
-DATA_FILES = ("shared_detector.json", "unified_bank.json")
-TRACKED_FILE = "shared_detector.json"
+#: The reference bank, and the detector artifact whose name upstream changes can change:
+#: it shipped as `shared_detector.json` until 2026-10-11, when the numbers moved to a
+#: float32 binary (`shared_detector.bin`). `DATA_FILES` are downloaded unconditionally;
+#: the detector is picked from `DETECTOR_FILES` by whichever name that revision carries.
+DATA_FILES = (upstream_detector.BANK_FILE,)
+DETECTOR_FILES = upstream_detector.DETECTOR_FILES
+TRACKED_FILE = DETECTOR_FILES[0]
 DEFAULT_OUT = os.path.join(PROJECT, "build/lm-fingerprint/lite-bank.bin")
 DEFAULT_CACHE = os.path.join(PROJECT, "build/lm-fingerprint/upstream")
 
@@ -124,35 +130,62 @@ def upstream_revision():
     return commit["sha"], commit["commit"]["committer"]["date"]
 
 
-def download(url, destination):
+def download(url, destination, absent_ok=False):
     """Stream one upstream file to disk so a 32 MB JSON never sits in memory twice.
 
     Retried like every other network call here: a reset in the middle of a 32 MB transfer
     is the single most likely failure of this script, and the partial file is thrown away
     before each attempt so a resumed-at-the-wrong-offset file can never be mistaken for a
     complete one.
+
+    `absent_ok` turns a 404 into `False`: a name that is simply not in that revision is a
+    permanent answer (see `tools/retry.py`), which is how the detector artifact's two
+    names are told apart without a second lookup API to pay for.
     """
     partial = destination + ".part"
     policy = retry.Policy.from_env()
 
     def once():
         request = urllib.request.Request(url)
+        written = 0
         try:
-            with urllib.request.urlopen(request, timeout=600) as response, open(partial, "wb") as handle:
-                while True:
-                    chunk = response.read(1 << 20)
-                    if not chunk:
-                        break
-                    handle.write(chunk)
+            with urllib.request.urlopen(request, timeout=600) as response:
+                # A body that stops early — a reset the socket layer does not report as one,
+                # a proxy that closes cleanly mid-transfer — looks exactly like a complete
+                # file to a read-until-EOF loop. These artifacts always come with a
+                # Content-Length, so compare against it and let the retry loop treat a
+                # short read as the transient thing it is: the alternative is a corrupt
+                # artifact reaching the builder, which is a much worse failure.
+                length = response.headers.get("Content-Length")
+                expected = int(length) if length is not None else None
+                with open(partial, "wb") as handle:
+                    while True:
+                        chunk = response.read(1 << 20)
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+                        written += len(chunk)
         except (urllib.error.URLError, OSError) as error:
             if os.path.exists(partial):
                 os.remove(partial)
             raise error
+        if expected is not None and written != expected:
+            os.remove(partial)
+            raise retry.Transient(
+                f"{url.rsplit('/', 1)[-1]} 只收到 {written}/{expected} 字节，连接就结束了",
+            )
         os.replace(partial, destination)
         return destination
 
     try:
         return retry.run(once, policy=policy, label=f"下载 {url.rsplit('/', 1)[-1]}")
+    except urllib.error.HTTPError as error:
+        if absent_ok and error.code == 404:
+            return False
+        raise SystemExit(
+            f"下载 {url} 失败：{retry.describe_error(error)}\n"
+            "该域名在部分网络不可达：设置 HTTPS_PROXY，或用 --data-dir 指向上游 clone。",
+        )
     except Exception as error:  # noqa: BLE001 - reported with the proxy hint below
         if os.path.exists(partial):
             os.remove(partial)
@@ -160,6 +193,26 @@ def download(url, destination):
             f"下载 {url} 失败：{retry.describe_error(error)}\n"
             "该域名在部分网络不可达：设置 HTTPS_PROXY，或用 --data-dir 指向上游 clone。",
         )
+
+
+def fetch_detector(cache_dir, revision):
+    """Download whichever detector artifact [revision] ships; return its path.
+
+    Both names are tried because the right one depends on the revision: a run pinned to a
+    commit from before upstream's format switch still needs the JSON, and the current one
+    only has the binary. Neither name existing is a real failure — the paths in
+    `upstream_detector` are wrong by then, and the message says so.
+    """
+    for name in DETECTOR_FILES:
+        target = os.path.join(cache_dir, name)
+        print(f"downloading data/{name} @ {revision[:12]}")
+        if download(f"{RAW}/{revision}/data/{name}", target, absent_ok=True):
+            return target
+        print(f"  {revision[:12]} 里没有 data/{name}，换下一个候选名")
+    raise SystemExit(
+        f"上游 {revision[:12]} 的 data/ 里既没有 {DETECTOR_FILES[0]} 也没有 {DETECTOR_FILES[1]}："
+        f"检查 {UPSTREAM}/tree/{revision}/data 实际的文件名，更新 tools/upstream_detector.py",
+    )
 
 
 def fetch_data(cache_dir, revision, refresh):
@@ -170,6 +223,7 @@ def fetch_data(cache_dir, revision, refresh):
         with open(stamp_path, encoding="utf-8") as handle:
             cached = json.load(handle).get("sha")
     present = all(os.path.isfile(os.path.join(cache_dir, name)) for name in DATA_FILES)
+    present = present and upstream_detector.find_detector(cache_dir) is not None
     if cached == revision and present and not refresh:
         print(f"upstream data cached at {revision[:12]}")
         return cache_dir
@@ -178,6 +232,7 @@ def fetch_data(cache_dir, revision, refresh):
         target = os.path.join(cache_dir, name)
         print(f"downloading data/{name} @ {revision[:12]}")
         download(f"{RAW}/{revision}/data/{name}", target)
+    fetch_detector(cache_dir, revision)
     with open(stamp_path, "w", encoding="utf-8") as handle:
         json.dump({"sha": revision, "source": f"{UPSTREAM}/tree/{revision}/data"}, handle, indent=2)
         handle.write("\n")
@@ -326,8 +381,10 @@ def main():
     if args.data_dir:
         data_dir = args.data_dir
         revision, revision_date = "local", "（本地副本）"
-        if not os.path.isfile(os.path.join(data_dir, TRACKED_FILE)):
-            raise SystemExit(f"{data_dir} 里找不到 {TRACKED_FILE}")
+        if upstream_detector.find_detector(data_dir) is None:
+            raise SystemExit(
+                f"{data_dir} 里既没有 {DETECTOR_FILES[0]} 也没有 {DETECTOR_FILES[1]}",
+            )
         print(f"using local upstream data: {data_dir}")
     else:
         if args.revision:

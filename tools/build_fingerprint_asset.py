@@ -2,7 +2,7 @@
 """Build the on-device fingerprint detection package from upstream lm-detector data.
 
 Reads the upstream artifacts and writes one binary file the Android app loads
-directly. The package carries everything upstream's `shared-detector-v1` scoring
+directly. The package carries everything upstream's `shared-detector-v2` scoring
 needs, so the app can reproduce its ranking and its calibrated probability without
 any upstream code at runtime:
 
@@ -10,13 +10,22 @@ any upstream code at runtime:
   * the centroid/"baseline" feature bank (hellinger + ordered blocks)
   * the kNN reference matrix per model (ranker.references)
   * the confidence calibration scalar (`calibration.tau`)
+  * the positional head and the frequency/positional blend (`ranker.positional`,
+    `ranker.blend`) — v2 ranks `blend.frequency · z(frequency) + blend.positional ·
+    z(positional)`, so without these the numbers in the package would be scored with
+    the wrong formula
 
-Format `LMFPA003`. Upstream used to ship a second scorer — a logistic "verifier" whose
-only job was to say whether its own best candidate agreed with the ranking — and it is
-gone from `shared-detector-v1` as of upstream `d53d3f5b` (58 models, probability from
-`softmax(tau · ranking)`). `LMFPA002` is the same package with that verifier block still
-in the middle; the app reads both (see `FingerprintBank`), so a device that has not
-re-downloaded the package keeps working.
+Format `LMFPA004`, which is `LMFPA003` plus that v2 tail. `LMFPA003` is the shape the
+pipeline published while upstream was on `shared-detector-v1` (the frequency side is
+what the whole ranker was there, so the app scores such a package with the v1 formula);
+`LMFPA002` is the same package with upstream's removed verifier block still in the middle.
+The app reads all three (see `FingerprintBank`), so a device that has not re-downloaded
+the package keeps working — and a v1 package keeps scoring exactly as it did, because its
+numbers were fitted for the v1 formula.
+
+The upstream schema is written into the package as a text field. A package whose schema
+is newer than the app implements is refused on install rather than scored with the wrong
+formula (which would look exactly like a working detector).
 
 Encoding: every dense block is int32 fixed point at 1e-6, which was measured to move a
 per-model score by at most 3.6e-5 and to change no ordering. The reference tensor (one
@@ -30,7 +39,8 @@ Usage:
     python tools/build_fingerprint_asset.py <data-dir> <out> \
         --pick gpt-5.4,claude-sonnet-4.6,gemini-3.7-flash
 
-<data-dir> must contain shared_detector.json and unified_bank.json as published at
+<data-dir> must contain upstream's detection artifact — shared_detector.bin, or
+shared_detector.json before upstream 2d71e10c — and unified_bank.json, as published at
 https://github.com/Ikaleio/lm-detector/tree/main/data
 
 --models N (or --pick a,b,c) restricts the package to a subset of the models. That is
@@ -44,7 +54,9 @@ import struct
 import sys
 from pathlib import Path
 
-MAGIC = b"LMFPA003"
+import upstream_detector
+
+MAGIC = b"LMFPA004"
 SCALE = 1_000_000.0
 INT8_MAX = 127
 INT16_MAX = 32767
@@ -54,6 +66,15 @@ INT16_MAX = 32767
 # and no candidate changes place. 8 bits halves the package but reorders near-tied
 # candidates (38 of 75,790 pairs, 0.05%), which is visible in the panel's top-8 list.
 DEFAULT_REFERENCE_BITS = 16
+
+#: The upstream detector schema this package format carries the scoring blocks for.
+#: A newer one would mean the stored numbers were fitted against a different ranking,
+#: which the app cannot detect on its own — so it is refused here instead of published.
+SUPPORTED_SCHEMA = "shared-detector-v2"
+
+#: The positional head's block widths, in ranker order (frequency, ordered, kernel, sequence).
+POSITIONAL_BLOCK_DIMENSIONS = (355, 74, 102, 220)
+POSITIONAL_DIMENSION = sum(POSITIONAL_BLOCK_DIMENSIONS)
 
 
 def quantize(values):
@@ -195,6 +216,11 @@ def subset_models(detector, bank, ids):
     detector["ranker"]["lda_weights"] = pick(ranker["lda_weights"])
     detector["ranker"]["lda_bias"] = pick(ranker["lda_bias"])
     detector["ranker"]["references"] = pick(ranker["references"])
+    if isinstance(ranker.get("positional"), dict):
+        positional = dict(ranker["positional"])
+        positional["weights"] = pick(positional["weights"])
+        positional["bias"] = pick(positional["bias"])
+        detector["ranker"]["positional"] = positional
     detector["ranker"]["bank"] = {
         **bank_block,
         "model_order": list(ids),
@@ -239,7 +265,7 @@ def main():
     argv = sys.argv[1:]
     options = {"--models": None, "--pick": None, "--ref-bits": None,
                "--emit-detector-json": None, "--emit-bank-json": None}
-    positional = []
+    inputs = []
     index = 0
     while index < len(argv):
         arg = argv[index]
@@ -253,16 +279,39 @@ def main():
             print(__doc__)
             return 0
         else:
-            positional.append(arg)
+            inputs.append(arg)
         index += 1
-    if len(positional) != 2:
+    if len(inputs) != 2:
         print(__doc__)
         return 2
-    data_dir = Path(positional[0])
-    out_path = Path(positional[1])
+    data_dir = Path(inputs[0])
+    out_path = Path(inputs[1])
 
-    detector = json.loads((data_dir / "shared_detector.json").read_text(encoding="utf-8"))
-    bank = json.loads((data_dir / "unified_bank.json").read_text(encoding="utf-8"))
+    # Upstream ships the detector as a binary artifact now and as JSON before that; the loader
+    # takes either, so the same command works on a fresh clone and on an older revision.
+    detector, detector_name = upstream_detector.read_detector(data_dir)
+    bank = json.loads((data_dir / upstream_detector.BANK_FILE).read_text(encoding="utf-8"))
+    print(f"检测器来源：{detector_name}（{len(detector['model_ids'])} 个模型）")
+    schema = detector.get("schema")
+    if schema != SUPPORTED_SCHEMA:
+        # The package's numbers only mean what the app will compute from them if the
+        # schema behind the format matches: earlier schemas have no positional head, and
+        # whatever comes after v2 is by definition fitted against a ranking this builder
+        # and this app do not implement. Either way the honest answer is to stop here.
+        raise SystemExit(
+            f"上游检测器 schema={schema!r}，本工具与 App 只实现了 {SUPPORTED_SCHEMA}："
+            "先按新 schema 更新 tools/build_fingerprint_asset.py 与 App 的指纹打分，再发布",
+        )
+    ranker = detector["ranker"]
+    for key in ("blend", "positional"):
+        if not isinstance(ranker.get(key), dict):
+            raise SystemExit(f"上游 schema 是 {schema}，但 ranker 里没有 {key}")
+    positional = ranker["positional"]
+    for key in ("params", "weights", "bias"):
+        if key not in positional:
+            raise SystemExit(f"上游 ranker.positional 里没有 {key}")
+    print(f"位置判别头：{len(positional['weights'])}x{len(positional['weights'][0])}，"
+          f"混合权重 frequency={ranker['blend']['frequency']} positional={ranker['blend']['positional']}")
 
     ref_bits = int(options["--ref-bits"] or DEFAULT_REFERENCE_BITS)
     if ref_bits not in (8, 16):
@@ -276,6 +325,9 @@ def main():
         detector, bank = subset_models(detector, bank, picked)
 
     ranker = detector["ranker"]
+    # subset_models returned a fresh ranker, so re-bind the head; the one bound above is
+    # still the full model set when --models/--pick is in play.
+    positional = ranker["positional"]
     h = bank["robust"]["hellinger"]
     o = bank["robust"]["ordered_blocks"]
 
@@ -303,7 +355,7 @@ def main():
     calibration = detector.get("calibration") or {}
     tau = calibration.get("tau")
     if not isinstance(tau, (int, float)):
-        raise SystemExit("shared_detector.json carries no calibration.tau")
+        raise SystemExit(f"{detector_name} 里没有 calibration.tau")
 
     w = Writer()
     w.parts.append(MAGIC)
@@ -359,6 +411,23 @@ def main():
     # kNN references: one matrix per candidate model
     w.quantized_references(ranker["references"], ref_bits)
 
+    # The LMFPA004 tail: how the frequency and positional halves are fused, the positional
+    # head those numbers were fitted with, and the schema behind both. Without it the app
+    # falls back to the v1 formula, which on a v2 package means a plausible-looking but
+    # wrong ranking — so the tail is what makes the numbers in this file mean anything.
+    w.f64([ranker["blend"]["frequency"], ranker["blend"]["positional"]])
+    w.u32(len(positional["params"]))
+    for block in positional["params"]:
+        w.u32(len(block["mean"]))
+        w.i32(quantize(block["mean"]))
+        w.i32(quantize(block["scale"]))
+    w.u32(len(positional["weights"]))
+    w.u32(len(positional["weights"][0]))
+    w.i32(quantize(flatten(positional["weights"])))
+    w.u32(len(positional["bias"]))
+    w.i32(quantize(positional["bias"]))
+    w.text(schema)
+
     blob = w.blob()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(blob)
@@ -394,6 +463,8 @@ def main():
     print(f"  knn references  : {sum(len(r) for r in ranker['references'])}x{len(ranker['references'][0][0])}")
     print(f"  hellinger dims  : {len(h['feature_mean'])}")
     print(f"  ordered dims    : {len(o['feature_mean'])}")
+    print(f"  positional head : {len(positional['weights'])}x{len(positional['weights'][0])}")
+    print(f"  schema          : {schema}")
     print(f"  environments    : {len(env)}")
     print(f"  reference bits  : {ref_bits}")
     print(f"  calibration tau : {tau}")

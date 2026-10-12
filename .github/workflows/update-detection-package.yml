@@ -123,6 +123,7 @@ jobs:
             tools/build_fingerprint_asset.py \
             tools/publish_bank.py \
             tools/update_fingerprint_package.py \
+            tools/upstream_detector.py \
             tools/retry.py \
             tools/retry_failed_runs.py
 

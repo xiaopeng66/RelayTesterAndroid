@@ -296,8 +296,15 @@ android {
         // （动画提示词、测试 Prompt 的写入端与读取端）、备份自断兼容 1（导入侧 4096 < 保存侧 16384，
         // 自己导出的备份导不回来）、资源无界 1（动画记录从不修剪，每条最多 2MB HTML + 截图）、
         // 导出未自述范围 1、死代码 1。另新增动画成功截图缩略图（替代「已完成」）。
-        versionCode = 10_800
-        versionName = "1.8.0"
+        // 1.8.1：指纹检测包对齐上游 shared-detector-v2。上游 2026-10-11（2d71e10c）把检测器资产
+        // 换成二进制格式，并把排名从「频率一侧」改成「频率 + 位置」两半按混合权重相加，两半都先
+        // 做 z 标准化，tau 也是按混合后的尺度拟合的。此前发布的包本就是用该资产构建的数据，却按
+        // v1 公式打分，等于用错公式算对的数字。本次把位置判别头（位置核 102 维 + 序列特征 220 维）
+        // 与混合权重一并移植，包格式升为 LMFPA004 并写入上游 schema 名；003/002 旧包仍按各自公式
+        // 照常评分，而 schema 比本版新的包会明确拒绝安装（否则「看起来在工作」恰恰是最坏的结果）。
+        // 检测包发布侧 minAppVersionCode 相应提到 10801。
+        versionCode = 10_801
+        versionName = "1.8.1"
         ndk {
             // arm64 only: the published update ships one APK, and every device the app is
             // meant for is arm64. The 32-bit and x86 ABIs would each add a copy of the two

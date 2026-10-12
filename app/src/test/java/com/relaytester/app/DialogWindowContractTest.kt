@@ -208,34 +208,86 @@ class DialogWindowContractTest {
     }
 
     @Test
-    fun `the drag resolves the slot under the finger, from a frame the row cannot move`() {
-        // 拖动的换位判据是「指尖落在哪一格」。几个承重件任何一件错了都只有设备上才看得出来：
+    fun `the drag hangs on the list box, not on a row LazyColumn will recycle`() {
+        // 拖动的承重件，一件错了都只有设备上才看得出来：
         //
-        // ① 指尖必须换算到根坐标。行自己会随着换位挪动，行本地坐标系跟着一起动，用行本地坐标
-        //    就等价于「累加被拖行自己的位移」——换位那一下会在位移里凭空多出一格，行立刻又被
-        //    换回去，两行就这么一直来回替换（用户报的就是这个）。
-        // ② 换算交给 supplierSlotUnderFinger：它把指尖与 itemsInfo 的 offset 放到同一个基准上
-        //    （offset 从视口起点量起，向上还隔着列表的上内边距），四舍五入落格再夹到两端。
-        //    这一条上一版漏了内边距，设备实测每格提前 21px 翻转——数值回归在 SupplierOrderTest。
-        // ③ 手势挂在整行上（见下一条），拖动才起得来。
+        // ① 手势必须挂在**列表盒**上，不能挂在行上。Compose 只把事件送给按下那一刻命中的节点，
+        //    而 LazyColumn 一旦把某行划出视口就把它整个丢出组合：行被回收，挂在它身上的手势跟着
+        //    一起消失——手指还在屏幕上，行却不再跟手（用户报的「偶尔断触，拖不到最顶/最底」）。
+        //    盒子在整个弹窗存活期内都在组合里，手势挂在这里，行的高矮进退与它无关。
+        // ② 拖动期间必须关掉列表自己的用户滚动。盒子是列表的父节点，Compose 把指针事件先送子节点
+        //    ——列表的滚动手势在盒子的手势之前，不关就会把手指的移动吃掉，盒子上的拖动起不来。
+        // ③ 拖动期间顺序一个字节都不写，松手才写一次。以前每跨一格写一次，而 LazyColumn 会跟着
+        //    「第一可见行」的 key 保持窗口位置：被拖的行换进第一格的那一次，窗口被拽下一格、行当场
+        //    出视口（同一类断触）；为压住这次滚动又得逐帧把窗口「钉」回去，于是滚动与钉窗成了同一
+        //    帧上的两个写手，谁最后落地取决于测量顺序——用户看到的就是边缘那一段一直闪（用户报的
+        //    「到边缘还是闪屏」）。现在整次拖动只有一笔写。
+        // ④ 被拖的行画在列表之外（浮层），列表里原来那一格留一个等高的空位：浮层不会被回收，列表
+        //    的几何（因此还有判定用的那一帧）整次拖动都不变。
+        // ⑤ 哪一行被拿起来由命中测试决定（supplierRowUnderFinger）：手势已经不在行上，事件落在谁
+        //    身上不再说明任何事。
         //
-        // 格子间距量自列表布局（itemsInfo 的相邻 offset 之差），不是写死的行高：行距一改，
-        // 换算不该跟着失准。这几条是源码事实；能算的那部分已经搬进 SupplierOrderTest 的数值
-        // 用例，这里只留「这几种写法必须继续存在于源码里」。
+        // 判定本身没有变：supplierSlotUnderFinger 拿按下时采下的那一帧算，指尖贴边时列表由
+        // supplierAutoScrollStep 逐帧自己滚。能算的那部分在 SupplierOrderTest 的数值用例里，
+        // 这里只钉「这几种写法必须继续存在于源码里」。
         val file = File(sourceRoot, "com/relaytester/app/feature/tester/TesterScreen.kt")
         assertTrue("找不到 TesterScreen.kt：${file.absolutePath}", file.isFile)
         val text = code(file)
+        // ① 手势挂在列表盒上：同一个节点既知道自己在根坐标里的位置（浮层与命中测试的基准），
+        //    又揣着拖动手势。
         assertTrue(
-            "指尖没有换算到根坐标（localToRoot）：用行本地坐标等于累加被拖行自己的位移，" +
-                "换位会在位移里凭空多出一格，两行会一直来回替换",
-            "localToRoot(change.position).y" in text,
+            "拖动手势没有挂在列表盒上（而是回了行上）：行会被 LazyColumn 回收，手势跟着一起死，" +
+                "手指还在屏幕上、行却不再跟手",
+            Regex("""\.onGloballyPositioned \{ boxTopInRoot = it\.positionInRoot\(\)\.y \}\s*\.then\(dragModifier\)""")
+                .containsMatchIn(text),
+        )
+        val row = Regex("(?s)private fun SupplierOrderRow\\((.*?)\n}").find(text)?.groupValues?.get(1)
+        assertNotNull("排序行的构造函数不在了", row)
+        assertTrue(
+            "行自己又带上了手势（pointerInput）：手势跟着挂载它的节点一起死，而行正是 LazyColumn " +
+                "会回收的那个节点——「断触」就是这么来的",
+            "pointerInput" !in row!!,
+        )
+        // ② 拖动期间关掉列表自己的滚动，否则子节点的滚动手势会先吃掉手指的移动。
+        assertTrue(
+            "拖动期间没有关掉列表的用户滚动：指针事件先送子节点（列表的滚动手势），手指的移动被它" +
+                "吃掉，盒子上的拖动起不来",
+            "userScrollEnabled = draggingId == null" in text,
+        )
+        // ③ 一次拖动只写一笔，写的是落点，且写的时候是松手。
+        assertEquals(
+            "拖动里出现了不止一处换位写入：拖动期间写列表会让 LazyColumn 跟着锚点挪窗口，" +
+                "被拖的行会当场出视口（断触），为压住它又得逐帧钉窗（闪屏）",
+            1, text.split("onMove(").size - 1,
         )
         assertTrue(
-            "指尖没有换算到列表内容这个基准（漏掉上内边距）：指尖会被算低一个内边距",
-            "supplierSlotUnderFinger(" in text,
+            "松手时的落点没有写进列表",
+            Regex("""(?s)fun endDrag\(draggedId: String\?, commit: Boolean\) \{.*?onMove\(draggedId, targetSlot\)""")
+                .containsMatchIn(text),
         )
         assertTrue(
-            "落格函数没有减掉列表顶边与上内边距：同一根手指在不同滚动位置上会算出不同的格子",
+            "自动滚动滚过的帧没有重新落格：手指停在边缘时没有 MOVE 事件，只认 onDrag 的判定永远不会" +
+                "重跑，列表滚了、落点不动",
+            "judgeSlot(pointerRootY)?.let { targetSlot = it }" in text,
+        )
+        // ④ 浮层在列表之外，原位留一个等高的空位。
+        assertTrue(
+            "被拖的行没有换成等高的空位：列表的几何会随拖动改变，判定用的那一帧就过期了",
+            ".height(SUPPLIER_ORDER_ROW_HEIGHT)" in text &&
+                "val dragged = suppliers.firstOrNull { it.id == draggingId }" in text,
+        )
+        assertTrue(
+            "浮层没有画在列表之上（zIndex）：它会与列表里的行抢同一层，看起来像两行",
+            "zIndex(1f)" in text,
+        )
+        // ⑤ 命中测试与判定基准。
+        assertTrue(
+            "拖动起点没有做命中测试：手势不在行上了，得由布局算出按下的是哪一行",
+            "supplierRowUnderFinger(" in text,
+        )
+        assertTrue(
+            "指尖与 itemsInfo 的 offset 没有换到同一基准：offset 从视口起点量起，向上还隔着列表的" +
+                "上内边距，漏掉它每格会提前翻转",
             "- listTopInRoot + viewportStartOffset" in text,
         )
         assertTrue(
@@ -243,19 +295,19 @@ class DialogWindowContractTest {
             Regex("""\.roundToInt\(\)\.coerceIn\(0, lastIndex\)""").containsMatchIn(text),
         )
         assertTrue(
-            "指尖与 offset 没有换到同一基准：offset 从视口起点量起，漏掉上内边距就会算低一格",
-            "+ viewportStartOffset" in text,
-        )
-        assertTrue(
             "格子间距没有量自列表布局（相邻行的 offset 之差）：行距一改换算就失准",
             "visible[1].offset - visible[0].offset" in text,
         )
-        // ⑤ 列表要跟着手指沿边缘滚（用户 1.7.17：拖到顶/底时列表不跟手、手指越出可见窗口
-        //    就断了；与边缘那一格换位是闪切）。三件事缺一不可：指尖夹进视口、按实际消费量
-        //    逐帧滚、把滚过的位移补进判定。
+        assertTrue(
+            "按下时没有采样判定帧：逐帧重读布局会把列表自己的滚动算进指尖位移，手指走一格、" +
+                "判定说走两格",
+            "val frame = currentSupplierDragFrame(listState, listTopInRoot, spacingPx)" in text,
+        )
+        // 指尖贴住边缘时列表要跟着手指滚（用户：「移出显示列表时列表应该往上或者往下拓展，直到
+        // 顶部或者底部」）。三件事缺一不可：指尖夹进视口、按实际消费量逐帧滚、把滚过的位移补进判定。
         assertTrue(
             "指尖没有夹进视口：越出边缘的手指会被算成列表中很远的一格（甚至直接末格），" +
-                "被拖的行一步跳出去、出了组合，手势当场取消",
+                "中间那些格子根本没进过画面",
             "fingerRootY.coerceIn(" in text,
         )
         assertTrue(
@@ -263,7 +315,7 @@ class DialogWindowContractTest {
             "supplierAutoScrollStep(" in text,
         )
         assertTrue(
-            "自动滚动没有逐帧步进：一次跳一屏会连着跳过好几格，换位就成了闪切",
+            "自动滚动没有逐帧步进：一次跳一屏会连着跳过好几格",
             "withFrameNanos {" in text,
         )
         assertTrue(
@@ -274,59 +326,15 @@ class DialogWindowContractTest {
             "自动滚过的位移没有补进判定：内容从手指底下滑过去，指尖底下的格子必须跟着前进",
             "+ autoScrolledPx" in text,
         )
-        // ④ 判定用的那一帧在手指按下时采一次，整次拖动不再重读（设备实测的第二类缺陷：
-        //    被拖的行如果是列表第一可见那行，换位会让列表跟着滚一格，逐帧重读就把这次滚动
-        //    算成指尖的位移——手指只走一格、判定说走两格，行越拖越跑）。
-        assertTrue(
-            "按下时没有采样判定帧：逐帧重读布局会把列表滚动（列表跟着第一可见行的 key 走）" +
-                "算进指尖位移，手指走一格、判定说走两格",
-            "dragFrame = currentSupplierDragFrame(" in text,
-        )
-        // ⑥ 设备实测抓到的第三类缺陷（修复途中又抓到第四类）：第三类＝停在边缘不动时没有
-        //    MOVE 事件，只认 onDragAt 的判定永远不重跑——列表在自动滚动，被拖行的落点却停在
-        //    起拖时那一格（实测滚了 5 行，行落在了起拖时底边那一格上）。修法＝逐帧循环里每
-        //    滚过一帧就用同一份 judgeSlot 重新落格，手势与循环共用这一份判定。
-        assertTrue(
-            "自动滚动滚过的帧没有重新落格：手指停在边缘时没有 MOVE 事件，只认 onDragAt 的" +
-                "判定永远不会重跑，列表滚了、落点不动",
-            "judgeSlot(pointerRootY)?.let { onMove(draggedId, it) }" in text,
-        )
-        // ④ 的姊妹缺陷（设备实测：拖到底边按住，第一次换位后拖动当场断，行不再高亮）：
-        //    换位会让列表的滚动锚点跟着挪一格。旧修法用 scrollToItem+scrollBy 把窗口「滚回」
-        //    按下时的位置——它参与滚动互斥，会取消逐帧循环正在进行的那次滚动（循环整个死掉）；
-        //    两次调用之间还可能渲染一帧按下时的窗口，被拖行那时已经前进到视口之外，行被裁出
-        //    组合，长按手势当场取消——「在边界处停留并取消选中态」正是它。修法＝每帧用
-        //    requestScrollToItem 把窗口「请求」成按下那一格 + 自动滚过的距离：不参与互斥、
-        //    不打断滚动、只在下一次测量生效，换位落地的测量消费到的永远是正确窗口。
-        assertTrue(
-            "换位后的窗口恢复没有用请求式钉窗（requestScrollToItem）：scrollToItem 会跟" +
-                "逐帧循环抢滚动锁互相取消，中间态那一帧还会把已移出视口的被拖行裁掉、断掉手势",
-            "listState.requestScrollToItem(index, offset.roundToInt())" in text,
-        )
-        assertTrue(
-            "钉窗目标没有折算「按下那一格 + 自动滚过的像素」：换位附带的滚动会留下来，" +
-                "行不跟手",
-            "frame.scrollIndex * frame.pitch + frame.scrollOffset + autoScrollPx" in text,
-        )
-        assertTrue(
-            "钉窗目标没有夹住可滚下限：目标折出的行号是负的（-1），请求无效，换位落地的" +
-                "那次测量没人挡着，锚点跟随会把被拖行拽出视口、断掉手势（设备实测）",
-            ".coerceAtLeast(frame.viewportStartOffset.toFloat())" in text,
-        )
-        assertTrue(
-            "拖动事件里的换位没有当场钉窗：换位的数据在事件线程落地，下一次测量就是它——" +
-                "只靠下一帧的逐帧钉窗，锚点跟随会在中间那一帧把被拖行拽出视口（用户看到的" +
-                "就是与边缘换位时的「闪切」）",
-            Regex("""judgeSlot\(fingerRootY\)\?\.let \{\s*onMove\(movedId, it\)\s*pinWindow\(\)""")
-                .containsMatchIn(text),
-        )
-        assertTrue(
-            "钉窗没有每帧重发：换位的数据晚一帧落地时，落地的测量消费不到请求，" +
-                "锚点跟随会把窗口又拽偏一格",
-            Regex("""(?s)LaunchedEffect\(draggingId\) \{.*?pinWindow\(\)\n        \}\n    \}""")
-                .containsMatchIn(text),
+        // 钉窗那一整套（requestScrollToItem、frame.scrollIndex * pitch + scrollOffset + autoScrollPx）
+        // 随「拖动期间不换位」一起退休：没有换位就没有锚点跟随要压，窗口除了指尖自己的滚动没有别的
+        // 写手。它回来就等于换位又回到了拖动期间——断触与闪屏的根。
+        assertFalse(
+            "钉窗又回来了（requestScrollToItem）：它存在的唯一理由是拖动期间还在换位",
+            "requestScrollToItem" in text,
         )
     }
+
 
     @Test
     fun `the animation toolbar is four bare icon buttons and no button keeps a press ghost`() {
@@ -382,16 +390,15 @@ class DialogWindowContractTest {
     }
 
     @Test
-    fun `the drag handle is the whole row, not the grip icon`() {
-        // 拖动「拖不动」的根因就在这里：手势原本挂在右侧那个手柄图标上，而它只有 44dp 宽。
-        // 手指按住它再拖，起手的一点抖动就滑出它的边界，手势当场取消——表现就是按下去不动。
-        // 修法是把 pointerInput 挂到整行。JVM 里量不到命中区，能钉住的是源码里的顺序：
-        // dragModifier 必须加在行这个容器上，而右端那个图标只剩 contentDescription = null 的
-        // 装饰身份（它不是把手，是「这里可以拖」的提示）。
+    fun `the whole list area is the handle, and the grip stays a decoration`() {
+        // 拖动「拖不动」的根因：手势原本挂在右侧那个手柄图标上，而它只有 44dp 宽——手指按住它再拖，
+        // 起手的一点抖动就滑出它的边界，手势当场取消。修法是把整片列表区域都做成把手（见上一条），
+        // 右端那个图标只剩 contentDescription = null 的装饰身份：它不是把手，是「这里可以拖」的提示。
+        // JVM 里量不到命中区，能钉住的是源码事实。
         val file = File(sourceRoot, "com/relaytester/app/feature/tester/TesterScreen.kt")
         val text = code(file)
         assertTrue(
-            "拖动手势没有挂在整行上：手柄只有 44dp，按住它拖会滑出边界，拖动又会断",
+            "拖动手势没有挂在列表区域上：手柄只有 44dp，按住它拖会滑出边界，拖动又会断",
             ".then(dragModifier)" in text,
         )
         assertTrue(
@@ -403,6 +410,7 @@ class DialogWindowContractTest {
             "SUPPLIER_ORDER_ROW_HEIGHT" in text,
         )
     }
+
 
     @Test
     fun `saving a supplier closes its editor and toasts on the page`() {
