@@ -49,27 +49,7 @@ Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询�
 
 调试包位于 `app/build/outputs/apk/debug/app-debug.apk`，发布用的优化包位于 `app/build/outputs/apk/optimized/app-optimized.apk`（包名 `com.relaytester.app`）。发布包的签名口令只放在仓库外（`~/.gradle/gradle.properties` 或构建时传入），不进版本库。
 
-## 发行版本
-
-- 最新：[v1.8.1 Release](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.8.1) · [发行说明](release-notes/RELEASE_NOTES_1.8.1.md)
-  - `RelayTester-v1.8.1-android.apk` · `3,154,287` 字节 · SHA-256 `7cf9948c0f5dde2aa044c36d02f8a22e3288c00e644d092ab4dce34e1486cd4b`
-
-历史版本（每个版本的说明页写明了该版当前安装包的字节数与 SHA-256）：
-
-- [v1.8.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.8.0) · [发行说明](release-notes/RELEASE_NOTES_1.8.0.md)
-- [v1.7.3](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.7.3) · [发行说明](release-notes/RELEASE_NOTES_1.7.3.md)
-- [v1.7.2](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.7.2) · [发行说明](release-notes/RELEASE_NOTES_1.7.2.md)
-- [v1.7.1](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.7.1) · [发行说明](release-notes/RELEASE_NOTES_1.7.1.md)
-- [v1.7.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.7.0) · [发行说明](release-notes/RELEASE_NOTES_1.7.0.md)
-- [v1.6.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.6.0) · [发行说明](release-notes/RELEASE_NOTES_1.6.0.md)
-- [v1.5.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.5.0) · [发行说明](release-notes/RELEASE_NOTES_1.5.0.md)
-- [v1.4.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.4.0) · [发行说明](release-notes/RELEASE_NOTES_1.4.0.md)
-- [v1.3.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.3.0) · [发行说明](release-notes/RELEASE_NOTES_1.3.0.md)
-- [v1.2.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.2.0) · [发行说明](release-notes/RELEASE_NOTES_1.2.0.md)
-- [v1.1.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.1.0) · [发行说明](release-notes/RELEASE_NOTES_1.1.0.md)
-- [v1.0.0](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.0.0) · [发行说明](release-notes/RELEASE_NOTES_1.0.0.md)
-
 ## 更多文档
 
-- [各版本发行说明](release-notes/)
+- [历史版本与发行说明](https://github.com/xiaopeng66/RelayTesterAndroid/releases)
 - [第三方许可声明](THIRD_PARTY_NOTICES.md)

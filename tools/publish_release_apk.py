@@ -3,7 +3,7 @@
 
 The release line this project ships on is one version per number: a rebuild replaces
 the asset and the notes in place instead of adding a patch number, so the version tag,
-the notes file and the APK always describe the same build.
+the release page and the APK always describe the same build.
 
 Two releases are involved, and this script is the only thing that touches both:
 
@@ -21,17 +21,21 @@ Both assets are downloaded again afterwards and compared byte for byte.
 Before anything is uploaded, the artifact has to pass four gates that a self-consistent
 feed cannot substitute for: it must be signed by the release certificate, carry this app's
 package name, still hold the wording the source says, and (compared against the live feed)
-not move the advertised version code backwards. The README's line for this version is
-rewritten to the numbers being published, because it went stale once already.
+not move the advertised version code backwards.
+
+The release notes live in the release page's body: the page *is* the record, so no copy of
+them sits in the repository to drift from it. This script reads that body (or a draft given
+with --notes), refuses it when the size and digest it names are not the artifact being
+published, and builds the feed's plain-text copy from the same text.
 
 Usage:
-    python tools/publish_release_apk.py --dry-run   # print what would be published
+    python tools/publish_release_apk.py --notes <草稿> --dry-run   # gates only, offline
     python tools/publish_release_apk.py --check     # verify the published assets match
-    python tools/publish_release_apk.py             # upload the APK, the notes and the feed
+    python tools/publish_release_apk.py             # upload the APK and the feed
 
-Files are read from the repository (app/build.gradle.kts, the optimized APK and
-release-notes/RELEASE_NOTES_<version>.md), so nothing here can drift from the build except
-by being run against a stale APK — which the download-back check at the end catches.
+The version and the APK are read from the repository (app/build.gradle.kts and the optimized
+build output), so nothing here can drift from the build except by being run against a stale
+APK — which the download-back check at the end catches.
 
 Token: GITHUB_TOKEN, or the first line of E:/AI/Zcode/tmp/.ghtoken.
 """
@@ -58,7 +62,6 @@ REPO = "xiaopeng66/RelayTesterAndroid"
 API = "https://api.github.com"
 PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GRADLE = os.path.join(PROJECT, "app/build.gradle.kts")
-README = os.path.join(PROJECT, "README.md")
 TOKEN_FILES = ["E:/AI/Zcode/tmp/.ghtoken"]
 
 # The package name an APK must carry to be publishable as this app's update source. The feed
@@ -170,13 +173,15 @@ NOTES_DIGEST_RE = re.compile(r"SHA-256[：:]\s*`([0-9a-fA-F]{64})`")
 NOTES_SIZE_RE = re.compile(r"字节数[：:]\s*`([\d,]+)`")
 
 
-def verify_notes_identity(notes_bytes, apk_bytes, notes_path):
+def verify_notes_identity(notes_bytes, apk_bytes, where):
     """Stop when the release notes describe bytes other than the APK being published.
 
     A Gradle Android build is not byte-reproducible: rebuilding the same source yields the
     same size at a different digest, so a digest written into the notes — and shown on the
     release page — goes stale on any rebuild after it was written. The notes are read before
     anything is uploaded, so this is the last point at which the two can be reconciled.
+
+    [where] names the source in the messages ("发行版正文", or the draft's file name).
     """
     text = notes_bytes.decode("utf-8")
     actual_digest = sha256(apk_bytes)
@@ -184,12 +189,11 @@ def verify_notes_identity(notes_bytes, apk_bytes, notes_path):
     stated_digests = NOTES_DIGEST_RE.findall(text)
     if not stated_digests:
         raise SystemExit(
-            f"{os.path.basename(notes_path)} 里没有 `SHA-256：` 一行，"
-            "无法核对说明与产物是不是同一份构建"
+            f"{where} 里没有 `SHA-256：` 一行，无法核对说明与产物是不是同一份构建"
         )
     if len(stated_digests) > 1:
         raise SystemExit(
-            f"{os.path.basename(notes_path)} 里有 {len(stated_digests)} 处 SHA-256："
+            f"{where} 里有 {len(stated_digests)} 处 SHA-256："
             f"{stated_digests}，无法判断哪一处是本页产物的摘要"
         )
     size_match = NOTES_SIZE_RE.search(text)
@@ -211,7 +215,7 @@ def verify_notes_identity(notes_bytes, apk_bytes, notes_path):
         f"  产物的 SHA-256  ：{actual_digest}\n"
         f"  说明写的字节数  ：{stated_size if stated_size is not None else '（未写）'}\n"
         f"  产物的字节数    ：{actual_size}\n"
-        f"  把 {os.path.basename(notes_path)} 改成本次产物的数字再发布"
+        f"  把 {where} 改成本次产物的数字再发布"
         "（Android 构建不可字节复现，重建一次摘要就会变）。"
     )
 
@@ -220,7 +224,7 @@ def notes_for_feed(notes_bytes, limit=FEED_NOTES_LIMIT):
     """The release notes flattened into the plain text the feed carries.
 
     The app's dialog prints this text as it comes — there is no Markdown renderer on that
-    side — so the markers the notes file is written with come off here, once, where a gate
+    side — so the markers the notes are written with come off here, once, where a gate
     can look at the result, instead of on a user's phone:
 
       * heading markers (`# …`) drop, the heading text stays;
@@ -258,15 +262,15 @@ def notes_for_feed(notes_bytes, limit=FEED_NOTES_LIMIT):
     return cut.rstrip() + "\n…"
 
 
-def verify_feed_notes(text, notes_path, limit=FEED_NOTES_LIMIT):
+def verify_feed_notes(text, where, limit=FEED_NOTES_LIMIT):
     """Refuse a feed whose notes still look like Markdown, or are past the app's ceiling.
 
     A gate rather than trust in [notes_for_feed]: the converter is the only thing standing
-    between the notes file and a dialog that prints exactly what it is handed, and a rule
-    the file grows later (a table, a nested list, an image) would otherwise surface as
-    literal `**` on a phone. Cheap to check here, impossible to notice there.
+    between the notes and a dialog that prints exactly what it is handed, and a rule the
+    notes grow later (a table, a nested list, an image) would otherwise surface as literal
+    `**` on a phone. Cheap to check here, impossible to notice there.
     """
-    name = os.path.basename(notes_path)
+    name = where
     if not text.strip():
         raise SystemExit(f"{name} 转成纯文本后是空的，清单里没有可显示的说明")
     if len(text) > limit:
@@ -378,49 +382,6 @@ def verify_release_identity(identity, apk_path):
             f"不是发布包名 {APP_PACKAGE!r}；它不能作为更新源发布"
         )
     print(f"identity: 包名 {identity['packageName']}，版本代码 {identity['versionCode']}")
-
-
-README_APK_RE = re.compile(
-    r"(`RelayTester-v([0-9.]+)-android\.apk`\s*·\s*`)([\d,]+)"
-    r"(`\s*字节\s*·\s*SHA-256\s*`)([0-9a-fA-F]{64})(`)"
-)
-
-
-def sync_readme_digest(apk_bytes, release_version):
-    """Rewrite README's line for this version so it names the bytes being published.
-
-    A rebuild moves the digest while the source stays put (the Android build is not
-    byte-reproducible), so a number written by hand is stale after the next one — which is
-    how this line came to disagree with the release notes, the artifact and the live feed all
-    at once. The release notes are *checked* and stop the run; the README is *rewritten*,
-    because it is prose this step already owns and a stale line there misleads a reader who
-    verifies a download against the file he was given. Only the two numbers move.
-    """
-    actual_size = len(apk_bytes)
-    actual_digest = sha256(apk_bytes)
-    with open(README, encoding="utf-8") as handle:
-        text = handle.read()
-
-    matches = [match for match in README_APK_RE.finditer(text) if match.group(2) == release_version]
-    if not matches:
-        print(f"readme: 没有 {release_version} 的安装包行，未改动（若已在别处说明，可忽略）")
-        return
-    if len(matches) > 1:
-        raise SystemExit(f"README.md 里有 {len(matches)} 处 {release_version} 的安装包行，无法判断改哪一处")
-
-    match = matches[0]
-    if match.group(3).replace(",", "") == str(actual_size) and match.group(5).lower() == actual_digest:
-        print(f"readme: 已与产物一致（{actual_size} 字节 {actual_digest[:12]}）")
-        return
-    replacement = (
-        f"{match.group(1)}{actual_size:,}{match.group(4)}{actual_digest}{match.group(6)}"
-    )
-    with open(README, "w", encoding="utf-8", newline="") as handle:
-        handle.write(text[: match.start()] + replacement + text[match.end():])
-    print(
-        f"readme: 已改写为本次产物（{match.group(3)} → {actual_size:,} 字节，"
-        f"{match.group(5)[:12]} → {actual_digest[:12]}）；记得把 README.md 一并提交"
-    )
 
 
 def published_app_version_code(token):
@@ -633,7 +594,16 @@ def differing_only_in_published_at(fetched, manifest):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--apk", help="要发布的 APK，默认取 optimized 构建产物")
-    parser.add_argument("--dry-run", action="store_true", help="只打印，不联网")
+    parser.add_argument(
+        "--notes",
+        help="说明草稿文件；不给就从发行版正文读（正文就是说明的出处），"
+             "给了则在发布时把正文同步成这份草稿",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只打印不写入；不联网，所以说明门禁要配 --notes 草稿（不给就只跑本地门禁）",
+    )
     parser.add_argument("--check", action="store_true", help="只校验线上与本地是否一致")
     parser.add_argument(
         "--allow-nonmonotonic",
@@ -646,17 +616,20 @@ def main():
     apk_path = args.apk or os.path.join(
         PROJECT, "app/build/outputs/apk/optimized/app-optimized.apk"
     )
-    notes_path = os.path.join(PROJECT, "release-notes", f"RELEASE_NOTES_{version()}.md")
     name = f"RelayTester-{tag}-android.apk"
     with open(apk_path, "rb") as handle:
         apk_bytes = handle.read()
-    with open(notes_path, "rb") as handle:
-        notes_bytes = handle.read()
     print(f"{tag}: {name} {len(apk_bytes)} 字节 sha256 {sha256(apk_bytes)}")
-    print(f"notes: {os.path.basename(notes_path)} {len(notes_bytes)} 字节")
-    # The notes are part of what goes up, and a rebuild moves the digest under them; checked
-    # before anything is uploaded, like the feed below it.
-    verify_notes_identity(notes_bytes, apk_bytes, notes_path)
+
+    # A draft is read here so the notes gates can run offline; without one the text comes
+    # from the release body below, which is where the notes live.
+    notes_bytes = None
+    notes_from = None
+    if args.notes:
+        with open(args.notes, "rb") as handle:
+            notes_bytes = handle.read()
+        notes_from = os.path.basename(args.notes)
+        print(f"notes: {notes_from} {len(notes_bytes)} 字节")
 
     # Three gates that no downstream check can substitute for: the APK has to be signed by
     # the release key, carry this app's package name, and hold the wording the source says.
@@ -671,10 +644,32 @@ def main():
     # that is not an APK) has to stop the run while the release is still untouched.
     identity = apk_identity(apk_path)
     verify_release_identity(identity, apk_path)
-    # The notes' plain-text form goes into the feed, so it is built and checked here, with
-    # the other gates and before anything is uploaded.
+
+    if args.dry_run and notes_bytes is None:
+        print(
+            "notes: --dry-run 不联网，说明门禁与清单里的说明这次不生成；"
+            "用 --notes <草稿> 能离线先跑一遍，或在发行版正文写好说明后直接发布"
+        )
+        return 0
+
+    token = read_token()
+    release = release_of(token, tag)
+    if release is None:
+        raise SystemExit(f"{tag} release 不存在；先建标签与发行版再发布资产")
+    if notes_bytes is None:
+        body = release.get("body") or ""
+        if not body.strip():
+            raise SystemExit(f"{tag} 的发行版正文是空的：说明就写在发行版正文里，先补上再发布")
+        notes_bytes = body.encode("utf-8")
+        notes_from = "发行版正文"
+        print(f"notes: {notes_from} {len(notes_bytes)} 字节")
+
+    # The notes name the bytes being published and a rebuild moves the digest under them;
+    # this is the last moment before an upload at which the two can be reconciled. The feed's
+    # plain-text copy is derived from the same text and checked here, with the other gates.
+    verify_notes_identity(notes_bytes, apk_bytes, notes_from)
     feed_notes = notes_for_feed(notes_bytes)
-    verify_feed_notes(feed_notes, notes_path)
+    verify_feed_notes(feed_notes, notes_from)
     print(f"notes: 清单内说明 {len(feed_notes)} 字（上限 {FEED_NOTES_LIMIT}）")
     manifest = build_app_manifest(
         identity,
@@ -692,14 +687,6 @@ def main():
     if args.dry_run:
         return 0
 
-    # Local and network-independent: the README names the artifact that exists on disk, so it
-    # is corrected before the release is touched. A `--dry-run` deliberately writes nothing.
-    sync_readme_digest(apk_bytes, version())
-
-    token = read_token()
-    release = release_of(token, tag)
-    if release is None:
-        raise SystemExit(f"{tag} release 不存在；先建标签与发行版再发布资产")
     if args.check:
         verify(release, name, apk_bytes)
         app_release = publish_bank.release_by_tag(token, APP_TAG)
@@ -732,15 +719,19 @@ def main():
         raise SystemExit(f"上传 {name} 失败：HTTP {status} {body[:300]!r}")
     print(f"uploaded {name}")
 
-    status, body = request(
-        token,
-        "PATCH",
-        f"{API}/repos/{REPO}/releases/{release['id']}",
-        {"body": notes_bytes.decode("utf-8")},
-    )
-    if status != 200:
-        raise SystemExit(f"更新发行说明失败：HTTP {status} {body[:200]!r}")
-    print("updated release notes from", os.path.basename(notes_path))
+    if args.notes:
+        # The draft was the source, so the page is brought in line with it before the feed —
+        # built from the same text — goes up. Without a draft the body already *is* the
+        # notes and there is nothing to sync.
+        status, body = request(
+            token,
+            "PATCH",
+            f"{API}/repos/{REPO}/releases/{release['id']}",
+            {"body": notes_bytes.decode("utf-8")},
+        )
+        if status != 200:
+            raise SystemExit(f"更新发行说明失败：HTTP {status} {body[:200]!r}")
+        print(f"updated release notes from {notes_from}")
 
     # The feed goes up last: it must never advertise an APK that is not there yet, and the
     # read-back below compares it with the version code this run just published.
