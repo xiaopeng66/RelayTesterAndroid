@@ -3,8 +3,8 @@
 Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询工具，面向经常使用中转站 / API 代理服务的用户。它不依赖外部服务器，直接从手机向用户配置的 API 站点发起请求。
 
 - 当前版本：1.7.3
-- 下载地址：[GitHub Release v1.7.3](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.7.3)
-- 安装包：包名 `com.relaytester.app`，约 2.85 MB；模型指纹检测包按需下载，不占安装包体积
+- 下载地址：[GitHub Release v1.8.1](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.8.1)
+- 安装包：包名 `com.relaytester.app`，约 3.0 MB；模型指纹检测包按需下载，不占安装包体积
 - 支持系统：Android 8.0 及以上
 
 ## 核心功能
