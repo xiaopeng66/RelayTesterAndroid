@@ -55,6 +55,7 @@ import sys
 from pathlib import Path
 
 import upstream_detector
+from fingerprint_package_validation import validate_package, validate_sources
 
 MAGIC = b"LMFPA004"
 SCALE = 1_000_000.0
@@ -302,6 +303,7 @@ def main():
             f"上游检测器 schema={schema!r}，本工具与 App 只实现了 {SUPPORTED_SCHEMA}："
             "先按新 schema 更新 tools/build_fingerprint_asset.py 与 App 的指纹打分，再发布",
         )
+    validate_sources(detector, bank)
     ranker = detector["ranker"]
     for key in ("blend", "positional"):
         if not isinstance(ranker.get(key), dict):
@@ -429,6 +431,7 @@ def main():
     w.text(schema)
 
     blob = w.blob()
+    validate_package(blob)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(blob)
 

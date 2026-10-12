@@ -2,10 +2,10 @@
 
 Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询工具，面向经常使用中转站 / API 代理服务的用户。它不依赖外部服务器，直接从手机向用户配置的 API 站点发起请求。
 
-- 当前版本：1.8.1
-- 下载地址：[GitHub Release v1.8.1](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.8.1)
+- 当前版本：1.8.2
+- 下载地址：[GitHub Release v1.8.2](https://github.com/xiaopeng66/RelayTesterAndroid/releases/tag/v1.8.2)
 - 安装包：包名 `com.relaytester.app`；模型指纹检测包按需下载，不占安装包体积
-- 支持系统：Android 8.0 及以上
+- 支持系统：Android 8.0 及以上（arm64）
 
 ## 核心功能
 
@@ -31,6 +31,7 @@ Relay Tester 是一款 Android 原生的多供应商模型测试与余额查询�
 
 ### 已知限制（如实登记）
 
+- **16 KB 内存页设备的脚本兼容性**：当前 QuickJS 原生库只按 4 KB 对齐，16 KB 内存页设备上的余额脚本查询路径不兼容；构建检查将其列为已知例外，不代表已通过此类设备验证。
 - **屏幕内容未加 `FLAG_SECURE`**：多任务切换器的预览截图与录屏会包含供应商名称、密钥输入框等界面内容。设置它会让用户自己也无法截图分享界面，权衡后不加。
 - **模板可以把密钥写进 URL**：若把 `{{apiKey}}` / `{{accessToken}}` 放进 URL 查询串（部分站点确实这样设计），密钥就会出现在请求 URL 里，可能被上游日志记录。应用不阻止这种写法，请尽量把凭据放在请求头。
 - **配置导出不是原子写**：导出走系统文件选择器（SAF），不支持「写临时文件再换名」，写入中途失败会在目标位置留下半个文件；应用会报错，但不会替你清理残件。

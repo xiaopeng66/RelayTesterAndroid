@@ -18,10 +18,10 @@ version name, so a tag comparison would call a 10502 install up to date.
 
 Both assets are downloaded again afterwards and compared byte for byte.
 
-Before anything is uploaded, the artifact has to pass four gates that a self-consistent
-feed cannot substitute for: it must be signed by the release certificate, carry this app's
-package name, still hold the wording the source says, and (compared against the live feed)
-not move the advertised version code backwards.
+Before anything is uploaded, local gates check the release certificate, package and source
+version, required wording, native alignment (with the verifier's documented exceptions),
+and notes identity. Actual publishing also compares the version code against the live feed
+so a known newer version is not overwritten without an explicit rollback override.
 
 The release notes live in the release page's body: the page *is* the record, so no copy of
 them sits in the repository to drift from it. This script reads that body (or a draft given
@@ -29,13 +29,18 @@ with --notes), refuses it when the size and digest it names are not the artifact
 published, and builds the feed's plain-text copy from the same text.
 
 Usage:
-    python tools/publish_release_apk.py --notes <草稿> --dry-run   # gates only, offline
-    python tools/publish_release_apk.py --check     # verify the published assets match
+    python tools/publish_release_apk.py --notes <草稿> --dry-run   # local gates + feed preview
+    python tools/publish_release_apk.py --dry-run   # APK gates only; no notes or feed preview
+    python tools/publish_release_apk.py --check     # read-only online asset comparison
     python tools/publish_release_apk.py             # upload the APK and the feed
 
-The version and the APK are read from the repository (app/build.gradle.kts and the optimized
-build output), so nothing here can drift from the build except by being run against a stale
-APK — which the download-back check at the end catches.
+Dry runs never read credentials or contact GitHub, even with a draft. They cannot check
+release existence, live version rollback or downloaded assets. --dry-run and --check are
+mutually exclusive. --notes only updates the release body during an actual publish.
+
+The version and the APK come from app/build.gradle.kts and the optimized build output.
+Version mismatches stop before network access; download-back verifies uploaded bytes, not
+source freshness. A same-version stale APK still needs the build/wording checks.
 
 Token: GITHUB_TOKEN, or the first line of E:/AI/Zcode/tmp/.ghtoken.
 """
@@ -55,6 +60,7 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import publish_bank  # noqa: E402 - the sibling module, on the path added just above
+import retry  # noqa: E402 - shared HTTP classification and header-aware waits
 import verify_apk_wording  # noqa: E402 - same, the wording invariants for the shipped APK
 import verify_native_alignment  # noqa: E402 - same, the 16 KB page pairing for its .so files
 
@@ -161,7 +167,7 @@ def verify(release, name, apk_bytes):
     assets = {asset["name"]: asset for asset in release["assets"]}
     if name not in assets:
         raise SystemExit(f"发布后找不到资产 {name}")
-    fetched = download(assets[name]["browser_download_url"])
+    fetched = publish_bank.download(assets[name]["browser_download_url"], cache_bust=True)
     if fetched != apk_bytes:
         raise SystemExit(
             f"回读的 {name} 与本地文件不一致（{len(fetched)} 字节 vs {len(apk_bytes)} 字节）"
@@ -196,12 +202,15 @@ def verify_notes_identity(notes_bytes, apk_bytes, where):
             f"{where} 里有 {len(stated_digests)} 处 SHA-256："
             f"{stated_digests}，无法判断哪一处是本页产物的摘要"
         )
-    size_match = NOTES_SIZE_RE.search(text)
-    stated_size = int(size_match.group(1).replace(",", "")) if size_match else None
+    stated_sizes = NOTES_SIZE_RE.findall(text)
+    if len(stated_sizes) != 1:
+        raise SystemExit(
+            f"{where} 里需要且只能有一处 `字节数：`，实际找到 {len(stated_sizes)} 处，"
+            "无法核对说明与产物是不是同一份构建"
+        )
+    stated_size = int(stated_sizes[0].replace(",", ""))
 
-    mismatch = stated_digests[0].lower() != actual_digest
-    if stated_size is not None and stated_size != actual_size:
-        mismatch = True
+    mismatch = stated_digests[0].lower() != actual_digest or stated_size != actual_size
     if not mismatch:
         print(
             f"notes: 说明里的 SHA-256 与字节数就是这份产物"
@@ -213,7 +222,7 @@ def verify_notes_identity(notes_bytes, apk_bytes, where):
         "发行说明与要发布的产物不是同一份构建，已在任何上传之前停下：\n"
         f"  说明写的 SHA-256：{stated_digests[0]}\n"
         f"  产物的 SHA-256  ：{actual_digest}\n"
-        f"  说明写的字节数  ：{stated_size if stated_size is not None else '（未写）'}\n"
+        f"  说明写的字节数  ：{stated_size}\n"
         f"  产物的字节数    ：{actual_size}\n"
         f"  把 {where} 改成本次产物的数字再发布"
         "（Android 构建不可字节复现，重建一次摘要就会变）。"
@@ -368,43 +377,102 @@ def verify_apk_signature(apk_path):
 
 
 def verify_release_identity(identity, apk_path):
-    """Stop unless the artifact is this app's own package.
+    """Stop unless the artifact is this app and matches the source's release version.
 
-    A debug build carries a different package name; the feed would carry it too, and every
-    installed device would reject the update before downloading anything — the channel stops
-    without an error anyone can see. The name is checked against a constant here rather than
-    against the build file because the point is to notice a *different* artifact, which the
-    build file cannot say.
+    Digest/read-back checks only prove the bytes agree with each other, not that an APK
+    was built for this release. Both release and optimized use the source version without
+    a suffix; a stale or debug APK must not acquire the current release's name in the feed.
     """
     if identity["packageName"] != APP_PACKAGE:
         raise SystemExit(
             f"{os.path.basename(apk_path)} 的包名是 {identity['packageName']!r}，"
             f"不是发布包名 {APP_PACKAGE!r}；它不能作为更新源发布"
         )
+    with open(GRADLE, encoding="utf-8") as handle:
+        code = re.search(r"^\s*versionCode\s*=\s*([0-9][0-9_]*)\s*(?://[^\n]*)?$", handle.read(), re.MULTILINE)
+    if code is None:
+        raise SystemExit("app/build.gradle.kts 里找不到 versionCode 整数")
+    expected = {"versionName": version(), "versionCode": int(code.group(1).replace("_", ""))}
+    for field, value in expected.items():
+        if identity[field] != value:
+            raise SystemExit(
+                f"{os.path.basename(apk_path)} 的 {field} 是 {identity[field]!r}，"
+                f"与 app/build.gradle.kts 的 {value!r} 不一致；重新构建后再发布"
+            )
     print(f"identity: 包名 {identity['packageName']}，版本代码 {identity['versionCode']}")
 
 
-def published_app_version_code(token):
-    """The version code the live feed advertises, or None when there is nothing to compare.
+NOTES_VERSION_CODE_RE = re.compile(r"(?:版本代码|versionCode)[：:]\s*`([0-9]+)`")
 
-    A missing release, a missing asset or an unreadable body all mean "unknown" rather than
-    "older": the caller must not refuse a publish because the network hiccuped.
+
+def notes_version_code(text, where):
+    """Version-release bodies are the durable fallback when a feed upload is interrupted."""
+    codes = NOTES_VERSION_CODE_RE.findall(text)
+    if len(codes) != 1 or int(codes[0]) <= 0:
+        raise SystemExit(f"{where} 缺少唯一的有效版本代码，无法确认线上版本代码，停止发布")
+    return int(codes[0])
+
+
+def released_app_version_code(token):
+    """Maximum code from all public version releases, not release creation/tag ordering.
+
+    Rebuilt releases can keep their tag. Never guess a code from semantic versioning or
+    silently ignore a version release whose body cannot establish its version code.
+    """
+    highest = None
+    page = 1
+    while True:
+        status, body = publish_bank.request(
+            token, "GET", f"{API}/repos/{REPO}/releases?per_page=100&page={page}",
+        )
+        if status != 200:
+            raise SystemExit(f"无法确认线上版本代码：读取发行历史失败 HTTP {status}")
+        try:
+            releases = json.loads(body)
+            if not isinstance(releases, list):
+                raise ValueError("release list is not an array")
+            for release in releases:
+                if not isinstance(release, dict) or not isinstance(release.get("tag_name"), str):
+                    raise ValueError("invalid release metadata")
+                tag = release["tag_name"]
+                if release.get("draft") or not re.fullmatch(r"v[0-9]+(?:\.[0-9]+)+", tag):
+                    continue
+                text = release.get("body")
+                if not isinstance(text, str):
+                    raise ValueError(f"{tag} has no release body")
+                code = notes_version_code(text, tag)
+                highest = max(highest or 0, code)
+        except (ValueError, KeyError, TypeError) as error:
+            raise SystemExit(f"无法确认线上版本代码：发行历史损坏（{error}）") from error
+        if len(releases) < 100:
+            return highest
+        page += 1
+
+
+def published_app_version_code(token):
+    """Return (live code, checked release snapshot), using history for absent/starter feeds.
+
+    An uploaded feed that cannot be read still fails closed. The checked asset id must
+    also be the one deletion targets; refreshing it after the check could delete a
+    newer publication whose version this invocation never checked.
     """
     release = publish_bank.release_by_tag(token, APP_TAG)
     if release is None:
-        return None
+        return released_app_version_code(token), None
     assets = {asset["name"]: asset for asset in release["assets"]}
-    if APP_ASSET not in assets:
-        return None
+    if APP_ASSET not in assets or assets[APP_ASSET].get("state") == "starter":
+        return released_app_version_code(token), release
     try:
-        body = publish_bank.download(
-            assets[APP_ASSET]["browser_download_url"], cache_bust=True, attempts=1
-        )
-        value = json.loads(body).get("versionCode")
-    except (urllib.error.URLError, ValueError, KeyError, TypeError) as error:
-        print(f"读线上清单失败，跳过版本代码比较：{error}")
-        return None
-    return int(value) if value is not None else None
+        body = publish_bank.download(assets[APP_ASSET]["browser_download_url"], cache_bust=True)
+        manifest = json.loads(body)
+        if not isinstance(manifest, dict):
+            raise ValueError("线上清单不是 JSON 对象")
+        value = manifest.get("versionCode")
+        if type(value) is not int or value <= 0:
+            raise ValueError("线上清单缺少有效的 versionCode 正整数")
+    except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as error:
+        raise SystemExit(f"无法确认线上版本代码，已在任何发布写入前停止：{error}") from error
+    return value, release
 
 
 def verify_monotonic_version_code(token, version_code, allow_nonmonotonic):
@@ -416,14 +484,14 @@ def verify_monotonic_version_code(token, version_code, allow_nonmonotonic):
     is this repository's normal release model (one public version per number, rebuilt in
     place), so equality is allowed and only a decrease is refused.
     """
-    published = published_app_version_code(token)
+    published, release = published_app_version_code(token)
     if published is None:
         print("monotonic: 线上还没有可比对的清单")
-        return
+        return release
     if version_code < published:
         if allow_nonmonotonic:
             print(f"monotonic: 本次 {version_code} 低于线上 {published}，按 --allow-nonmonotonic 继续")
-            return
+            return release
         raise SystemExit(
             f"本次要发布的版本代码 {version_code} 低于线上清单的 {published}，已停止：\n"
             "  发布后线上版本会倒退，已经升级的设备会把更新判成「已是最新」，更新通道静默失效。\n"
@@ -431,6 +499,7 @@ def verify_monotonic_version_code(token, version_code, allow_nonmonotonic):
         )
     relation = "相同（同号重建，允许）" if version_code == published else "更高"
     print(f"monotonic: 线上 {published} → 本次 {version_code}（{relation}）")
+    return release
 
 
 
@@ -469,10 +538,9 @@ def apk_identity(apk_path):
 def build_app_manifest(identity, apk_bytes, tag, name, notes_url, notes):
     """The feed document describing the APK that is about to be published.
 
-    `versionName` comes from the build file rather than from the APK because the APK's
-    carries the variant suffix (`1.5.0-optimized`) while the release it belongs to is
-    tagged with the public line — the same field the tag is built from, so the two agree
-    by construction.
+    `versionName` is the source release version, already checked against the artifact by
+    verify_release_identity. Neither release nor optimized has a name suffix, so the APK,
+    tag and feed must describe the same version.
 
     `notes` is the release notes as plain text ([notes_for_feed]), which is what lets the
     app's update dialog show them inline instead of behind a link.
@@ -515,16 +583,21 @@ def verify_app_manifest(release_tag, manifest_bytes, manifest, attempts=6, wait_
     seen = None
     last_error = None
     last_differing = None
+    policy = retry.Policy(attempts=attempts, base_delay=wait_seconds, max_delay=wait_seconds, jitter=0)
     for attempt in range(attempts):
         try:
             # Cache-busted and single-try per read: this loop owns the attempt count, and a
             # just-replaced asset can be served from a CDN cache for a moment.
             fetched = publish_bank.download(url, cache_bust=True, attempts=1)
-        except urllib.error.URLError as error:
+        except Exception as error:  # noqa: BLE001 - only transient errors or CDN 404 retry
+            missing = isinstance(error, urllib.error.HTTPError) and error.code == 404
+            if not missing and not retry.transient_error(error):
+                raise SystemExit(f"清单回读校验未能完成：{error}") from error
             last_error = error
             print(f"清单回读失败（第 {attempt + 1}/{attempts} 次）：{error}")
             if attempt + 1 < attempts:
-                time.sleep(wait_seconds)
+                headers = error.headers if isinstance(error, urllib.error.HTTPError) else None
+                retry.delay_for_status(policy, attempt, headers)
             continue
         last_error = None
         if fetched == manifest_bytes:
@@ -599,12 +672,13 @@ def main():
         help="说明草稿文件；不给就从发行版正文读（正文就是说明的出处），"
              "给了则在发布时把正文同步成这份草稿",
     )
-    parser.add_argument(
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument(
         "--dry-run",
         action="store_true",
-        help="只打印不写入；不联网，所以说明门禁要配 --notes 草稿（不给就只跑本地门禁）",
+        help="离线本地门禁，不读凭据、不校验线上版本或回读；配 --notes 才核对说明并预览清单",
     )
-    parser.add_argument("--check", action="store_true", help="只校验线上与本地是否一致")
+    modes.add_argument("--check", action="store_true", help="联网只读校验线上与本地是否一致，不发布或改写正文")
     parser.add_argument(
         "--allow-nonmonotonic",
         action="store_true",
@@ -645,18 +719,21 @@ def main():
     identity = apk_identity(apk_path)
     verify_release_identity(identity, apk_path)
 
-    if args.dry_run and notes_bytes is None:
-        print(
-            "notes: --dry-run 不联网，说明门禁与清单里的说明这次不生成；"
-            "用 --notes <草稿> 能离线先跑一遍，或在发行版正文写好说明后直接发布"
-        )
-        return 0
+    if args.dry_run:
+        print("dry-run: 只跑离线本地门禁；未校验线上发行版、版本代码防倒退或资产回读")
+        if notes_bytes is None:
+            print("notes: 未提供 --notes，跳过说明门禁与清单预览；用 --notes <草稿> 可补做离线校验")
+            return 0
 
-    token = read_token()
-    release = release_of(token, tag)
-    if release is None:
-        raise SystemExit(f"{tag} release 不存在；先建标签与发行版再发布资产")
+    # With a draft, every local gate (and the whole preview) precedes credentials and HTTP.
+    # Without one, the release body is the single source and must be fetched read-only.
+    token = None
+    release = None
     if notes_bytes is None:
+        token = read_token()
+        release = release_of(token, tag)
+        if release is None:
+            raise SystemExit(f"{tag} release 不存在；先建标签与发行版再发布资产")
         body = release.get("body") or ""
         if not body.strip():
             raise SystemExit(f"{tag} 的发行版正文是空的：说明就写在发行版正文里，先补上再发布")
@@ -668,6 +745,8 @@ def main():
     # this is the last moment before an upload at which the two can be reconciled. The feed's
     # plain-text copy is derived from the same text and checked here, with the other gates.
     verify_notes_identity(notes_bytes, apk_bytes, notes_from)
+    if notes_version_code(notes_bytes.decode("utf-8"), notes_from) != identity["versionCode"]:
+        raise SystemExit("发行说明里的版本代码与 APK 不一致，已在任何发布写入前停止")
     feed_notes = notes_for_feed(notes_bytes)
     verify_feed_notes(feed_notes, notes_from)
     print(f"notes: 清单内说明 {len(feed_notes)} 字（上限 {FEED_NOTES_LIMIT}）")
@@ -687,6 +766,12 @@ def main():
     if args.dry_run:
         return 0
 
+    if release is None:
+        token = read_token()
+        release = release_of(token, tag)
+        if release is None:
+            raise SystemExit(f"{tag} release 不存在；先建标签与发行版再发布资产")
+
     if args.check:
         verify(release, name, apk_bytes)
         app_release = publish_bank.release_by_tag(token, APP_TAG)
@@ -698,8 +783,8 @@ def main():
         verify_app_manifest(app_release, manifest_bytes, manifest, tolerate_published_at=True)
         return 0
 
-    # Read-back of the live feed, so a release built from a stale APK cannot move the version
-    # code backwards. Read-only, and the only gate here that needs the network.
+    # Read-back of the live feed, so publishing cannot silently move its known version code
+    # backwards. This online gate is read-only and still precedes every mutation.
     verify_monotonic_version_code(token, identity["versionCode"], args.allow_nonmonotonic)
 
     for asset in release["assets"]:
@@ -733,11 +818,21 @@ def main():
             raise SystemExit(f"更新发行说明失败：HTTP {status} {body[:200]!r}")
         print(f"updated release notes from {notes_from}")
 
-    # The feed goes up last: it must never advertise an APK that is not there yet, and the
-    # read-back below compares it with the version code this run just published.
-    app_release = publish_bank.ensure_release(
-        token, tag=APP_TAG, name=APP_RELEASE_NAME, body_text=APP_RELEASE_BODY
-    )
+    # Verify the APK before advertising it, then re-read the live version fence after
+    # the potentially slow upload. This catches another publisher advancing the feed.
+    release = release_of(token, tag)
+    verify(release, name, apk_bytes)
+    app_release = verify_monotonic_version_code(token, identity["versionCode"], args.allow_nonmonotonic)
+    # Use exactly the checked snapshot. If another publisher replaces its asset,
+    # DELETE of this old id returns 404 and stops rather than deleting the newer id.
+    if app_release is None:
+        status, body = publish_bank.request(token, "POST", f"{API}/repos/{REPO}/releases", {
+            "tag_name": APP_TAG, "name": APP_RELEASE_NAME, "body": APP_RELEASE_BODY,
+            "prerelease": True, "draft": False,
+        })
+        if status not in (200, 201):
+            raise SystemExit(f"创建 {APP_TAG} release 失败或已有其它发布：HTTP {status} {body[:200]!r}")
+        app_release = json.loads(body)
     publish_bank.replace_asset(token, app_release, APP_ASSET, manifest_bytes, "application/json")
     app_release = publish_bank.release_by_tag(token, APP_TAG)
     verify_app_manifest(app_release, manifest_bytes, manifest)

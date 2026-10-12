@@ -1,6 +1,8 @@
 package com.relaytester.app
 
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.viewModelScope
 import com.relaytester.app.core.fingerprint.BankUpdateClient
 import com.relaytester.app.core.model.ApiResult
 import com.relaytester.app.core.model.ErrorKind
@@ -55,12 +57,16 @@ import com.relaytester.app.feature.fingerprint.stripOuterFence
 import com.relaytester.app.feature.fingerprint.supplierPickerOptions
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import org.jsoup.Jsoup
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -83,6 +89,8 @@ import org.junit.Test
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class AnimationTestRegressionTest {
     private val mainDispatcher = UnconfinedTestDispatcher()
+    private val lifecycle = ViewModelStore()
+    private val subjects = mutableListOf<FingerprintViewModel>()
 
     @Before
     fun setUp() {
@@ -91,7 +99,16 @@ class AnimationTestRegressionTest {
 
     @After
     fun tearDown() {
-        Dispatchers.resetMain()
+        val roots = subjects.map { it.viewModelScope.coroutineContext[Job]!! }
+        try {
+            lifecycle.clear()
+            mainDispatcher.scheduler.runCurrent()
+            runBlocking {
+                withContext(Dispatchers.Default) { withTimeout(10_000) { roots.forEach { it.join() } } }
+            }
+        } finally {
+            Dispatchers.resetMain()
+        }
     }
 
     // ---- What counts as a document --------------------------------------
@@ -341,20 +358,20 @@ class AnimationTestRegressionTest {
 
     @Test
     fun `a head mentioned inside a script does not capture the policy`() {
-        // The same trap by the other route: a script body is text, not markup, so a `<head`
-        // inside it is not the document's head. The script has to precede the real head for
-        // this to be the case being tested — a plain `indexOf` lands in the script, injects
-        // the policy into script source, and the document runs with no CSP at all.
-        val html = "<html><script>var s = \"<head>\";</script><head>" +
-            "<body><svg></svg></body></html>"
+        // A meta policy is not retroactive: it must precede the first executable script.
+        val script = "<script>var s = \"<head>\";</script>"
+        val html = "<html>$script<head><body><svg></svg></body></html>"
         val hardened = injectCsp(html)
-
-        val realHead = hardened.lastIndexOf("<head>")
-        val meta = hardened.indexOf("Content-Security-Policy")
-        assertTrue("策略必须落在真正的 head 里", meta > realHead)
-        val scriptEnd = hardened.indexOf("</script>")
-        assertTrue("策略不得被塞进脚本源码", meta > scriptEnd)
-        assertTrue(hardened.contains("<script>var s = \"<head>\";</script>"))
+        val parsed = Jsoup.parse(hardened)
+        val policies = parsed.head().select("meta[http-equiv=Content-Security-Policy]")
+        assertEquals("策略必须成为真实 head 元素的子节点", 1, policies.size)
+        assertTrue(policies.single().attr("content").contains("default-src 'none'"))
+        assertTrue("原脚本必须完整保留", hardened.contains(script))
+        assertTrue(
+            "策略必须在前置脚本执行之前生效",
+            hardened.indexOf("Content-Security-Policy") < hardened.indexOf(script),
+        )
+        assertEquals("var s = \"<head>\";", parsed.selectFirst("script")!!.data())
     }
 
     @Test
@@ -373,6 +390,63 @@ class AnimationTestRegressionTest {
         // And a decoy inside a script body, with the real head after it.
         val scriptFirst = "<html><script>var s = \"<head>\";</script><head>"
         assertEquals(scriptFirst.lastIndexOf("<head>"), realHeadIndex(scriptFirst))
+    }
+
+    @Test
+    fun `csp remains a parsed head policy when a head attribute contains greater than`() {
+        for (quote in listOf('"', '\'')) {
+            assertParserVisibleCsp(
+                "<!DOCTYPE html><html><head data-note=${quote}a > b$quote></head>" +
+                    "<body><svg></svg></body></html>",
+            )
+        }
+    }
+
+    @Test
+    fun `csp ignores a fake head inside an html attribute`() {
+        for (quote in listOf('"', '\'')) {
+            assertParserVisibleCsp(
+                "<!DOCTYPE html><html data-note=$quote<head>$quote><head></head>" +
+                    "<body><svg></svg></body></html>",
+            )
+        }
+    }
+
+    @Test
+    fun `csp ignores a fake head inside textarea text`() {
+        // No explicit head: HTML creates one before the body. The policy must go into an
+        // app-owned head, not into the textarea's raw text where it is merely displayed.
+        assertParserVisibleCsp(
+            "<!DOCTYPE html><html><body><textarea><head></textarea><svg></svg></body></html>",
+        )
+    }
+
+    @Test
+    fun `csp remains visible for ordinary and headless documents`() {
+        // Controls for the parser-based oracle: neither the document nor its content may be
+        // discarded just to make the malicious attribute cases pass.
+        assertParserVisibleCsp("<!DOCTYPE html><html><head></head><body><svg></svg></body></html>")
+        assertParserVisibleCsp("<!DOCTYPE html><html><body><svg></svg></body></html>")
+    }
+
+    private fun assertParserVisibleCsp(html: String) {
+        val document = parseAnimationDocument(html, truncated = false).getOrThrow()
+        val hardened = injectFitStylesheet(injectCsp(document.html))
+        // An independent HTML parser, not realHeadIndex or another substring assertion:
+        // text saying "Content-Security-Policy" inside an attribute/comment is not a meta tag.
+        // This checks markup placement only; native WebView enforcement still needs a device.
+        val parsed = Jsoup.parse(hardened)
+        val policies = parsed.head().children()
+            .filter {
+                it.tagName() == "meta" &&
+                    it.attr("http-equiv").equals("Content-Security-Policy", ignoreCase = true)
+            }
+            .map { it.attr("content") }
+        assertEquals("CSP must be an actual meta element in the parsed head: $html", 1, policies.size)
+        for (directive in listOf("connect-src 'none'", "frame-src 'none'", "worker-src 'none'", "form-action 'none'")) {
+            assertTrue("The parsed policy lost $directive", policies.single().contains(directive))
+        }
+        assertEquals("The accepted document must remain in the parsed body", 1, parsed.body().select("svg").size)
     }
 
     @Test
@@ -1408,22 +1482,59 @@ class AnimationTestRegressionTest {
     @Test
     fun `a late answer from a deleted test writes nothing`() {
         val gate = CompletableDeferred<Unit>()
-        val api = ScriptedAnimationApi(listOf("<!DOCTYPE html><html><svg/></html>"), gate = gate)
+        val started = CompletableDeferred<Unit>()
+        val delivered = CompletableDeferred<Unit>()
+        val html = "<!DOCTYPE html><html><svg/></html>"
+        val api = object : RelayApi() {
+            override suspend fun completeTextStreaming(
+                profile: SupplierProfile,
+                apiKey: String,
+                model: String,
+                prompt: String,
+                maxTokens: Int,
+                timeoutSeconds: Int,
+                onProgress: suspend (String) -> Unit,
+                onReasoning: suspend (String) -> Unit,
+                salvageOnDisconnect: Boolean,
+            ): ApiResult<String> = withContext(NonCancellable) {
+                started.complete(Unit)
+                gate.await()
+                onProgress(html)
+                onReasoning("late reasoning")
+                delivered.complete(Unit)
+                ApiResult.Success(html)
+            }
+        }
         val subject = animationViewModel(api)
-        subject.openAnimationTest("sup-1", "test-model")
-        subject.startAnimationGeneration()
-        runBlocking { api.started.await() }
-        val sessionId = subject.uiState.value.animation.session!!.sessionId
-        subject.removeAnimationSession(sessionId)
+        try {
+            subject.openAnimationTest("sup-1", "test-model")
+            subject.startAnimationGeneration()
+            runBlocking { withTimeout(10_000) { started.await() } }
+            val sessionId = subject.uiState.value.animation.session!!.sessionId
+            val jobs = subject.viewModelScope.coroutineContext[Job]!!.children.toList()
+            assertTrue("必须捕获实际生成作业", jobs.isNotEmpty())
+            subject.removeAnimationSession(sessionId)
+            subject.openAnimationTest("sup-1", "other-model")
+            val remaining = subject.uiState.value.animation
+            assertTrue("已取消作业仍持有晚到响应", jobs.any { !it.isCompleted })
 
-        // 放行晚到的响应：不能把已删除的记录重新点亮，也不能凭空多出一条。
-        gate.complete(Unit)
-        runBlocking { delay(100) }
-
-        assertTrue(
-            "晚到响应不得让已删除的记录复活",
-            subject.uiState.value.animation.sessions.none { it.sessionId == sessionId },
-        )
+            gate.complete(Unit)
+            runBlocking {
+                withContext(Dispatchers.Default) {
+                    withTimeout(10_000) {
+                        delivered.await()
+                        jobs.forEach { it.join() }
+                    }
+                }
+            }
+            assertTrue(
+                "晚到响应不得让已删除的记录复活",
+                subject.uiState.value.animation.sessions.none { it.sessionId == sessionId },
+            )
+            assertEquals("晚到回调不得污染后来打开的记录", remaining, subject.uiState.value.animation)
+        } finally {
+            gate.complete(Unit)
+        }
     }
 
     @Test
@@ -2449,6 +2560,8 @@ class AnimationTestRegressionTest {
             clock = { 1_791_009_120_000L },
             animationRetryDelay = retryDelay,
         ).apply {
+            lifecycle.put("animation-${subjects.size}", this)
+            subjects += this
             // skipRestore 跳过了启动读，供应商目录还没进 knownSuppliers；卡片上的动画入口
             // 依赖它解析上下文，所以测试要先把目录读上来（真实应用里这一步发生在进入
             // 面板时，见 FingerprintScreen 的 refreshCatalogue 调用）。

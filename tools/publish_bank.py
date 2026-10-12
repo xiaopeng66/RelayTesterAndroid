@@ -13,12 +13,12 @@ The manifest is derived from the asset itself — build stamp, model count, refe
 digest, size and SHA-256 are all read back out of the binary — so the two can never
 disagree. Both files are downloaded again afterwards and compared byte for byte.
 
-Every call to GitHub goes through `retry.py`, which repeats transient answers (5xx, 429,
-timeouts, resets) and returns permanent ones immediately — see that module for why the
-split matters. Counts and delays come from BANK_RETRY_* in the environment. The publish
-itself stays idempotent: re-running after a failure rebuilds the same bytes and either
-finds them already published ("无需发布") or replaces the assets again, so a retried job
-cannot publish twice or publish something stale.
+GitHub calls use `retry.py` to distinguish transient failures from permanent refusals.
+API/download retry budgets come from BANK_RETRY_*; readback owns a bounded budget and
+also retries CDN 404s. The updater's rebuild is deterministic for a fixed upstream input:
+it skips unchanged assets only after both pass readback, and can recover incomplete
+uploads. A rerun may resolve newer upstream data, and --force may replace identical
+assets. Same-name replacement is delete then upload, with a short missing-asset window.
 
 Usage:
     python tools/publish_bank.py                 # publish build/lm-fingerprint/lite-bank.bin
@@ -30,16 +30,19 @@ Token: GITHUB_TOKEN, or the first line of E:/AI/Zcode/tmp/.ghtoken.
 """
 
 import argparse
+import datetime
 import hashlib
 import json
 import os
-import struct
+import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import retry
+from fingerprint_package_validation import validate_package
 
 REPO = "xiaopeng66/RelayTesterAndroid"
 TAG = "bank"
@@ -48,7 +51,6 @@ API = "https://api.github.com"
 PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_BANK = os.path.join(PROJECT, "build/lm-fingerprint/lite-bank.bin")
 TOKEN_FILES = ["E:/AI/Zcode/tmp/.ghtoken"]
-MAGIC_LENGTH = 8
 # The oldest app that can read a package published from this tree. It is a property of the
 # *package format and the reading code*, not of whatever version the build file happens to
 # be on: the daily detection-package job runs independently of the APK release, so binding
@@ -60,12 +62,11 @@ MAGIC_LENGTH = 8
 # package would hand every installed device a manifest its app refuses as "too new"; the
 # order is therefore: release the app, then let the pipeline publish.
 MIN_APP_VERSION_CODE = 10_801
-# The manifest's formatVersion is read off the package's own magic rather than being a
-# constant here: three shapes are live while the fleet upgrades (format 2 still carries
-# upstream's removed verifier block, format 3 dropped it, format 4 carries the v2 ranker's
-# positional head), and a publish that hardcoded the number could advertise the wrong one
-# and have the app reject a valid package.
-FORMAT_BY_MAGIC = {b"LMFPA002": 2, b"LMFPA003": 3, b"LMFPA004": 4}
+
+
+class PublishedAssetMismatch(SystemExit):
+    """Read-back proved an asset missing or different; transport failures are not this."""
+
 
 RELEASE_BODY = """指纹检测包的发布源，供「指纹检测」面板的「检查更新」按钮读取。
 
@@ -95,32 +96,8 @@ def sha256(data):
 
 
 def read_header(blob):
-    """Read the asset's own header so the manifest cannot drift from the file."""
-    magic = blob[:MAGIC_LENGTH]
-    if magic not in FORMAT_BY_MAGIC:
-        raise SystemExit(f"不是指纹库资产（magic={magic!r}）")
-    offset = MAGIC_LENGTH
-
-    def u32():
-        nonlocal offset
-        value = struct.unpack_from("<I", blob, offset)[0]
-        offset += 4
-        return value
-
-    def text():
-        nonlocal offset
-        length = u32()
-        value = blob[offset:offset + length].decode("utf-8")
-        offset += length
-        return value
-
-    return {
-        "format_version": FORMAT_BY_MAGIC[magic],
-        "source_reference_sha256": text(),
-        "built_at": text(),
-        "reference_sha256": text(),
-        "model_count": u32(),
-    }
+    """Read metadata only after the entire package passes the Android shape contract."""
+    return validate_package(blob)
 
 
 def app_version_code():
@@ -145,7 +122,8 @@ def build_manifest(bank_bytes):
 def _request_once(token, method, url, payload, content_type):
     """One attempt. Returns (status, body, headers); HTTP errors come back as statuses."""
     request_object = urllib.request.Request(url, data=payload, method=method)
-    request_object.add_header("Authorization", "Bearer " + token)
+    if token:
+        request_object.add_header("Authorization", "Bearer " + token)
     request_object.add_header("Accept", "application/vnd.github+json")
     request_object.add_header("X-GitHub-Api-Version", "2022-11-28")
     if payload is not None:
@@ -182,7 +160,7 @@ def request(token, method, url, data=None, content_type="application/json", raw=
             print(f"{label}: {retry.describe_error(error)}（第 {index + 1}/{policy.attempts} 次），"
                   f"{seconds:.1f}s 后重试")
             continue
-        if status not in retry.TRANSIENT_STATUS or index + 1 >= policy.attempts:
+        if not retry.transient_status(status, headers) or index + 1 >= policy.attempts:
             return status, body
         wait = retry.delay_for_status(policy, index, headers)
         print(f"{label}: HTTP {status}（第 {index + 1}/{policy.attempts} 次），"
@@ -311,21 +289,25 @@ def verify(release, bank_bytes, manifest_bytes, attempts=6, wait_seconds=5.0):
     assets = {asset["name"]: asset for asset in release["assets"]}
     for name in ("lite-bank.bin", "latest.json"):
         if name not in assets:
-            raise SystemExit(f"发布后找不到资产 {name}")
+            raise PublishedAssetMismatch(f"发布后找不到资产 {name}")
     bank_url = assets["lite-bank.bin"]["browser_download_url"]
     manifest_url = assets["latest.json"]["browser_download_url"]
     seen = None
     last_error = None
+    policy = retry.Policy(attempts=attempts, base_delay=wait_seconds, max_delay=wait_seconds, jitter=0)
     for attempt in range(attempts):
         try:
             fetched_bank = download(bank_url, cache_bust=True, attempts=1)
             fetched_manifest = download(manifest_url, cache_bust=True, attempts=1)
-        except urllib.error.URLError as error:
-            # HTTPError is a subclass of URLError, so a 5xx answer lands here too.
+        except Exception as error:  # noqa: BLE001 - classify before retrying or granting repair
+            missing = isinstance(error, urllib.error.HTTPError) and error.code == 404
+            if not missing and not retry.transient_error(error):
+                raise SystemExit(f"回读校验未能完成：{error}") from error
             last_error = error
             print(f"回读失败（第 {attempt + 1}/{attempts} 次）：{error}")
             if attempt + 1 < attempts:
-                time.sleep(wait_seconds)
+                headers = error.headers if isinstance(error, urllib.error.HTTPError) else None
+                retry.delay_for_status(policy, attempt, headers)
             continue
         last_error = None
         if fetched_bank == bank_bytes and fetched_manifest == manifest_bytes:
@@ -334,12 +316,182 @@ def verify(release, bank_bytes, manifest_bytes, attempts=6, wait_seconds=5.0):
         seen = (len(fetched_bank), len(fetched_manifest))
         if attempt + 1 < attempts:
             time.sleep(wait_seconds)
-    if seen is None:
+    if last_error is not None:
+        if isinstance(last_error, urllib.error.HTTPError) and last_error.code == 404:
+            raise PublishedAssetMismatch(f"回读资产不存在（重试 {attempts} 次）：{last_error}")
+        # A stale CDN response followed by a transport failure still leaves the current
+        # state unknown. Never turn that uncertainty into permission to delete assets.
         raise SystemExit(f"回读校验未能完成（重试 {attempts} 次）：{last_error}")
-    raise SystemExit(
+    if seen is None:
+        raise SystemExit(f"回读校验未能完成（重试 {attempts} 次）")
+    raise PublishedAssetMismatch(
         f"回读校验失败（重试 {attempts} 次）：本地 {len(bank_bytes)}/{len(manifest_bytes)} 字节，"
         f"线上 {seen[0]}/{seen[1]} 字节",
     )
+
+
+def build_time(value):
+    """Compare actual instants, never ISO strings with different UTC offsets."""
+    try:
+        instant = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if instant.utcoffset() is None:
+            raise ValueError("timezone required")
+        return instant.astimezone(datetime.timezone.utc)
+    except (AttributeError, TypeError, ValueError, OverflowError) as error:
+        raise SystemExit(f"无法确认检测包构建时间 {value!r}（需要带时区的 ISO 时间），停止发布") from error
+
+
+def read_published_manifest(release):
+    """Return a validated surviving manifest, or None for absent/invalid asset bytes."""
+    asset = next((item for item in release.get("assets", []) if item["name"] == "latest.json"), None)
+    if asset is None or asset.get("state") == "starter":
+        return None
+    try:
+        raw = download(asset["browser_download_url"], cache_bust=True)
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return None
+        raise SystemExit(f"无法读取线上检测包清单，停止发布：{error}") from error
+    except Exception as error:
+        raise SystemExit(f"无法读取线上检测包清单，停止发布：{error}") from error
+    try:
+        current = json.loads(raw)
+        valid = (
+            isinstance(current, dict)
+            and all(type(current.get(key)) is int and current[key] > 0
+                    for key in ("modelCount", "sizeBytes"))
+            and isinstance(current.get("sha256"), str)
+            and re.fullmatch(r"[0-9a-fA-F]{64}", current["sha256"]) is not None
+            and isinstance(current.get("builtAt"), str)
+        )
+    except (ValueError, TypeError):
+        valid = False
+    if not valid:
+        return None
+    build_time(current["builtAt"])
+    return current
+
+
+def published_identity(token):
+    """Read the bank's identity, recovering a broken manifest only from the actual bank.
+
+    A missing/starter manifest is a normal interrupted upload. It grants no permission
+    to replace an unknown bank: download and validate the existing payload first. A
+    valid manifest remains the fence when its payload was the interrupted upload.
+    """
+    release = release_by_tag(token)
+    if release is None:
+        return None, None
+    current = read_published_manifest(release)
+    if current is not None:
+        return current, release
+    assets = {asset["name"]: asset for asset in release.get("assets", [])}
+    bank_asset = assets.get("lite-bank.bin")
+    if bank_asset is None:
+        if not assets:
+            return None, release  # Empty release, before its first asset upload.
+        raise SystemExit("线上检测包清单损坏且没有可核对的包，停止发布；请先核对已有发布")
+    if bank_asset.get("state") == "starter":
+        raise SystemExit("线上清单和检测包均未上传完整，无法确认已有版本，停止发布")
+    try:
+        existing = download(bank_asset["browser_download_url"], cache_bust=True)
+    except Exception as error:
+        raise SystemExit(f"清单损坏且无法核对线上检测包，停止发布：{error}") from error
+    current = build_manifest(existing)
+    build_time(current["builtAt"])
+    print("线上清单缺失或损坏，使用已回读并验证的检测包确认版本")
+    return current, release
+
+
+def verify_not_older(candidate, current):
+    candidate_time = build_time(candidate["builtAt"])
+    if current is not None and candidate_time < build_time(current["builtAt"]):
+        raise SystemExit(
+            f"本次检测包构建于 {candidate['builtAt']}，早于线上 {current['builtAt']}，停止发布；"
+            "--force 仅重传相同内容，不允许版本倒退"
+        )
+
+
+def verify_payload_not_older(token, candidate, current, release):
+    """Return (checked release snapshot, payload matches candidate).
+
+    A newer payload can survive a crash before its manifest is replaced. A CDN 404
+    cannot prove it absent; only refreshed release metadata plus a surviving valid
+    manifest can authorize repair of an absent/empty-starter payload.
+    """
+    if release is None:
+        return release, False
+    asset = next((item for item in release.get("assets", []) if item["name"] == "lite-bank.bin"), None)
+    if asset is None:
+        return release, False
+    if asset.get("state") == "starter":
+        if type(asset.get("size")) is not int or asset["size"] != 0 or current is None:
+            raise SystemExit("检测包 starter 状态不明确或没有有效清单，停止发布")
+        return release, False
+    try:
+        existing = download(asset["browser_download_url"], cache_bust=True)
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            raise SystemExit(f"无法确认线上检测包版本，停止发布：{error}") from error
+        refreshed = release_by_tag(token)
+        if refreshed is None:
+            raise SystemExit("检测包下载 404 且发行版状态已变化，停止发布") from error
+        remaining = next((item for item in refreshed.get("assets", []) if item["name"] == "lite-bank.bin"), None)
+        if remaining is not None and not (
+            remaining.get("state") == "starter"
+            and type(remaining.get("size")) is int and remaining["size"] == 0
+        ):
+            raise SystemExit("检测包下载 404，但 API 仍列出已上传或状态不明的资产，停止发布") from error
+        surviving = read_published_manifest(refreshed)
+        if surviving is None:
+            raise SystemExit("检测包缺失且没有幸存的有效清单，停止发布") from error
+        verify_not_older(candidate, surviving)
+        return refreshed, False
+    except Exception as error:
+        raise SystemExit(f"无法确认线上检测包版本，停止发布：{error}") from error
+    try:
+        actual = build_manifest(existing)
+    except SystemExit:
+        # A valid manifest for exactly this candidate can repair its corrupt payload.
+        # Different candidate data must not replace a payload of unprovable age.
+        if current is not None and current["sha256"].lower() == candidate["sha256"].lower():
+            return release, False
+        raise
+    verify_not_older(candidate, actual)
+    matches = actual["sha256"] == candidate["sha256"] and actual["sizeBytes"] == candidate["sizeBytes"]
+    if not matches:
+        # `current` may be inferred from the payload, not a surviving manifest.
+        # Deleting an uncommitted newer payload would erase its only version fence
+        # if the next upload fails. Restore its manifest with identical bytes first.
+        surviving = read_published_manifest(release)
+        verify_not_older(candidate, surviving)
+        if surviving is None or build_time(actual["builtAt"]) > build_time(surviving["builtAt"]):
+            raise SystemExit(
+                f"线上检测包构建于 {actual['builtAt']}，但 latest.json 缺失或早于该检测包，停止替换不同内容；"
+                "请先使用与线上检测包逐字节一致的文件恢复 latest.json；--force 不能绕过此保护"
+            )
+    return release, matches
+
+
+def verify_workflow_head(token):
+    """An old Actions rerun must not publish using a superseded builder."""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    revision = os.environ.get("GITHUB_SHA", "")
+    ref = os.environ.get("GITHUB_REF", "")
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", revision) or not ref.startswith("refs/heads/") or repo != REPO:
+        raise SystemExit("发布任务缺少可信的仓库、分支或提交信息，停止发布")
+    branch = urllib.parse.quote(ref[len("refs/heads/"):], safe="")
+    status, body = request(token, "GET", f"{API}/repos/{repo}/commits/{branch}")
+    try:
+        head = json.loads(body)["sha"] if status == 200 else None
+    except (ValueError, KeyError, TypeError):
+        head = None
+    if head is None:
+        raise SystemExit(f"无法确认发布分支的最新提交（HTTP {status}），停止发布")
+    if head != revision:
+        raise SystemExit("本次任务的提交已不是发布分支最新提交，停止旧任务覆盖线上检测包；请启动新任务")
 
 
 def main():
@@ -366,8 +518,14 @@ def main():
         verify(release, bank_bytes, manifest_bytes)
         return 0
 
-    release = ensure_release(token)
-    replace_asset(token, release, "lite-bank.bin", bank_bytes, "application/octet-stream")
+    current, release = published_identity(token)
+    verify_not_older(manifest, current)
+    release, payload_matches = verify_payload_not_older(token, manifest, current, release)
+    verify_workflow_head(token)
+    if release is None:
+        release = ensure_release(token)
+    if not payload_matches:
+        replace_asset(token, release, "lite-bank.bin", bank_bytes, "application/octet-stream")
     replace_asset(token, release, "latest.json", manifest_bytes, "application/json")
     release = release_by_tag(token)
     verify(release, bank_bytes, manifest_bytes)

@@ -272,7 +272,7 @@ internal fun injectFitStylesheet(html: String): String {
     val tag = "<style>$css</style>"
     val headIndex = realHeadIndex(html)
     if (headIndex < 0) return html
-    val headEnd = html.indexOf('>', headIndex)
+    val headEnd = openingTagEnd(html, headIndex, "head")
     if (headEnd < 0) return html
     // Append before `</head>` when there is one, so this is the last stylesheet of the head
     // and outranks the document's own rules; otherwise after the opening tag.
@@ -307,27 +307,118 @@ internal fun injectCsp(html: String): String {
         append("frame-ancestors 'none'")
     }
     val meta = """<meta http-equiv="Content-Security-Policy" content="$policy">"""
-    val headIndex = realHeadIndex(html)
-    if (headIndex < 0) {
-        // No head to put it in: wrap the meta and the document so the policy still applies
-        // from the document's very first byte.
+    val headEnd = initialHeadEnd(html)
+    if (headEnd < 0) {
+        // No safely identified initial head: put the policy in an app-owned head before
+        // any untrusted content, including scripts or text that could swallow a later meta.
         return "<!DOCTYPE html><html><head>$meta</head><body>$html</body></html>"
     }
-    val headEnd = html.indexOf('>', headIndex)
-    if (headEnd < 0) return html
     return html.substring(0, headEnd + 1) + meta + html.substring(headEnd + 1)
 }
 
 /**
- * The index of the `<head` that actually opens the document's head element.
+ * The end of a head opening tag reached through an inert document prefix only.
+ *
+ * This is not a general HTML parser. Whitespace, ordinary comments, a simple HTML doctype
+ * and the html opening tag may precede the head. Anything else (including scripts, raw
+ * text, body content or malformed markup) takes the app-owned-head fallback. Looking for
+ * a later head would put the policy after content the browser has already processed.
+ */
+private fun initialHeadEnd(html: String): Int {
+    var index = 0
+    var seenDoctype = false
+    var seenHtml = false
+    while (index < html.length) {
+        when {
+            html[index].isHtmlSpace() -> index++
+            html.startsWith("<!--", index) -> {
+                val bodyStart = index + 4
+                // HTML also has abrupt/legacy comment endings. Rather than misread one and
+                // skip active markup, accept only the unambiguous comment subset here.
+                if (html.getOrNull(bodyStart) == '>' || html.startsWith("->", bodyStart)) return -1
+                val end = html.indexOf("--", bodyStart)
+                if (end < 0 || !html.startsWith("-->", end)) return -1
+                index = end + 3
+            }
+            html.startsWith("<!doctype", index, ignoreCase = true) -> {
+                val nameStart = index + 9
+                if (seenDoctype || seenHtml || html.getOrNull(nameStart)?.isHtmlSpace() != true) return -1
+                val end = html.indexOf('>', nameStart)
+                if (end < 0 ||
+                    !html.substring(nameStart, end).trim { it.isHtmlSpace() }.equals("html", ignoreCase = true)
+                ) return -1
+                seenDoctype = true
+                index = end + 1
+            }
+            html.startsWith("<html", index, ignoreCase = true) -> {
+                if (seenHtml) return -1
+                val end = openingTagEnd(html, index, "html")
+                if (end < 0) return -1
+                seenHtml = true
+                index = end + 1
+            }
+            html.startsWith("<head", index, ignoreCase = true) -> return openingTagEnd(html, index, "head")
+            else -> return -1
+        }
+    }
+    return -1
+}
+
+/** Only accept a well-formed opening tag; quoted delimiters are attribute data, not markup. */
+private fun openingTagEnd(html: String, start: Int, name: String): Int {
+    if (!html.startsWith("<$name", start, ignoreCase = true)) return -1
+    var index = start + name.length + 1
+    if (index >= html.length || (!html[index].isHtmlSpace() && html[index] !in "/>")) return -1
+    while (index < html.length) {
+        while (index < html.length && html[index].isHtmlSpace()) index++
+        if (index >= html.length) return -1
+        if (html[index] == '>') return index
+        if (html[index] == '/') return if (html.getOrNull(index + 1) == '>') index + 1 else -1
+
+        val attributeStart = index
+        while (index < html.length && !html[index].isHtmlSpace() && html[index] !in "=/>") {
+            if (html[index] in "\"'<\u0000") return -1
+            index++
+        }
+        if (index == attributeStart) return -1
+        while (index < html.length && html[index].isHtmlSpace()) index++
+        if (html.getOrNull(index) != '=') continue
+        index++
+        while (index < html.length && html[index].isHtmlSpace()) index++
+        val quote = html.getOrNull(index) ?: return -1
+        if (quote == '\'' || quote == '"') {
+            index = html.indexOf(quote, index + 1)
+            if (index < 0) return -1
+            index++
+            if (index < html.length && !html[index].isHtmlSpace() && html[index] !in "/>") return -1
+        } else {
+            val valueStart = index
+            while (index < html.length && !html[index].isHtmlSpace() && html[index] != '>') {
+                // Quotes inside an unquoted value do not open a quoted value in HTML.
+                // Reject malformed attributes instead of skipping a real tag terminator.
+                if (html[index] in "\"'`=<\u0000") return -1
+                index++
+            }
+            if (index == valueStart) return -1
+        }
+    }
+    return -1
+}
+
+/** HTML's tokenizer treats only these five characters as whitespace, not all Unicode spaces. */
+private fun Char.isHtmlSpace(): Boolean = this in " \t\n\r\u000c"
+
+/**
+ * The head candidate used for non-security-critical fitting, not for policy placement.
+ * [initialHeadEnd] deliberately has a stricter prefix-only contract for the CSP.
  *
  * A plain `indexOf("<head")` matches text inside a comment or a script, and the model writes
  * both: a document with `<!-- <head> -->` above its real head had the policy injected into
  * the comment, where it applies to nothing, and the preview silently ran with no CSP at all.
- * Comments are skipped here, and a `<head` inside one is not a candidate. The scan is
- * deliberately small — it looks for the first `<head` that is not inside a comment or a
- * `<script>`/`<style>` body — because anything more is an HTML parser, and the fallback
- * (wrapping the document) already produces a correct result when this finds nothing.
+ * Comments are skipped here, and a `<head` inside one is not a candidate. This legacy
+ * fitting scan also skips script/style bodies; it does not establish parser state and must
+ * not be used as the security gate. [injectCsp] has already inserted the policy before the
+ * fitting pass runs, or provided an app-owned head when the prefix was ambiguous.
  */
 internal fun realHeadIndex(html: String): Int {
     val lower = html.lowercase()

@@ -104,7 +104,7 @@ internal suspend fun OkHttpClient.executeSameOrigin(request: Request): Response 
             val where = current.url.resolve(location)
                 ?.let { "${it.scheme}://${it.host}" }
                 ?: "无效地址"
-            throw RedirectRefusedException("上游要求跳转到 $where，出于密钥安全已拒绝")
+            throw RedirectRefusedException("上游要求跳转到 $where，出于密钥安全已拒绝".redactSecrets())
         }
         response.close()
         if (++hops > MAX_REDIRECT_HOPS) {

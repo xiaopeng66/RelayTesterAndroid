@@ -43,8 +43,16 @@ object NumberFeatures {
 
     private val DIGITS = Regex("\\d+")
 
-    /** True for any Unicode letter, matching the JS `/\p{L}/u` test. */
-    private fun Char.isLetterAnyScript(): Boolean = Character.isLetter(this)
+    /** Unicode code points, not UTF-16 halves, matching the JS `/\p{L}/u` test. */
+    private fun String.containsLetterAnyScript(): Boolean {
+        var index = 0
+        while (index < length) {
+            val codePoint = Character.codePointAt(this, index)
+            if (Character.isLetter(codePoint)) return true
+            index += Character.charCount(codePoint)
+        }
+        return false
+    }
 
     /**
      * Returns the longest run of in-range integers. Runs break on letters, so a
@@ -57,7 +65,7 @@ object NumberFeatures {
         for (match in DIGITS.findAll(text)) {
             val separator = text.substring(previousEnd, match.range.first)
             val value = match.value.toIntOrNull()
-            if (current.isNotEmpty() && separator.any { it.isLetterAnyScript() }) {
+            if (current.isNotEmpty() && separator.containsLetterAnyScript()) {
                 if (current.size > best.size) best = current.toIntArray()
                 current = ArrayList()
             }

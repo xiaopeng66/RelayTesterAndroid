@@ -1,5 +1,7 @@
 package com.relaytester.app
 
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.viewModelScope
 import com.relaytester.app.core.model.ApiResult
 import com.relaytester.app.core.model.BalanceHttpMethod
 import com.relaytester.app.core.model.BalanceQueryResult
@@ -22,12 +24,15 @@ import com.relaytester.app.feature.tester.TesterViewModel
 import com.relaytester.app.feature.tester.catalogSaveResetsDraft
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -44,6 +49,9 @@ import org.junit.Test
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class TesterPanelRegressionTest {
     private val mainDispatcher = UnconfinedTestDispatcher()
+    private val lifecycle = ViewModelStore()
+    private val subjects = mutableListOf<TesterViewModel>()
+    private val releaseFixtures = mutableListOf<() -> Unit>()
 
     @Before
     fun setUp() {
@@ -52,24 +60,33 @@ class TesterPanelRegressionTest {
 
     @After
     fun tearDown() {
-        Dispatchers.resetMain()
+        val roots = subjects.map { it.viewModelScope.coroutineContext[Job]!! }
+        try {
+            lifecycle.clear()
+            releaseFixtures.forEach { it() }
+            mainDispatcher.scheduler.runCurrent()
+            awaitReal { roots.forEach { it.join() } }
+        } finally {
+            Dispatchers.resetMain()
+        }
     }
 
     // ---- Starting a run is atomic ----------------------------------------
 
     @Test
     fun `a double tap on start does not launch two rounds`() {
-        // The guard reads `isRunning`, but that is published only after the draft has
-        // been persisted — a suspension point. The second tap of a double tap lands
-        // inside that window, so without an atomic start both rounds dispatch and both
-        // write their own completion state over the other's.
-        val api = SlowApi(listOf("model-a"), holdMs = 60)
-        val subject = viewModel(api)
+        // The first draft write stays parked until both taps have reached the start guard.
+        val api = RecordingTestApi(listOf("model-a"))
+        val store = GatedStore()
+        val subject = viewModel(relayApi = api, supplierStore = store)
         seedRunnableState(subject)
 
         subject.startTest()
+        runBlocking { withTimeout(SETTLE_TIMEOUT_MS) { store.entered.await() } }
         subject.startTest()
-        runBlocking { delay(400) }
+
+        store.release()
+        settle(subject)
 
         assertEquals("双击只允许一轮", 1, api.calls.get())
     }
@@ -106,13 +123,16 @@ class TesterPanelRegressionTest {
     fun `an empty directory is not evidence that models were delisted`() {
         // An endpoint that answers 200 with `[]` looks the same as one whose list
         // failed to populate. Judging it would mark every model of that site as gone.
-        val subject = viewModel(ModelsApi(emptyList()))
+        val api = RecordingModelsApi(emptyList())
+        val subject = viewModel(api)
         seedEntry(subject, ModelSource("supplier-1", "model-a"))
 
         subject.refreshModelCatalogEntry(ENTRY_ID)
-        awaitCatalogIdle(subject)
+        settle(subject)
 
+        assertEquals(listOf("supplier-1"), api.queriedSupplierIds.toList())
         val state = subject.uiState.value
+        assertTrue("目录检查必须完成", state.catalogRefreshingEntryIds.isEmpty())
         assertTrue("空目录不得判为已下架", state.catalogMissingSources.isEmpty())
         assertFalse(
             "不得声称模型已不存在",
@@ -127,7 +147,7 @@ class TesterPanelRegressionTest {
         seedEntry(subject, ModelSource("supplier-1", "model-a"))
 
         subject.refreshModelCatalogEntry(ENTRY_ID)
-        awaitCatalogIdle(subject)
+        settle(subject)
 
         val state = subject.uiState.value
         assertTrue(
@@ -141,37 +161,41 @@ class TesterPanelRegressionTest {
 
     @Test
     fun `querying every balance runs at most eight sites at once`() {
-        // One request per supplier, but the fan-out used to be unbounded: with a long
-        // supplier list it opened a socket per site and queued them all on the same
-        // small IO pool. Twelve sites held open long enough to overlap prove the cap.
-        val api = TrackingBalanceApi(holdMs = 250)
+        val api = GatedBalanceApi()
         val subject = viewModel(balanceApi = api)
         seedBalanceState(subject, suppliers = 12)
 
         subject.queryAllBalances()
-        runBlocking { delay(1_500) }
+        awaitReal { api.started(8).await() }
+        assertEquals("第一批八条请求必须保持在途", 8, api.inFlight.get())
+        val firstWave = api.queriedSupplierIds.toSet()
+        firstWave.forEach(api::release)
+        awaitReal { api.started(12).await() }
+        api.releaseAll()
+        settle(subject)
 
         assertEquals("每个站点恰好查询一次", 12, api.calls.get())
-        assertTrue(
-            "批量余额查询的在途请求数不得超过 8",
-            api.maxInFlight <= 8,
-        )
-        assertTrue("上限应当真的被触到（否则判据无意义）", api.maxInFlight >= 2)
+        assertEquals((1..12).map { "supplier-$it" }.toSet(), api.queriedSupplierIds.toSet())
+        assertEquals("批量余额查询最多八条请求同时在途", 8, api.maxInFlight)
         assertFalse(subject.balanceUiState.value.isQuerying)
     }
 
     @Test
     fun `a double tap on query balance does not launch two queries`() {
-        // The same publish-window race as startTest: isQuerying is published only
-        // after persistDraft() has suspended on the Keystore write, so the second
-        // tap of a double tap lands before any guard the flag could offer.
-        val api = TrackingBalanceApi(holdMs = 200)
-        val subject = viewModel(balanceApi = api)
+        // The second tap lands before persistence can publish the first query's busy state.
+        val api = GatedBalanceApi()
+        val store = GatedStore()
+        val subject = viewModel(balanceApi = api, supplierStore = store)
         seedBalanceState(subject, suppliers = 1)
 
         subject.queryBalance()
+        awaitReal { store.entered.await() }
+        assertFalse(subject.balanceUiState.value.isQuerying)
         subject.queryBalance()
-        runBlocking { delay(900) }
+        store.release()
+        awaitReal { api.started(1).await() }
+        api.releaseAll()
+        settle(subject)
 
         assertEquals("双击只允许一次查询", 1, api.calls.get())
         assertFalse(subject.balanceUiState.value.isQuerying)
@@ -179,39 +203,41 @@ class TesterPanelRegressionTest {
 
     @Test
     fun `a single-card refresh runs beside a batch query without clearing its state`() {
-        // 并行要求：单卡刷新与批量余额查询可以同时在途。批量认领空闲供应商，单卡刷新
-        // 保有自己的占位；先完成的那个只释放自己，不得清空另一个的「查询中」标记。
-        // 用闸门而不是计时：三个请求必须真的同时挂在网上，而不是靠时间窗口猜。
-        //
-        // 刷新的必须是**非活动**站点：活动站点那条路要先过 `credentialTransactionMutex`
-        // 落凭据，而闸门把请求停在网络上时那把锁还握着——批量随后排在锁后，永远到不了网线。
-        // 那是测试自己造出来的顺序，不是并发缺陷（真实场景里活动站点刷新与批量并发时，
-        // 批量确实会先等一次凭据落盘，然后照常发出）。
+        assertBalanceQueriesKeepOtherOwners(cardFinishesFirst = true)
+    }
+
+    @Test
+    fun `a finished batch keeps a single-card refresh marked as querying`() {
+        assertBalanceQueriesKeepOtherOwners(cardFinishesFirst = false)
+    }
+
+    private fun assertBalanceQueriesKeepOtherOwners(cardFinishesFirst: Boolean) {
         val api = GatedBalanceApi()
         val subject = viewModel(balanceApi = api)
         seedBalanceState(subject, suppliers = 3)
 
-        subject.refreshSupplierBalance("supplier-2")
-        runBlocking { withTimeout(5_000) { api.started(1).await() } }
-
+        subject.refreshSupplierBalance("supplier-1")
+        awaitReal { api.started(1).await() }
+        val cardJobs = subject.viewModelScope.coroutineContext[Job]!!.children.toList()
         subject.queryAllBalances()
-
-        runBlocking {
-            withTimeout(5_000) { api.started(3).await() }
-        }
+        awaitReal { api.started(3).await() }
+        val batchJobs = subject.viewModelScope.coroutineContext[Job]!!.children.toList() - cardJobs.toSet()
         assertEquals("三个站点的请求必须同时在途", 3, api.inFlight.get())
-        assertTrue(
-            "单卡与批量必须同时持有占位（当前 ${subject.balanceUiState.value.queryingSupplierIds}）",
-            subject.balanceUiState.value.queryingSupplierIds.size >= 2,
+        assertEquals(
+            setOf("supplier-1", "supplier-2", "supplier-3"),
+            subject.balanceUiState.value.queryingSupplierIds,
         )
 
-        api.releaseAll()
-        runBlocking {
-            withTimeout(5_000) {
-                while (subject.balanceUiState.value.isQuerying) delay(10)
-            }
-        }
+        val completed = if (cardFinishesFirst) setOf("supplier-1") else setOf("supplier-2", "supplier-3")
+        completed.forEach(api::release)
+        awaitReal { (if (cardFinishesFirst) cardJobs else batchJobs).forEach { it.join() } }
+        val remaining = setOf("supplier-1", "supplier-2", "supplier-3") - completed
+        assertEquals("先完成的操作只清除自己的占位", remaining, subject.balanceUiState.value.queryingSupplierIds)
+        assertTrue("另一个操作仍在查询", subject.balanceUiState.value.isQuerying)
+        assertEquals(remaining.size, api.inFlight.get())
 
+        api.releaseAll()
+        settle(subject)
         val settled = subject.balanceUiState.value
         assertFalse("全部结束后不得残留查询中状态", settled.isQuerying)
         assertEquals("每个站点恰好查询一次", 3, api.calls.get())
@@ -229,7 +255,7 @@ class TesterPanelRegressionTest {
 
         subject.searchAllCatalogModels("model")
 
-        runBlocking { delay(300) }
+        settle(subject)
 
         assertFalse(
             "禁止测试的供应商不得被检索（实际请求过：${api.queriedSupplierIds}）",
@@ -249,13 +275,13 @@ class TesterPanelRegressionTest {
     fun `a normal test still starts while an advanced run is in flight`() {
         // 要求是所有测试可并行：高级测试在它自己的弹窗里跑时，主界面的「开始测试」必须真的
         // 发出请求，而不是可点却静默无效。两者各有各的作业与结果键。
-        val api = SlowApi(listOf("model-a"), holdMs = 10)
-        val subject = viewModel(api)
+        val api = RecordingTestApi(listOf("model-a"))
+        val subject = viewModel(relayApi = api)
         seedRunnableState(subject)
         setUnifiedTestingForTest(subject)
 
         subject.startTest()
-        runBlocking { delay(400) }
+        settle(subject)
 
         assertEquals("高级测试在跑时普通测试也必须发出请求", 1, api.calls.get())
         assertTrue(subject.uiState.value.results.isNotEmpty())
@@ -289,7 +315,7 @@ class TesterPanelRegressionTest {
 
         subject.clearBalanceMessage()
         subject.queryAllBalances()
-        runBlocking { delay(200) }
+        awaitReal { subject.balanceUiState.first { it.message != null } }
 
         assertEquals("全部站点都已被占用时不得再发请求", 1, api.calls.get())
         assertTrue(
@@ -298,7 +324,7 @@ class TesterPanelRegressionTest {
         )
 
         api.releaseAll()
-        runBlocking { delay(200) }
+        settle(subject)
     }
 
     @Test
@@ -324,9 +350,7 @@ class TesterPanelRegressionTest {
         )
 
         api.releaseAll()
-        runBlocking {
-            withTimeout(5_000) { while (subject.balanceUiState.value.isQuerying) delay(10) }
-        }
+        settle(subject)
         assertFalse("全部结束后不得残留查询中状态", subject.balanceUiState.value.isQuerying)
     }
 
@@ -342,7 +366,8 @@ class TesterPanelRegressionTest {
         setSupplierTestingDisabledForTest(subject, "supplier-2", disabled = true)
 
         subject.searchAllCatalogModels("model")
-        runBlocking { delay(200) }
+        settle(subject)
+        awaitReal { subject.uiState.first { it.catalogSearchMessage != null } }
 
         val state = subject.uiState.value
         assertTrue(
@@ -361,7 +386,7 @@ class TesterPanelRegressionTest {
         seedRunnableState(subject, secondSupplier = false)
 
         subject.searchAllCatalogModels("   ")
-        runBlocking { delay(150) }
+        awaitReal { subject.uiState.first { it.catalogSearchMessage != null } }
 
         val state = subject.uiState.value
         assertTrue(
@@ -416,8 +441,8 @@ class TesterPanelRegressionTest {
         // 重测已选 re-runs the ticked rows; it must not rebuild the list from them alone.
         // It used to, which dropped every unticked verdict from the panel and from the
         // exported JSON — the button says "retest the selected", not "discard the rest".
-        val api = SlowApi(listOf("model-a", "model-b"), holdMs = 10)
-        val subject = viewModel(api)
+        val api = RecordingTestApi(listOf("model-a", "model-b"))
+        val subject = viewModel(relayApi = api)
         seedRunnableState(subject)
         setResultsForTest(
             subject,
@@ -428,7 +453,7 @@ class TesterPanelRegressionTest {
         )
 
         subject.retestAll()
-        runBlocking { delay(400) }
+        settle(subject)
 
         val results = subject.uiState.value.results
         assertTrue(
@@ -451,7 +476,7 @@ class TesterPanelRegressionTest {
         seedRunnableState(subject)
 
         subject.fetchAllSupplierModels()
-        runBlocking { delay(400) }
+        settle(subject)
 
         val state = subject.uiState.value
         assertEquals("空目录必须出现在失败清单里", 1, state.modelFetchFailures.size)
@@ -475,7 +500,7 @@ class TesterPanelRegressionTest {
 
         var reported: Boolean? = null
         subject.selectSupplier("supplier-2") { reported = it }
-        runBlocking { delay(300) }
+        settle(subject)
 
         assertEquals("成功的切换必须回报 true", true, reported)
         assertEquals("supplier-2", subject.uiState.value.activeSupplierId)
@@ -516,7 +541,7 @@ class TesterPanelRegressionTest {
         seedEntry(subject, ModelSource("supplier-1", "model-a"))
 
         subject.fetchCatalogModels("supplier-1")
-        runBlocking { delay(200) }
+        settle(subject)
 
         val state = subject.uiState.value
         assertEquals("连接供应商失败", state.catalogPickerMessage)
@@ -530,7 +555,7 @@ class TesterPanelRegressionTest {
         seedEntry(subject, ModelSource("supplier-1", "model-a"))
 
         subject.fetchCatalogModels("supplier-1")
-        runBlocking { delay(200) }
+        settle(subject)
 
         val state = subject.uiState.value
         assertEquals("已拉取 2 个模型", state.catalogPickerMessage)
@@ -543,7 +568,7 @@ class TesterPanelRegressionTest {
         seedEntry(subject, ModelSource("supplier-1", "model-a"))
 
         subject.fetchCatalogModels("supplier-1")
-        runBlocking { delay(200) }
+        settle(subject)
 
         val state = subject.uiState.value
         assertEquals("该供应商未返回模型", state.catalogPickerMessage)
@@ -559,7 +584,7 @@ class TesterPanelRegressionTest {
         setPickerStateForTest(subject)
 
         subject.fetchCatalogModels("supplier-1")
-        runBlocking { delay(200) }
+        settle(subject)
 
         val state = subject.uiState.value
         assertTrue(
@@ -580,7 +605,7 @@ class TesterPanelRegressionTest {
         seedEntry(subject, ModelSource("supplier-1", "model-a"))
 
         subject.updateModelCatalogEntry(ENTRY_ID, "entry", listOf(ModelSource("supplier-1", "model-a")))
-        runBlocking { delay(200) }
+        settle(subject)
 
         val outcome = subject.uiState.value.catalogSaveOutcome
         assertNotNull("未改动保存也要有一次可确认的回执", outcome)
@@ -598,7 +623,7 @@ class TesterPanelRegressionTest {
         seedEntry(subject, ModelSource("supplier-1", "model-a"))
 
         subject.updateModelCatalogEntry("entry-gone", "entry", listOf(ModelSource("supplier-1", "model-a")))
-        runBlocking { delay(200) }
+        settle(subject)
 
         val outcome = subject.uiState.value.catalogSaveOutcome
         assertNotNull(outcome)
@@ -614,7 +639,7 @@ class TesterPanelRegressionTest {
         seedEntry(subject, ModelSource("supplier-1", "model-a"))
 
         subject.updateModelCatalogEntry(ENTRY_ID, "renamed", listOf(ModelSource("supplier-1", "model-a")))
-        runBlocking { delay(300) }
+        settle(subject)
 
         val state = subject.uiState.value
         val outcome = state.catalogSaveOutcome
@@ -635,18 +660,22 @@ class TesterPanelRegressionTest {
         seedEntry(subject, ModelSource("supplier-1", "model-a"))
 
         subject.updateModelCatalogEntry(ENTRY_ID, "renamed", listOf(ModelSource("supplier-1", "model-a")))
-        runBlocking { delay(200) }
+        awaitReal { store.entered.await() }
         assertEquals("第一次保存已进入写盘", 1, store.saveCalls.get())
         assertTrue(subject.uiState.value.isSavingCatalogEntry)
 
-        subject.updateModelCatalogEntry(ENTRY_ID, "renamed", listOf(ModelSource("supplier-1", "model-a")))
-        runBlocking { delay(100) }
-        assertEquals("保存中的第二次点击不得再写盘", 1, store.saveCalls.get())
+        // Different content bypasses the unchanged-draft shortcut; only the in-flight guard may refuse it.
+        subject.updateModelCatalogEntry(ENTRY_ID, "renamed-again", listOf(ModelSource("supplier-1", "model-a")))
 
         store.gate!!.complete(Unit)
-        runBlocking { delay(200) }
+        settle(subject)
+        assertEquals("保存中的第二次点击不得再写盘", 1, store.saveCalls.get())
+
         val outcome = subject.uiState.value.catalogSaveOutcome
         assertTrue("放行后这一次保存必须成功落地", outcome!!.success)
+        assertFalse(subject.uiState.value.isSavingCatalogEntry)
+        assertEquals("落盘的是第一次保存的内容", "renamed", subject.uiState.value.modelCatalog.first().name)
+        assertEquals("回执属于第一次保存", "renamed", outcome.savedName)
         assertFalse(subject.uiState.value.isSavingCatalogEntry)
         assertEquals("renamed", subject.uiState.value.modelCatalog.first().name)
     }
@@ -718,6 +747,28 @@ class TesterPanelRegressionTest {
         )
     }
 
+    // ---- Waiting ---------------------------------------------------------
+
+    /** Includes sibling jobs launched while a preparation job is finishing. */
+    private fun settle(subject: TesterViewModel) {
+        awaitReal {
+            while (true) {
+                val pending = subject.viewModelScope.coroutineContext[Job]!!.children.toList()
+                if (pending.isEmpty()) break
+                pending.forEach { it.join() }
+            }
+        }
+    }
+
+    /** IO work and deadlines use real dispatchers, not the Main test scheduler. */
+    private fun <T> awaitReal(block: suspend () -> T): T = try {
+        runBlocking {
+            withContext(Dispatchers.Default) { withTimeout(SETTLE_TIMEOUT_MS) { block() } }
+        }
+    } catch (timeout: TimeoutCancellationException) {
+        throw AssertionError("等待测试操作超时（${SETTLE_TIMEOUT_MS}ms）", timeout)
+    }
+
     // ---- Harness ---------------------------------------------------------
 
     private fun viewModel(
@@ -734,7 +785,13 @@ class TesterPanelRegressionTest {
         relayApiFactory = { relayApi },
         balanceApiFactory = { balanceApi },
         skipRestore = true,
-    )
+    ).also { subject ->
+        lifecycle.put("panel-${subjects.size}", subject)
+        subjects += subject
+        if (supplierStore is GatedStore) releaseFixtures += { supplierStore.release(); Unit }
+        if (supplierStore is RecordingStore) releaseFixtures += { supplierStore.gate?.complete(Unit); Unit }
+        if (balanceApi is GatedBalanceApi) releaseFixtures += balanceApi::releaseAll
+    }
 
     private fun seedEntry(subject: TesterViewModel, source: ModelSource) {
         setProfileForTest(subject)
@@ -944,16 +1001,6 @@ class TesterPanelRegressionTest {
         balanceState.value = balanceState.value.copy(isInitializing = false)
     }
 
-    private fun awaitCatalogIdle(subject: TesterViewModel) {
-        runBlocking {
-            var waited = 0L
-            while (subject.uiState.value.catalogRefreshingEntryIds.isNotEmpty() && waited < 5_000) {
-                delay(10)
-                waited += 10
-            }
-        }
-    }
-
     private class SilentStore : SupplierStore(null) {
         override suspend fun read() = SupplierStoreState(emptyList(), null)
         override suspend fun save(state: SupplierStoreState) = Unit
@@ -969,11 +1016,13 @@ class TesterPanelRegressionTest {
         val gate: CompletableDeferred<Unit>? = null,
     ) : SupplierStore(null) {
         val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val entered = CompletableDeferred<Unit>()
 
         override suspend fun read() = SupplierStoreState(emptyList(), null)
 
         override suspend fun save(state: SupplierStoreState) {
             saveCalls.incrementAndGet()
+            entered.complete(Unit)
             gate?.await()
             if (fail) error("磁盘写入失败")
         }
@@ -1017,11 +1066,8 @@ class TesterPanelRegressionTest {
         )
     }
 
-    /** A relay that answers every test after [holdMs], so a round stays in flight. */
-    private class SlowApi(
-        private val models: List<String>,
-        private val holdMs: Long,
-    ) : RelayApi() {
+    /** A relay that answers every model test instantly and counts the requests. */
+    private class RecordingTestApi(private val models: List<String>) : RelayApi() {
         val calls = java.util.concurrent.atomic.AtomicInteger(0)
 
         override suspend fun fetchModels(
@@ -1039,77 +1085,59 @@ class TesterPanelRegressionTest {
             timeoutSeconds: Int,
         ): ModelTestResult {
             calls.incrementAndGet()
-            delay(holdMs)
             return ModelTestResult(model = model, status = TestStatus.SUCCESS)
         }
     }
 
-    /**
-     * A balance endpoint that answers after [holdMs] and records how many queries were
-     * in flight at once — the only way to observe the fan-out's concurrency cap.
-     */
-    private class TrackingBalanceApi(private val holdMs: Long) : BalanceApi() {
-        val calls = java.util.concurrent.atomic.AtomicInteger(0)
-        private val inFlight = java.util.concurrent.atomic.AtomicInteger(0)
-        private val peak = java.util.concurrent.atomic.AtomicInteger(0)
+    /** Holds persistence open until the test has issued both taps. */
+    private class GatedStore : SupplierStore(null) {
+        val entered = CompletableDeferred<Unit>()
+        private val gate = CompletableDeferred<Unit>()
 
-        val maxInFlight: Int get() = peak.get()
+        override suspend fun read() = SupplierStoreState(emptyList(), null)
 
-        override suspend fun query(
-            profile: SupplierProfile,
-            apiKey: String,
-            accessToken: String,
-            userId: String,
-            template: BalanceQueryTemplate,
-        ): BalanceQueryResult {
-            calls.incrementAndGet()
-            val now = inFlight.incrementAndGet()
-            peak.updateAndGet { previous -> maxOf(previous, now) }
-            delay(holdMs)
-            inFlight.decrementAndGet()
-            return BalanceQueryResult.Success(
-                BalanceSnapshot(
-                    supplierId = profile.id,
-                    templateId = template.id,
-                    templateName = template.name,
-                    availableRaw = 1.0,
-                    unitLabel = "USD",
-                    scaleDivisor = 1.0,
-                    checkedAt = 0L,
-                    latencyMs = 1,
-                ),
-            )
+        override suspend fun save(state: SupplierStoreState) {
+            entered.complete(Unit)
+            gate.await()
         }
+
+        fun release() = gate.complete(Unit)
     }
 
-    /**
-     * A balance endpoint that parks every call until released, so a test can hold several
-     * requests in flight and observe the fan-out deterministically instead of by timing.
-     */
+    /** Each entered request stays open until its supplier or the whole fixture is released. */
     private class GatedBalanceApi : BalanceApi() {
         val calls = java.util.concurrent.atomic.AtomicInteger(0)
         val inFlight = java.util.concurrent.atomic.AtomicInteger(0)
-        private val gates = java.util.Collections.synchronizedList(mutableListOf<CompletableDeferred<Unit>>())
+        private val peak = java.util.concurrent.atomic.AtomicInteger(0)
+        private val gates = mutableListOf<Pair<String, CompletableDeferred<Unit>>>()
+        private val pendingSignals = mutableListOf<Pair<Int, CompletableDeferred<Unit>>>()
+        private var released = false
 
-        /** Resolves when at least [count] requests have arrived and are parked. */
-        fun started(count: Int): CompletableDeferred<Unit> {
-            val signal = CompletableDeferred<Unit>()
-            // A request may already have arrived before this was called (Unconfined runs the
-            // launch eagerly), so the current count is checked first — otherwise the signal
-            // waits for a *new* call that never comes.
-            if (calls.get() >= count) {
-                signal.complete(Unit)
-            } else {
-                pendingSignals += count to signal
+        val maxInFlight: Int get() = peak.get()
+        val queriedSupplierIds: List<String> get() = synchronized(gates) { gates.map { it.first } }
+
+        /** Resolves only after the arriving requests have installed their release gates. */
+        fun started(count: Int): CompletableDeferred<Unit> = synchronized(gates) {
+            CompletableDeferred<Unit>().also { signal ->
+                if (calls.get() >= count) {
+                    signal.complete(Unit)
+                } else {
+                    pendingSignals += count to signal
+                }
             }
-            return signal
         }
 
-        private val pendingSignals =
-            java.util.Collections.synchronizedList(mutableListOf<Pair<Int, CompletableDeferred<Unit>>>())
+        fun release(supplierId: String) {
+            synchronized(gates) { gates.filter { it.first == supplierId }.map { it.second } }
+                .forEach { it.complete(Unit) }
+        }
 
         fun releaseAll() {
-            synchronized(gates) { gates.toList() }.forEach { it.complete(Unit) }
+            val pending = synchronized(gates) {
+                released = true
+                gates.map { it.second }
+            }
+            pending.forEach { it.complete(Unit) }
         }
 
         override suspend fun query(
@@ -1120,12 +1148,17 @@ class TesterPanelRegressionTest {
             template: BalanceQueryTemplate,
         ): BalanceQueryResult {
             val gate = CompletableDeferred<Unit>()
-            val arrived = calls.incrementAndGet()
-            inFlight.incrementAndGet()
-            gates += gate
-            synchronized(pendingSignals) {
-                pendingSignals.filter { arrived >= it.first }.forEach { it.second.complete(Unit) }
+            val signals = synchronized(gates) {
+                gates += profile.id to gate
+                if (released) gate.complete(Unit)
+                val active = inFlight.incrementAndGet()
+                peak.updateAndGet { previous -> maxOf(previous, active) }
+                val arrived = calls.incrementAndGet()
+                val ready = pendingSignals.filter { arrived >= it.first }
+                pendingSignals.removeAll(ready.toSet())
+                ready.map { it.second }
             }
+            signals.forEach { it.complete(Unit) }
             try {
                 gate.await()
             } finally {
@@ -1148,5 +1181,6 @@ class TesterPanelRegressionTest {
 
     private companion object {
         const val ENTRY_ID = "entry-1"
+        const val SETTLE_TIMEOUT_MS = 5_000L
     }
 }

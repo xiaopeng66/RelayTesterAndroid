@@ -1,5 +1,7 @@
 package com.relaytester.app
 
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.viewModelScope
 import com.relaytester.app.core.fingerprint.BankManifestParser
 import com.relaytester.app.core.fingerprint.BankSource
 import com.relaytester.app.core.fingerprint.BankUpdateClient
@@ -32,15 +34,22 @@ import com.relaytester.app.feature.fingerprint.formatBankBuiltAt
 import java.io.File
 import java.io.IOException
 import java.util.Collections
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
@@ -48,6 +57,7 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
 import org.json.JSONArray
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -70,6 +80,11 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class FingerprintViewModelTest {
     private val mainDispatcher = UnconfinedTestDispatcher()
+    private val lifecycle = ViewModelStore()
+    private val subjects = mutableListOf<FingerprintViewModel>()
+    private val launchRoot = Job()
+    private val launchScope = CoroutineScope(mainDispatcher + launchRoot)
+    private val releaseFixtures = mutableListOf<() -> Unit>()
 
     /** A published-bank build stamp; the same length as the packaged one by construction. */
     private val patchStamp = "2026-09-30T05:12:31.123456+00:00"
@@ -91,7 +106,33 @@ class FingerprintViewModelTest {
 
     @After
     fun tearDown() {
-        Dispatchers.resetMain()
+        val roots = subjects.map { it.viewModelScope.coroutineContext[Job]!! } + launchRoot
+        try {
+            launchRoot.cancel()
+            lifecycle.clear()
+            releaseFixtures.forEach { it() }
+            mainDispatcher.scheduler.runCurrent()
+            awaitReal { roots.forEach { it.join() } }
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    private fun own(subject: FingerprintViewModel) {
+        lifecycle.put("fingerprint-${subjects.size}", subject)
+        subjects += subject
+    }
+
+    private fun <T> awaitReal(block: suspend () -> T): T = runBlocking {
+        withContext(Dispatchers.Default) { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { block() } }
+    }
+
+    private fun settle(subject: FingerprintViewModel) = awaitReal {
+        while (true) {
+            val pending = subject.viewModelScope.coroutineContext[Job]!!.children.toList()
+            if (pending.isEmpty()) break
+            pending.forEach { it.join() }
+        }
     }
 
     private fun bank(): FingerprintBank = BankFixtures.bank()
@@ -109,6 +150,7 @@ class FingerprintViewModelTest {
         updatePreferences = MemoryUpdatePreferences(),
         skipRestore = true,
     ).apply {
+        own(this)
         // The real panel only shows itself once the bank is loaded; these tests skip the
         // store read, so they wait for the bank load instead of racing it.
         runBlocking { awaitIdle() }
@@ -153,8 +195,16 @@ class FingerprintViewModelTest {
         clock = clock,
         bankCheckIntervalMillis = bankCheckIntervalMillis,
     ).apply {
+        own(this)
+        releaseFixtures += { bankFetcher.gate?.complete(Unit); Unit }
+        if (store is MutableSupplierStore) releaseFixtures += { store.gate?.complete(Unit); Unit }
+        if (historyStore is GatedAppendHistoryStore) releaseFixtures += historyStore::release
+        if (api is GatedCompletionApi) releaseFixtures += api::release
+        if (api is ParkedRetryApi) releaseFixtures += api::release
+        if (api is ReplacingRetryApi) releaseFixtures += api::releaseAll
+        if (ioDispatcher is QueuedIoDispatcher) releaseFixtures += ioDispatcher::resumeAll
         // A skipped restore still loads the bank, and no test may race that.
-        if (skipRestore) runBlocking { awaitIdle() }
+        if (skipRestore) runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { awaitIdle() } }
     }
 
     /** A round ready to dispatch: supplier chosen, models ticked, challenges seeded. */
@@ -213,27 +263,15 @@ class FingerprintViewModelTest {
         selectMode(DetectionMode.API)
     }
 
-    /**
-     * Waits for the batch list to leave its interim states, or fails on a stall.
-     *
-     * The launch is not synchronous with the call that starts it: [runApiDetection]
-     * publishes the rows from inside the round's coroutine, so a bare poll can look at
-     * an empty list, see nothing PENDING or RUNNING, and return while the round it is
-     * supposed to be waiting for has not even started. Waiting for the panel to go busy
-     * first closes that window — only then does "no row is waiting" mean the round ended.
-     */
+    /** Joins the dispatched round, but not deliberately parked history or timer jobs. */
     private fun awaitBatchSettled(subject: FingerprintViewModel) {
-        runBlocking {
-            withTimeout(BATCH_SETTLE_TIMEOUT_MS) {
-                while (!subject.uiState.value.isRunning && subject.uiState.value.batchResults.isEmpty()) {
-                    delay(10)
-                }
-                while (subject.uiState.value.batchResults.any {
-                        it.status == ModelDetectionStatus.PENDING ||
-                            it.status == ModelDetectionStatus.RUNNING
-                    }
-                ) {
-                    delay(10)
+        val field = FingerprintViewModel::class.java.getDeclaredField("runJob").apply { isAccessible = true }
+        val round = field.get(subject) as Job?
+        awaitReal {
+            round?.join()
+            subject.uiState.first { state ->
+                !state.isRunning && state.batchResults.isNotEmpty() && state.batchResults.none {
+                    it.status == ModelDetectionStatus.PENDING || it.status == ModelDetectionStatus.RUNNING
                 }
             }
         }
@@ -761,11 +799,12 @@ class FingerprintViewModelTest {
         // 显式点名（多模型时「全部重试」走的就是这条路）也要被挡住：入口虽然已经撤下，
         // 但调用方仍可能指定模型，去重必须自己成立。
         subject.retryChallenge(0, listOf("test-model"))
-        runBlocking { delay(300) }
-        assertEquals("同一模型同一题不许并发补发", 2, api.prompts.count { it == prompt0 })
+        // The final count includes any duplicate queued behind the parked request.
+        assertTrue("同键重复调用不得进入排队", subject.uiState.value.queuedRetries.isEmpty())
 
         api.release()
-        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { subject.awaitIdle() } }
+        settle(subject)
+        assertEquals("同一模型同一题不许并发补发", 2, api.prompts.count { it == prompt0 })
         assertEquals("补发成功后入口清空", emptyMap<Int, List<String>>(), subject.uiState.value.retryableModels)
     }
 
@@ -789,7 +828,7 @@ class FingerprintViewModelTest {
         assertEquals(listOf("test-model"), mid.retryableModels[0])
 
         subject.retryChallenge(0)
-        runBlocking { delay(200) }
+        awaitReal { subject.uiState.first { ("test-model" to 0) in it.queuedRetries } }
 
         // 逐题发送时这条重试排到当前那一题之后（用户要求）：第 2 题还在飞，它就不许上线，
         // 而且必须如实说「排队中」，不能拿 REQUESTING 假装已经在接收。
@@ -831,7 +870,7 @@ class FingerprintViewModelTest {
         assertEquals("并行：第 1 题已失败、第 2 题在接收", setOf(0), subject.uiState.value.retryableModels.keys)
 
         subject.retryChallenge(0)
-        runBlocking { delay(200) }
+        awaitReal { api.retried.await() }
 
         // 并行模式没有闸门：入口一出现、点下去就上线，与逐题发送的排队形成对照。
         // 两条路径各有一条测试钉住，闸门被误用到并行分支上时这里会红。
@@ -890,7 +929,7 @@ class FingerprintViewModelTest {
 
         val brokenBefore = api.models.count { it == "broken" }
         subject.retryChallenge(0)
-        runBlocking { delay(200) }
+        awaitReal { subject.uiState.first { ("broken" to 0) in it.queuedRetries } }
 
         // 逐题发送时补发同样排在当前那一题之后：slow 还在飞，broken 的第 4 次请求就不该出现。
         assertEquals("失败模型的补发同样排队", setOf("broken" to 0), subject.uiState.value.queuedRetries)
@@ -948,27 +987,40 @@ class FingerprintViewModelTest {
 
     @Test
     fun `parallel detection issues the three requests concurrently`() {
-        val api = FakeCompletionApi(goldenCase().answers)
-        val subject = readyApiViewModel(api, parallel = true)
-
-        subject.runApiDetection()
-        runBlocking { subject.awaitIdle() }
-
-        assertEquals("并行模式下三条请求必须同时在飞", 3, api.maxConcurrent.get())
-        assertEquals(3, api.calls.get())
-        assertEquals(ChallengeState.RECEIVED, subject.uiState.value.progress[0].state)
+        val gates = RequestGates()
+        val api = FakeCompletionApi(goldenCase().answers, requestGates = gates)
+        val subject = readyApiViewModel(api, parallel = true, ioDispatcher = mainDispatcher)
+        try {
+            subject.runApiDetection()
+            awaitReal { repeat(3) { gates.entered.receive() } }
+            assertEquals("并行模式下三条请求必须同时在飞", 3, api.maxConcurrent.get())
+            gates.releaseAll()
+            settle(subject)
+            assertEquals(3, api.calls.get())
+            assertEquals(ChallengeState.RECEIVED, subject.uiState.value.progress[0].state)
+        } finally {
+            gates.releaseAll()
+        }
     }
 
     @Test
     fun `sequential detection never overlaps requests`() {
-        val api = FakeCompletionApi(goldenCase().answers)
-        val subject = readyApiViewModel(api, parallel = false)
-
-        subject.runApiDetection()
-        runBlocking { subject.awaitIdle() }
-
-        assertEquals("顺序模式下同一时刻只能有一条请求在飞", 1, api.maxConcurrent.get())
-        assertEquals(3, api.calls.get())
+        val gates = RequestGates()
+        val api = FakeCompletionApi(goldenCase().answers, requestGates = gates)
+        val subject = readyApiViewModel(api, parallel = false, ioDispatcher = mainDispatcher)
+        try {
+            subject.runApiDetection()
+            repeat(3) { index ->
+                assertEquals(index, awaitReal { gates.entered.receive() })
+                assertEquals("上一题未放行时不得发送下一题", index + 1, api.calls.get())
+                gates.release(index)
+            }
+            settle(subject)
+            assertEquals("顺序模式下同一时刻只能有一条请求在飞", 1, api.maxConcurrent.get())
+            assertEquals(3, api.calls.get())
+        } finally {
+            gates.releaseAll()
+        }
     }
 
     @Test
@@ -1762,16 +1814,21 @@ class FingerprintViewModelTest {
 
     @Test
     fun `a second run is refused while the first is still dispatching`() {
-        // The guard cannot read `isRunning` alone: it is published only after the
-        // credentials are in, so a double tap lands inside that window and starts two rounds.
         val api = FakeCompletionApi(goldenCase().answers)
-        val subject = readyApiViewModel(api)
-
-        subject.runApiDetection()
-        subject.runApiDetection()
-        runBlocking { subject.awaitIdle() }
-
-        assertEquals("双击只允许一轮（三条题目各一次）", 3, api.calls.get())
+        val store = MutableSupplierStore(listOf(testSupplier()))
+        val subject = readyApiViewModelFor(store, api)
+        val gate = CompletableDeferred<Unit>()
+        store.gate = gate
+        try {
+            subject.runApiDetection()
+            assertFalse("凭据读取尚未完成", subject.uiState.value.isRunning)
+            subject.runApiDetection()
+            gate.complete(Unit)
+            settle(subject)
+            assertEquals("双击只允许一轮（三条题目各一次）", 3, api.calls.get())
+        } finally {
+            gate.complete(Unit)
+        }
     }
 
     @Test
@@ -1788,7 +1845,7 @@ class FingerprintViewModelTest {
         // 自动检查没人按过，只能占它自己的那个门：用户点下的检测必须照跑，
         // 不能被一个用户没请求的 HTTP 请求挡在门外。启动那一次自己会等到检查落地，
         // 所以这里必须用一条自己的协程发起它，不能在 runBlocking 里等它返回。
-        val launcher = CoroutineScope(mainDispatcher).launch { subject.checkBankOnLaunch() }
+        val launcher = launchScope.launch { subject.checkBankOnLaunch() }
         assertTrue("静默检查必须真的在飞", subject.uiState.value.isCheckingBankInBackground)
 
         subject.runApiDetection()
@@ -1910,7 +1967,7 @@ class FingerprintViewModelTest {
         runBlocking { subject.awaitIdle() }
 
         fetcher.gate = gate
-        val launcher = CoroutineScope(mainDispatcher).launch { subject.checkBankOnLaunch() }
+        val launcher = launchScope.launch { subject.checkBankOnLaunch() }
         assertTrue(subject.uiState.value.isCheckingBankInBackground)
         assertEquals("静默检查先发出一次清单请求并停在门上", 1, fetcher.urls.size)
 
@@ -1944,7 +2001,7 @@ class FingerprintViewModelTest {
             FakeCompletionApi(goldenCase().answers),
             bankFetcher = fetcher,
         )
-        val launcher = CoroutineScope(mainDispatcher).launch { subject.checkBankOnLaunch() }
+        val launcher = launchScope.launch { subject.checkBankOnLaunch() }
         assertTrue(subject.uiState.value.isCheckingBankInBackground)
         assertEquals(listOf(FakeHttpFetcher.MANIFEST_URL), fetcher.urls)
 
@@ -2778,18 +2835,28 @@ class FingerprintViewModelTest {
         return subject
     }
 
+    private fun releaseLateRetry(subject: FingerprintViewModel, api: ParkedRetryApi, jobs: List<Job>) {
+        assertTrue("必须捕获取消后仍未结束的旧重试", jobs.any { it.isCancelled && !it.isCompleted })
+        api.release()
+        awaitReal {
+            api.lateDelivered.await()
+            jobs.forEach { it.join() }
+        }
+        settle(subject)
+    }
+
     @Test
     fun `a retry answered after the challenges are regenerated writes nothing`() {
-        val api = ParkedRetryApi(goldenCase().answers)
+        val api = ParkedRetryApi(goldenCase().answers, deliverAfterCancellation = true)
         val subject = parkedRetryState(api)
         assertTrue("第一题应当可重试", subject.uiState.value.retryableModels.containsKey(0))
 
         subject.retryChallenge(0)
         runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.retryParked.await() } }
 
+        val jobs = subject.viewModelScope.coroutineContext[Job]!!.children.toList()
         subject.regenerateChallenges()
-        api.release()
-        runBlocking { subject.awaitIdle() }
+        releaseLateRetry(subject, api, jobs)
 
         val state = subject.uiState.value
         assertTrue("重新出题后旧结果不得回来", state.batchResults.isEmpty())
@@ -2804,14 +2871,14 @@ class FingerprintViewModelTest {
 
     @Test
     fun `a retry answered after a supplier switch writes nothing`() {
-        val api = ParkedRetryApi(goldenCase().answers)
+        val api = ParkedRetryApi(goldenCase().answers, deliverAfterCancellation = true)
         val subject = parkedRetryState(api)
         subject.retryChallenge(0)
         runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.retryParked.await() } }
 
+        val jobs = subject.viewModelScope.coroutineContext[Job]!!.children.toList()
         subject.selectSupplier("sup-1")
-        api.release()
-        runBlocking { subject.awaitIdle() }
+        releaseLateRetry(subject, api, jobs)
 
         val state = subject.uiState.value
         assertTrue("切站后旧结果不得回来", state.batchResults.isEmpty())
@@ -2821,14 +2888,14 @@ class FingerprintViewModelTest {
 
     @Test
     fun `a retry answered after a mode switch writes nothing`() {
-        val api = ParkedRetryApi(goldenCase().answers)
+        val api = ParkedRetryApi(goldenCase().answers, deliverAfterCancellation = true)
         val subject = parkedRetryState(api)
         subject.retryChallenge(0)
         runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.retryParked.await() } }
 
+        val jobs = subject.viewModelScope.coroutineContext[Job]!!.children.toList()
         subject.selectMode(DetectionMode.MANUAL)
-        api.release()
-        runBlocking { subject.awaitIdle() }
+        releaseLateRetry(subject, api, jobs)
 
         val state = subject.uiState.value
         assertTrue("切模式后旧结果不得回来", state.batchResults.isEmpty())
@@ -2838,14 +2905,14 @@ class FingerprintViewModelTest {
 
     @Test
     fun `a retry answered after the model selection changes writes nothing`() {
-        val api = ParkedRetryApi(goldenCase().answers)
+        val api = ParkedRetryApi(goldenCase().answers, deliverAfterCancellation = true)
         val subject = parkedRetryState(api)
         subject.retryChallenge(0)
         runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.retryParked.await() } }
 
+        val jobs = subject.viewModelScope.coroutineContext[Job]!!.children.toList()
         subject.toggleModelSelection("test-model")
-        api.release()
-        runBlocking { subject.awaitIdle() }
+        releaseLateRetry(subject, api, jobs)
 
         val state = subject.uiState.value
         assertTrue("改勾选后旧结果不得回来", state.batchResults.isEmpty())
@@ -2855,7 +2922,7 @@ class FingerprintViewModelTest {
 
     @Test
     fun `a retry answered after a new round started writes nothing into it`() {
-        val api = ParkedRetryApi(goldenCase().answers)
+        val api = ParkedRetryApi(goldenCase().answers, deliverAfterCancellation = true)
         val history = FingerprintHistoryStore(MemoryHistoryFiles())
         val subject = readyApiViewModelFor(
             SingleSupplierStore(testSupplier()),
@@ -2868,11 +2935,12 @@ class FingerprintViewModelTest {
         subject.retryChallenge(0)
         runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.retryParked.await() } }
 
-        // 新主轮在旧重试仍在飞时开始：先作废旧重试，再跑自己的三题。
+        val jobs = subject.viewModelScope.coroutineContext[Job]!!.children.toList()
+        // The old request still holds the serial mutex; a parallel replacement can finish first.
+        subject.updateParallel(true)
         subject.runApiDetection()
         awaitBatchSettled(subject)
-        api.release()
-        runBlocking { subject.awaitIdle() }
+        releaseLateRetry(subject, api, jobs)
 
         val golden = goldenCase().answers
         val slots = subject.uiState.value.modelSlots["test-model"].orEmpty()
@@ -2881,12 +2949,6 @@ class FingerprintViewModelTest {
         // 若旧请求写回了新轮，这里会变成 golden[0]。
         assertEquals("新轮的结果不得被旧重试覆盖", golden[1], slots[0].answer)
         assertEquals(ChallengeState.RECEIVED, slots[0].state)
-        // 主轮记过两次历史；旧重试不得再记第三条。
-        runBlocking {
-            withTimeout(BATCH_SETTLE_TIMEOUT_MS) {
-                while (subject.uiState.value.history.size < 2) delay(10)
-            }
-        }
         assertEquals("历史只记主轮，不记已作废的重试", 2, subject.uiState.value.history.size)
     }
 
@@ -2896,58 +2958,80 @@ class FingerprintViewModelTest {
         val api = ReplacingRetryApi(goldenCase().answers, cancellationGate = cleanupGate)
         val subject = parkedRetryState(api)
 
-        subject.retryChallenge(0)
-        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.retryParked.await() } }
-        // 取消使旧重试失效；取消的清理被 cleanupGate 拄住，模拟"旧 Job 还没走完回调"。
-        // 放行 API 闸门：旧重试的 await 抛 CancellationException，走进被拄住的清理，
-        // 逐题发送的串行互斥锁也随之释放。
-        subject.cancelRun()
-        api.release()
-        // 等旧 Job 真的走完清理（cleanupGate 一放就完成），否则新一轮会被 runInFlight 挡住：
-        // 取消后仍攥着 runJob 句柄是刻意设计，正是为了不让新人踩到垂死的旧轮。
-        cleanupGate.complete(Unit)
+        try {
+            subject.retryChallenge(0)
+            awaitReal { api.retryParked.await() }
+            val oldJobs = subject.viewModelScope.coroutineContext[Job]!!.children.toList()
+            subject.cancelRun()
+            awaitReal { api.cancellationStarted.await() }
 
-        // 新一轮跑到第一题失败：同键重试只有在这之后才登记得上（没有结果时点击只是换题）。
-        subject.runApiDetection()
-        awaitBatchSettled(subject)
-        subject.retryChallenge(0)
-        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.retryTwoParked.await() } }
+            // The old request keeps the serial mutex until cleanup exits; the new round need not use it.
+            subject.updateParallel(true)
+            subject.runApiDetection()
+            awaitBatchSettled(subject)
+            subject.retryChallenge(0)
+            awaitReal { api.retryTwoParked.await() }
+            assertTrue("旧清理必须仍未结束", oldJobs.any { !it.isCompleted })
 
-        // 旧 Job 的完成回调此刻已经落地过：若它无条件清掉了同键登记，这一格现在就
-        // 不在 retryJobs 里，下面这次点击会发出额外的请求。格子在缓存里已是
-        // REQUESTING，可重试列表本来就是空的，所以显式点名，单独钉住去重守卫。
-        subject.retryChallenge(0, listOf("test-model"))
-        assertEquals("同键重试在飞时不得再发请求", 8, api.calls.get())
-        api.releaseSecond()
-        runBlocking { subject.awaitIdle() }
-        assertEquals(
-            "新一轮重试必须能正常补题",
-            ChallengeState.RECEIVED,
-            subject.uiState.value.modelSlots["test-model"]?.get(0)?.state,
-        )
+            cleanupGate.complete(Unit)
+            awaitReal { oldJobs.forEach { it.join() } }
+            subject.retryChallenge(0, listOf("test-model"))
+            api.releaseSecond()
+            settle(subject)
+            assertEquals("旧完成回调不得撤掉新重试的去重登记", 8, api.calls.get())
+            assertEquals(
+                "新一轮重试必须能正常补题",
+                ChallengeState.RECEIVED,
+                subject.uiState.value.modelSlots["test-model"]?.get(0)?.state,
+            )
+        } finally {
+            api.releaseAll()
+        }
     }
 
     // ---- R06: history commands run in the order they were issued ---------
 
     @Test
     fun `a clear issued after a parked append cannot overtake it`() {
-        val appendGate = CompletableDeferred<Unit>()
-        val history = GatedAppendHistoryStore(MemoryHistoryFiles(), appendGate)
-        val subject = readyApiViewModel(FakeCompletionApi(goldenCase().answers), historyStore = history)
-        subject.runApiDetection()
-        awaitBatchSettled(subject)
-        // 追加已进入存储并拄在门上：此刻发起的清空必须排队，而不是抢先进入 IO。
-        runBlocking { history.appendStarted.await() }
+        val io = QueuedIoDispatcher()
+        val history = GatedAppendHistoryStore(MemoryHistoryFiles(), CompletableDeferred())
+        val subject = readyApiViewModel(
+            FakeCompletionApi(goldenCase().answers),
+            ioDispatcher = io,
+            historyStore = history,
+        )
+        val appendWorker = Executors.newSingleThreadExecutor()
+        try {
+            io.paused = true
+            subject.runApiDetection()
+            // Credential preparation publishes the finished round and queues its append.
+            io.takeNext().run()
+            val append = appendWorker.submit(io.takeNext())
+            awaitReal { history.appendStarted.await() }
+            val appendJobs = subject.viewModelScope.coroutineContext[Job]!!.children.toList()
 
-        subject.clearHistory()
-        runBlocking { delay(100) }
-        assertEquals("清空必须排在未完成的追加之后", 0, history.clearCalls.get())
+            subject.clearHistory()
+            val allJobs = (appendJobs + subject.viewModelScope.coroutineContext[Job]!!.children.toList()).distinct()
+            // A clear dispatched without its predecessor join runs here while append is still blocked.
+            io.runQueued()
+            assertEquals("清空必须排在未完成的追加之后", 0, history.clearCalls.get())
 
-        appendGate.complete(Unit)
-        runBlocking { subject.awaitIdle() }
-        assertEquals("清空必须恰好执行一次", 1, history.clearCalls.get())
-        assertTrue("磁盘上不得留下清空前的旧记录", history.load().isEmpty())
-        assertTrue("界面上不得留下清空前的旧记录", subject.uiState.value.history.isEmpty())
+            history.release()
+            io.resumeAll()
+            append.get(BATCH_SETTLE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            awaitReal { allJobs.forEach { it.join() } }
+            settle(subject)
+            assertEquals("清空必须恰好执行一次", 1, history.clearCalls.get())
+            assertTrue("磁盘上不得留下清空前的旧记录", history.load().isEmpty())
+            assertTrue("界面上不得留下清空前的旧记录", subject.uiState.value.history.isEmpty())
+        } finally {
+            history.release()
+            io.resumeAll()
+            appendWorker.shutdown()
+            check(appendWorker.awaitTermination(BATCH_SETTLE_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                "历史追加线程未退出"
+            }
+        }
     }
 
     @Test
@@ -3059,13 +3143,36 @@ private fun otherSupplier(): SupplierProfile = SupplierProfile(
     testSettings = TestSettings(),
 )
 
+private class RequestGates {
+    val entered = Channel<Int>(Channel.UNLIMITED)
+    private val gates = mutableMapOf<Int, CompletableDeferred<Unit>>()
+    private var released = false
+
+    suspend fun awaitRelease(index: Int) {
+        val gate = synchronized(gates) {
+            gates.getOrPut(index) { CompletableDeferred() }.also { if (released) it.complete(Unit) }
+        }
+        entered.send(index)
+        gate.await()
+    }
+
+    fun release(index: Int) {
+        synchronized(gates) { gates.getValue(index) }.complete(Unit)
+    }
+
+    fun releaseAll() {
+        val pending = synchronized(gates) {
+            released = true
+            gates.values.toList()
+        }
+        pending.forEach { it.complete(Unit) }
+    }
+}
+
 /**
  * Answers every challenge from [answers] in call order, optionally failing instead.
  *
- * The hold inside the request is load bearing: without a suspension point the
- * unconfined main dispatcher runs each request to completion before the next one
- * starts, so a parallel round and a sequential round become indistinguishable and
- * both concurrency assertions pass for free.
+ * Concurrency tests supply per-request gates; other cases only yield between callbacks.
  *
  * Every call records the model it was sent for, in arrival order: that list is how a
  * batch's ordering is asserted.
@@ -3075,7 +3182,7 @@ private class FakeCompletionApi(
     /** Flippable: a test can let upstream recover between a round and its retry. */
     var failure: TestError? = null,
     private val failingModels: Set<String> = emptySet(),
-    private val holdMs: Long = 20,
+    private val requestGates: RequestGates? = null,
 ) : RelayApi() {
     val calls = AtomicInteger(0)
     val maxConcurrent = AtomicInteger(0)
@@ -3097,7 +3204,7 @@ private class FakeCompletionApi(
         val now = inFlight.incrementAndGet()
         maxConcurrent.updateAndGet { current -> maxOf(current, now) }
         try {
-            withContext(Dispatchers.Default) { delay(holdMs) }
+            if (requestGates != null) requestGates.awaitRelease(index) else yield()
         } finally {
             inFlight.decrementAndGet()
         }
@@ -3146,9 +3253,8 @@ private fun numbersAnswer(count: Int = 320): String = (1..count).joinToString(",
  * real supplier produced: HTTP 200, the whole token budget spent in the reasoning channel,
  * zero characters of content.
  *
- * The hold is the same one [FakeCompletionApi] carries: without a suspension point the
- * unconfined main dispatcher runs each ask to completion before the next one starts, and a
- * parallel round would be indistinguishable from a sequential one.
+ * The response yields long enough to expose an in-flight blank-answer retry. Concurrency
+ * bounds are checked separately with per-request gates, not this fixture's timed hold.
  */
 private class BlankAskThenAnswerApi(
     private val answers: List<String>,
@@ -3284,6 +3390,11 @@ private class GatedCompletionApi(
     private val gate = CompletableDeferred<Unit>()
     val models = Collections.synchronizedList(mutableListOf<String>())
 
+    fun release() {
+        gate.complete(Unit)
+        cancellationGate?.complete(Unit)
+    }
+
     override suspend fun completeText(
         profile: SupplierProfile,
         apiKey: String,
@@ -3332,9 +3443,10 @@ private class GatedCompletionApi(
  */
 private class ParkedRetryApi(
     private val answers: List<String>,
+    private val deliverAfterCancellation: Boolean = false,
 ) : RelayApi() {
-    /** Completed once the retry of question 1 is parked. */
     val retryParked = CompletableDeferred<Unit>()
+    val lateDelivered = CompletableDeferred<Unit>()
     private val gate = CompletableDeferred<Unit>()
     private val calls = AtomicInteger(0)
     val prompts = Collections.synchronizedList(mutableListOf<String>())
@@ -3350,12 +3462,22 @@ private class ParkedRetryApi(
         prompt: String,
         maxTokens: Int,
         timeoutSeconds: Int,
-    ): ApiResult<String> {
+    ): ApiResult<String> = answer(prompt) {}
+
+    private suspend fun answer(prompt: String, onProgress: suspend (String) -> Unit): ApiResult<String> {
         prompts += prompt
         return when (calls.getAndIncrement()) {
             0 -> ApiResult.Failure(TestError(ErrorKind.UPSTREAM, "上游返回 HTTP 502"))
-            // The round's own three questions come first; the fourth call is the retry.
-            3 -> {
+            3 -> if (deliverAfterCancellation) {
+                // The callback and successful return deliberately outlive cancellation of the owning job.
+                withContext(NonCancellable) {
+                    retryParked.complete(Unit)
+                    gate.await()
+                    onProgress(answers[0])
+                    lateDelivered.complete(Unit)
+                    ApiResult.Success(answers[0])
+                }
+            } else {
                 retryParked.complete(Unit)
                 gate.await()
                 ApiResult.Success(answers[0])
@@ -3372,9 +3494,9 @@ private class ParkedRetryApi(
         maxTokens: Int,
         timeoutSeconds: Int,
         onProgress: suspend (String) -> Unit,
-    onReasoning: suspend (String) -> Unit,
+        onReasoning: suspend (String) -> Unit,
         salvageOnDisconnect: Boolean,
-    ): ApiResult<String> = completeText(profile, apiKey, model, prompt, maxTokens, timeoutSeconds)
+    ): ApiResult<String> = answer(prompt, onProgress)
 }
 
 /**
@@ -3392,6 +3514,7 @@ private class ReplacingRetryApi(
 ) : RelayApi() {
     /** Completed once the first retry (call 3) is parked. */
     val retryParked = CompletableDeferred<Unit>()
+    val cancellationStarted = CompletableDeferred<Unit>()
 
     /** Completed once the second round's retry (call 7) is parked. */
     val retryTwoParked = CompletableDeferred<Unit>()
@@ -3409,6 +3532,12 @@ private class ReplacingRetryApi(
         secondGate.complete(Unit)
     }
 
+    fun releaseAll() {
+        release()
+        releaseSecond()
+        cancellationGate?.complete(Unit)
+    }
+
     override suspend fun completeText(
         profile: SupplierProfile,
         apiKey: String,
@@ -3424,6 +3553,7 @@ private class ReplacingRetryApi(
                 try {
                     gate.await()
                 } catch (error: CancellationException) {
+                    cancellationStarted.complete(Unit)
                     cancellationGate?.let { cleanup -> withContext(NonCancellable) { cleanup.await() } }
                     throw error
                 }
@@ -3469,6 +3599,30 @@ private class FailingHistoryFiles : HistoryFileSystem {
     }
 }
 
+/** Only history-order tests pause IO; a blocking append is dispatched on a separate worker. */
+private class QueuedIoDispatcher : CoroutineDispatcher() {
+    @Volatile var paused = false
+    private val queue = ConcurrentLinkedQueue<Runnable>()
+
+    override fun isDispatchNeeded(context: CoroutineContext): Boolean = true
+
+    override fun dispatch(context: CoroutineContext, block: Runnable) {
+        queue.add(block)
+        if (!paused) runQueued()
+    }
+
+    fun takeNext(): Runnable = checkNotNull(queue.poll()) { "预期的 IO 操作尚未入队" }
+
+    fun runQueued() {
+        while (true) (queue.poll() ?: return).run()
+    }
+
+    fun resumeAll() {
+        paused = false
+        runQueued()
+    }
+}
+
 /**
  * A history store the ordering tests can observe and hold: append signals its arrival
  * and then parks until released, and clear counts its calls. With no gate it is just a
@@ -3482,10 +3636,13 @@ private class GatedAppendHistoryStore(
     val appendStarted = CompletableDeferred<Unit>()
     val clearCalls = AtomicInteger(0)
 
+    fun release() {
+        appendGate?.complete(Unit)
+    }
+
     override fun append(entries: List<DetectionHistoryEntry>): Boolean {
         appendStarted.complete(Unit)
-        // 存储本身是同步 API（真实实现走阻塞文件 IO），所以要拄住它也只能阻塞等待；
-        // 测试在专用线程上跑，主线程上的测试协程不会被这里挡住。
+        // The synchronous store API blocks only the append worker, never the test scheduler.
         appendGate?.let { gate -> runBlocking { gate.await() } }
         return super.append(entries)
     }

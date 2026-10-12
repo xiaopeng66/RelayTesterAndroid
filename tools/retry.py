@@ -27,17 +27,15 @@ No third-party dependency and no state: the caller owns the loop shape through
 `run()`, and nothing here writes anything.
 """
 
+import math
 import os
 import random
 import time
 import urllib.error
 
 #: Answers that mean "the other side is busy or broken right now", not "your request is
-#: wrong". 429 and 403 are both used by GitHub for rate limiting; 403 is deliberately
-#: *not* listed here, because a 403 with no rate-limit headers (bad scope, blocked
-#: resource) is permanent — callers that can tell the two apart pass the decision through
-#: `retry.run(retry_if=...)` instead.
-TRANSIENT_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+#: wrong". A 403 is retryable only when the response headers identify a rate limit.
+TRANSIENT_STATUS = frozenset({408, 425, 429}) | frozenset(range(500, 600))
 
 #: Transport errors worth another attempt. urllib wraps most of these in URLError, but
 #: they can also surface raw (a reset mid-read arrives as ConnectionResetError).
@@ -105,7 +103,7 @@ class Policy:
             jitter=_env_float(f"{prefix}_JITTER", DEFAULT_JITTER),
         )
 
-    def delay(self, attempt, retry_after=None, rand=random.random, sleep=time.sleep):
+    def delay(self, attempt, retry_after=None, rand=random.random, sleep=None):
         """Seconds to wait before retry number [attempt] (0-based), then sleep them.
 
         The server's own `Retry-After` wins when it is present — GitHub asks for a
@@ -121,13 +119,28 @@ class Policy:
             seconds = min(self.base_delay * (2 ** attempt), self.max_delay)
             seconds *= 1.0 + self.jitter * (rand() * 2 - 1)
         seconds = max(0.0, seconds)
-        sleep(seconds)
+        (sleep if sleep is not None else time.sleep)(seconds)
         return seconds
 
 
-def transient_status(status):
-    """True when an HTTP status means "try again", false when it means "you are wrong"."""
-    return status in TRANSIENT_STATUS
+def response_header(headers, name):
+    for key, value in (headers or {}).items():
+        if str(key).lower() == name.lower():
+            return str(value).strip()
+    return None
+
+
+def rate_limited(headers):
+    """A plain 403 is a refusal; only explicit limit headers justify retrying it."""
+    return (
+        response_header(headers, "x-ratelimit-remaining") == "0"
+        or response_header(headers, "retry-after") is not None
+    )
+
+
+def transient_status(status, headers=None):
+    """Classify the response before HTTPError can fall through as a transport error."""
+    return status in TRANSIENT_STATUS or (status == 403 and rate_limited(headers))
 
 
 def retry_after_seconds(header):
@@ -148,13 +161,17 @@ def retry_after_seconds(header):
     return max(0.0, when.timestamp() - time.time())
 
 
-def delay_for_status(policy, attempt, headers, sleep=time.sleep):
-    """Wait according to a response's `Retry-After` (when it has one), then sleep."""
-    retry_after = None
-    for key, value in (headers or {}).items():
-        if str(key).lower() == "retry-after":
-            retry_after = retry_after_seconds(value)
-            break
+def delay_for_status(policy, attempt, headers, sleep=None):
+    """Use Retry-After, or the exhausted primary limit's reset time, before backoff."""
+    retry_after = retry_after_seconds(response_header(headers, "retry-after"))
+    if retry_after is None and response_header(headers, "x-ratelimit-remaining") == "0":
+        try:
+            reset = float(response_header(headers, "x-ratelimit-reset"))
+        except (TypeError, ValueError):
+            pass
+        else:
+            if math.isfinite(reset):
+                retry_after = max(0.0, reset - time.time())
     return policy.delay(attempt, retry_after=retry_after, sleep=sleep)
 
 
@@ -166,7 +183,7 @@ def transient_error(error):
     status must classify it with `transient_status` first (see publish_bank.request).
     """
     if isinstance(error, urllib.error.HTTPError):
-        return transient_status(error.code)
+        return transient_status(error.code, error.headers)
     if isinstance(error, Transient):
         return True
     if isinstance(error, urllib.error.URLError):
@@ -183,7 +200,7 @@ def describe_error(error):
     return f"{type(error).__name__}: {error}"
 
 
-def run(call, policy=None, retry_if=None, label="", sleep=time.sleep, log=print):
+def run(call, policy=None, retry_if=None, label="", sleep=None, log=print):
     """Call [call] until it stops looking transient, up to `policy.attempts` times.
 
     [call] is called with no arguments. `retry_if(value)` decides whether a *returned*
@@ -200,7 +217,8 @@ def run(call, policy=None, retry_if=None, label="", sleep=time.sleep, log=print)
         except Exception as error:  # noqa: BLE001 - classification decides, not the call
             if index + 1 >= policy.attempts or not transient_error(error):
                 raise
-            seconds = policy.delay(index, sleep=sleep)
+            headers = error.headers if isinstance(error, urllib.error.HTTPError) else None
+            seconds = delay_for_status(policy, index, headers, sleep=sleep)
             log(f"{label or '调用'}失败（第 {index + 1}/{policy.attempts} 次）："
                 f"{describe_error(error)}，{seconds:.1f}s 后重试")
             continue

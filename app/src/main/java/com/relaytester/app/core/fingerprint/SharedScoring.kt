@@ -45,9 +45,9 @@ import kotlin.math.sqrt
  * produced (one file per package format, each generated from its own upstream revision).
  *
  * Deliberate deviation: upstream gates the temperature softmax on hashes that bind the
- * artifact to the bank it was fitted with. Our package *is* that binding — it is built
- * from one pair of upstream files and carries their digests — so the gate collapses to
- * "the package parsed and carries a sane tau".
+ * artifact to the bank it was fitted with. The package producer must establish those
+ * model/calibration bindings before packing; parsing dimensions or comparing the two
+ * reference digests does not prove provenance. This scorer checks tau and its arithmetic.
  */
 
 /** Feature standardisation for one block (`head_params` / `full_params`). */
@@ -198,6 +198,9 @@ internal object SharedScoring {
     fun calibrate(ranking: DoubleArray, tau: Double): DoubleArray? {
         if (!tau.isFinite() || tau < 0.001 || tau > 1000.0) return null
         val logits = DoubleArray(ranking.size) { tau * ranking[it] }
+        // Finite ranking/blend values can still overflow when multiplied by tau.
+        // Keep the ordering, but never label a NaN softmax as calibrated.
+        if (logits.isEmpty() || logits.any { !it.isFinite() }) return null
         val maximum = logits.max()
         var total = 0.0
         val weights = DoubleArray(logits.size) {

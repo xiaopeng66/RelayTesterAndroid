@@ -9,8 +9,8 @@ package com.relaytester.app.core.fingerprint
  *
  * Scoring is a port of upstream's `shared-detector-v2` for the current package format
  * and of `shared-detector-v1` for the older one; see [SharedScoring] for both formulas,
- * for why the package format picks between them, and for the two deviations (both of
- * which only drop upstream's artifact-hash binding — our package *is* that binding).
+ * for why the package format picks between them, and for the model/calibration bindings
+ * the producer must establish before packing the upstream artifacts.
  */
 class FingerprintBank private constructor(
     val modelIds: List<String>,
@@ -162,9 +162,9 @@ class FingerprintBank private constructor(
          * Parses packed package bytes.
          *
          * Every field is bounds-checked against the file itself, the reader has to consume
-         * it exactly, and the per-model arrays have to agree on one model count. Bytes
-         * that are truncated, padded, or built from two different upstream revisions fail
-         * here instead of scoring nonsense later.
+         * it exactly, and the per-model arrays have to agree on one model count. Truncated,
+         * padded, or structurally inconsistent packages fail here. Matching model order and
+         * calibration provenance must still be established by the package producer.
          */
         fun fromPackageBytes(bytes: ByteArray): FingerprintBank {
             val reader = BankReader(bytes)
@@ -175,11 +175,18 @@ class FingerprintBank private constructor(
             }
             reader.expectMagic(magic)
             val legacyVerifier = magic == LEGACY_MAGIC
-            reader.string() // source reference digest, informational
+            val sourceReferenceDigest = reader.string()
             val builtAt = reader.string()
-            reader.string() // reference digest
+            val referenceDigest = reader.string()
+            // Reject an explicit contradiction, not an absent historical field. These
+            // strings are not authentication or proof of model/calibration provenance.
+            require(
+                sourceReferenceDigest.isEmpty() || referenceDigest.isEmpty() ||
+                    sourceReferenceDigest.equals(referenceDigest, ignoreCase = true),
+            ) { "指纹检测包的来源参考摘要与参考摘要不一致" }
 
             val modelCount = reader.u32()
+            require(modelCount > 0) { "指纹检测包没有模型" }
             // Four string lists are pre-sized from this count before anything is read,
             // so it has to be plausible for the file that declared it.
             reader.requireCapacity(modelCount, 32)
@@ -196,7 +203,13 @@ class FingerprintBank private constructor(
 
             val tau = reader.float64()
             val recommended = reader.float64().toInt()
-            val minimumValid = reader.float64().toInt()
+            val minimumValidValue = reader.float64()
+            require(
+                minimumValidValue.isFinite() && minimumValidValue >= 1.0 &&
+                    minimumValidValue <= Int.MAX_VALUE.toDouble() &&
+                    minimumValidValue == kotlin.math.floor(minimumValidValue),
+            ) { "指纹检测包的有效数字下限不是有效正整数" }
+            val minimumValid = minimumValidValue.toInt()
 
             val headParams = readParams(reader, "LDA")
             val ldaRows = reader.u32()
@@ -208,14 +221,22 @@ class FingerprintBank private constructor(
             val hellinger = readFeatureBank(reader)
             val ordered = readFeatureBank(reader)
             val environmentCount = reader.u32()
+            require(environmentCount > 0) { "指纹检测包没有环境模板" }
             reader.requireCapacity(environmentCount, 8)
-            val environments = if (environmentCount > 0) {
-                val models = reader.u32()
-                val columns = reader.u32()
-                Array(environmentCount) { reader.matrix(models, columns) }
-            } else {
-                emptyArray()
+            val environmentModels = reader.u32()
+            val environmentColumns = reader.u32()
+            require(environmentModels == modelCount) { "指纹检测包的环境模板与模型数量不一致" }
+            require(environmentColumns == ORDERED_DIMENSION) {
+                "指纹检测包的环境模板维度不是 $ORDERED_DIMENSION"
             }
+            // Validate the whole tensor before allocating its nested arrays. Independent
+            // row/count bounds against the same remaining bytes do not bound their product,
+            // especially when zero-width rows consume no bytes at all.
+            val environmentBytes = environmentModels.toLong() * ORDERED_DIMENSION * Int.SIZE_BYTES
+            require(environmentBytes <= reader.remaining.toLong() / environmentCount) {
+                "指纹检测包的环境模板已截断"
+            }
+            val environments = Array(environmentCount) { reader.matrix(environmentModels, environmentColumns) }
 
             val references = reader.quantizedReferences()
 
@@ -317,20 +338,14 @@ class FingerprintBank private constructor(
         }
 
         /**
-         * The integrity gate that upstream expresses as hash bindings.
+         * Structural and numeric checks for the arrays this reader will score.
          *
-         * Upstream refuses to use a detector whose recorded base/verifier digests do not
-         * match the artifact it was fitted with. That cannot happen to a single packed
-         * package, so the equivalent check is structural: every per-model array must have
-         * exactly the declared number of models, and the verifier's matrices must line up
-         * with the 429-dimensional feature vector the ranker produces. A package
-         * assembled from two upstream revisions breaks one of these.
+         * These checks do not prove that same-shaped arrays share model order or that tau
+         * was fitted for them. The producer owns those upstream model/calibration bindings;
+         * the reader can reject contradictory reference digests and malformed structures.
          */
         private fun validate(ids: List<String>, weights: DetectorWeights, modelCount: Int) {
-            // A package with no models satisfies every dimension check below (empty arrays
-            // satisfy all of them) and then ranks nothing: the round would end on
-            // `order.first()` with an internal "List is empty." in the panel.
-            require(modelCount > 0) { "指纹检测包没有模型" }
+            // The header has already rejected an empty roster before allocating arrays.
             require(weights.headParams.size == 2 && weights.fullParams.size == 2) {
                 "指纹检测包的特征标准化块数量不正确"
             }
@@ -415,14 +430,22 @@ class FingerprintBank private constructor(
             reader.requireCapacity(blocks, 16)
             return Array(blocks) {
                 val size = reader.u32()
-                FeatureParams(reader.floats(size), reader.floats(size))
+                val mean = reader.floats(size)
+                val scale = readScale(reader, size, what)
+                FeatureParams(mean, scale)
             }
         }
+
+        private fun readScale(reader: BankReader, size: Int, what: String): DoubleArray =
+            reader.floats(size).also { scale ->
+                // Fixed-point values are finite, but zero remains an invalid divisor.
+                require(scale.all { it != 0.0 }) { "指纹检测包的$what 标准化缩放不能为零" }
+            }
 
         private fun readFeatureBank(reader: BankReader): FeatureBank {
             val size = reader.u32()
             val mean = reader.floats(size)
-            val scale = reader.floats(size)
+            val scale = readScale(reader, size, "特征库")
             val basisRows = reader.u32()
             val basis = if (basisRows > 0) {
                 val columns = reader.u32()

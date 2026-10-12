@@ -4,22 +4,22 @@
 # the calls that fail transiently *inside* a step. Everything else — a job the runner
 # killed, a clone that never started, an unexpected exception, a GitHub-side outage — used
 # to leave a red run that nobody sees until the next daily schedule, 24 hours later. This
-# workflow notices within minutes and starts the failed jobs over.
+# workflow requests a retry when notified, with an hourly scheduled fallback.
 #
 # What it can and cannot do, deliberately:
-#   * it never runs the publish itself. It only calls `rerun-failed-jobs` on a run GitHub
-#     already made, from the same commit with the same inputs;
+#   * it only calls `rerun-failed-jobs`: repository commit and inputs stay fixed, while
+#     the publishing workflow resolves upstream HEAD again on each attempt;
 #   * it asks for `actions: write` and nothing else. No `contents: write`, so it cannot
 #     touch the release, its assets, or any file in the repository — a compromised or
 #     broken watchdog cannot corrupt a published package;
-#   * the publish is idempotent (deterministic rebuild + digest compare), so re-running a
-#     job whose upload already succeeded prints "无需发布" instead of publishing twice;
+#   * deterministic builds and asset readback avoid unnecessary healthy replacements;
+#     force=true still uploads, and a fresh upstream revision can change the rebuilt bytes;
 #   * `tools/retry_failed_runs.py` caps the work at `--max-attempts` and a time window;
 #     a run that fails repeatedly stays red on purpose.
 #
 # Two triggers, on purpose:
-#   * `workflow_run` fires the moment a publish run finishes red: the retry happens in
-#     minutes, which is what makes a transient failure invisible in practice;
+#   * `workflow_run` reacts to a completed publish run; delivery and runner availability
+#     determine when a retry starts, so this is not a recovery-time guarantee;
 #   * `schedule` is the safety net for the case where the watchdog itself was skipped —
 #     a dropped `workflow_run` delivery, or a repository that was quiet when the failure
 #     happened. It re-examines the same window and finds nothing new when all is well.
@@ -57,17 +57,24 @@ concurrency:
 
 jobs:
   retry:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && (github.event_name != 'workflow_run' || github.event.workflow_run.head_branch == github.event.repository.default_branch)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Check out this repository
-        # A plain clone rather than actions/checkout, same reasoning as the publish
-        # workflow: nothing third-party to trust. Only `tools/` is read from here.
-        run: git clone --depth 1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" work
+        run: |
+          set -euo pipefail
+          git init --quiet work
+          git -C work remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git -C work fetch --quiet --depth 1 origin "$GITHUB_SHA"
+          git -C work checkout --quiet --detach FETCH_HEAD
+          test "$(git -C work rev-parse HEAD)" = "$GITHUB_SHA"
 
-      - name: Check the watchdog imports
+      - name: Publishing tool regression tests
         working-directory: work
-        run: python3 -m py_compile tools/retry_failed_runs.py tools/publish_bank.py tools/retry.py
+        run: |
+          set -euo pipefail
+          python3 -B tools/verify_ci_tests.py python
 
       - name: Re-run failed jobs
         working-directory: work

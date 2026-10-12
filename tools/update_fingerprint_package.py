@@ -8,7 +8,7 @@ One command does the whole round trip:
        JSON before that — both are read) + `unified_bank.json` (cached),
     3. rebuild the package with `build_fingerprint_asset.py`,
     4. compare it with the manifest already published on the `bank` release,
-    5. publish it — and only if the digest actually changed.
+    5. publish changed content, repair incomplete assets, or verify a healthy no-op.
 
 Step 5 is where the app picks the new package up: the panel's "检查更新" button reads
 that manifest, and a device with no package checks it once by itself on first entry.
@@ -25,11 +25,10 @@ Usage:
     python tools/update_fingerprint_package.py --ref-bits 8     # smaller package, see below
     python tools/update_fingerprint_package.py --revision SHA   # skip the API, use this revision
 
-Scheduling: this runs itself. `.github/workflows/update-detection-package.yml` calls it on a
-daily cron and on manual dispatch, using the run's own scoped token — nothing to configure
-locally and no long-lived credential anywhere. Runs that find nothing new are a no-op: the
-build is deterministic (its `builtAt` comes from upstream's data, not from the clock), so the
-rebuilt digest is compared with the published manifest and the upload is skipped.
+Scheduling: `.github/workflows/update-detection-package.yml` calls it on a daily cron or
+manual dispatch with the run's own scoped token. The build is deterministic (`builtAt`
+comes from upstream's data, not the clock). An equal manifest digest skips uploading only
+after both published assets pass readback; --force still replaces them.
 
 Network note: raw.githubusercontent.com is not always reachable from every network.
 Set HTTPS_PROXY if you need a proxy, or pass --data-dir with a clone of upstream.
@@ -92,32 +91,18 @@ def api_get(url):
     policy = retry.Policy.from_env()
 
     def once():
-        try:
-            with urllib.request.urlopen(request, timeout=120) as response:
-                return json.loads(response.read())
-        except urllib.error.HTTPError as error:
-            if error.code in (403, 429) and rate_limited(error.headers):
-                # Same status as a permanent refusal, different meaning: tell the retry
-                # loop which one this is instead of leaving it to the status code.
-                raise retry.Transient(f"GitHub API HTTP {error.code} 限流") from error
-            if error.code in (403, 429):
-                raise SystemExit(
-                    f"GitHub API 限流或拒绝（HTTP {error.code}）：写入 token 后重试，"
-                    "或改用 --data-dir 指向本地上游副本",
-                )
-            raise SystemExit(f"读取 {url} 失败：HTTP {error.code} {error.read()[:200]!r}")
+        with urllib.request.urlopen(request, timeout=120) as response:
+            return json.loads(response.read())
 
-    return retry.run(once, policy=policy, label=f"读取 {url.split('/')[-1][:40]}")
-
-
-def rate_limited(headers):
-    """True when a 403/429 answer is the rate limiter rather than a permanent refusal."""
-    if not headers:
-        return True  # no headers at all: treat as the limiter, the caller retries and gives up
-    remaining = headers.get("X-RateLimit-Remaining")
-    if remaining is not None and str(remaining).strip() == "0":
-        return True
-    return headers.get("Retry-After") is not None
+    try:
+        return retry.run(once, policy=policy, label=f"读取 {url.split('/')[-1][:40]}")
+    except urllib.error.HTTPError as error:
+        if error.code in (403, 429):
+            raise SystemExit(
+                f"GitHub API 限流或拒绝（HTTP {error.code}）：检查 token 权限和限流状态后重试，"
+                "或改用 --data-dir 指向本地上游副本",
+            ) from error
+        raise SystemExit(f"读取 {url} 失败：HTTP {error.code} {error.read()[:200]!r}") from error
 
 
 def upstream_revision():
@@ -207,6 +192,12 @@ def fetch_detector(cache_dir, revision):
         target = os.path.join(cache_dir, name)
         print(f"downloading data/{name} @ {revision[:12]}")
         if download(f"{RAW}/{revision}/data/{name}", target, absent_ok=True):
+            # The loader prefers .bin. A cache reused for a JSON-only revision must not
+            # keep an older .bin that would silently override the file just downloaded.
+            for other in DETECTOR_FILES:
+                stale = os.path.join(cache_dir, other)
+                if other != name and os.path.isfile(stale):
+                    os.remove(stale)
             return target
         print(f"  {revision[:12]} 里没有 data/{name}，换下一个候选名")
     raise SystemExit(
@@ -223,11 +214,18 @@ def fetch_data(cache_dir, revision, refresh):
         with open(stamp_path, encoding="utf-8") as handle:
             cached = json.load(handle).get("sha")
     present = all(os.path.isfile(os.path.join(cache_dir, name)) for name in DATA_FILES)
-    present = present and upstream_detector.find_detector(cache_dir) is not None
+    detector_count = sum(os.path.isfile(os.path.join(cache_dir, name)) for name in DETECTOR_FILES)
+    # A legacy cache containing both names is ambiguous: the preferred .bin may belong
+    # to a different revision than the stamp. Refetch it once to establish one source.
+    present = present and detector_count == 1
     if cached == revision and present and not refresh:
         print(f"upstream data cached at {revision[:12]}")
         return cache_dir
     os.makedirs(cache_dir, exist_ok=True)
+    # Inputs are replaced individually. Invalidate the old stamp first so an interrupted
+    # revision switch cannot later pass the cache fast path with a mixed input pair.
+    if os.path.isfile(stamp_path):
+        os.remove(stamp_path)
     for name in DATA_FILES:
         target = os.path.join(cache_dir, name)
         print(f"downloading data/{name} @ {revision[:12]}")
@@ -254,18 +252,6 @@ def build(data_dir, out_path, args):
     result = subprocess.run(command, cwd=PROJECT)
     if result.returncode != 0:
         raise SystemExit(f"构建失败（退出码 {result.returncode}）")
-
-
-def published_manifest(token):
-    """The manifest currently on the `bank` release, or None when nothing is up yet."""
-    release = publish_bank.release_by_tag(token)
-    if release is None:
-        return None, None
-    for asset in release.get("assets", []):
-        if asset["name"] == "latest.json":
-            body = publish_bank.download(asset["browser_download_url"])
-            return json.loads(body), release
-    return None, release
 
 
 def describe(manifest):
@@ -407,14 +393,25 @@ def main():
         return 0
 
     token = publish_bank.read_token()
-    current, release = published_manifest(token)
+    current, release = publish_bank.published_identity(token)
+    publish_bank.verify_not_older(built_manifest, current)
     print(f"published now: {describe(current)}")
+    manifest_bytes = (
+        json.dumps(built_manifest, ensure_ascii=False, indent=2) + "\n"
+    ).encode("utf-8")
     if current is not None and current["sha256"] == built_manifest["sha256"] and not args.force:
-        print(
-            f"无需发布：本地构建与线上逐字节一致（上游 {revision[:12]}，"
-            f"{built_manifest['modelCount']} 个模型）",
-        )
-        return 0
+        try:
+            # A matching manifest does not prove its payload survived the last upload.
+            # Read both assets back, including the compatibility/size fields in latest.json.
+            publish_bank.verify(release, built, manifest_bytes)
+        except publish_bank.PublishedAssetMismatch as error:
+            print(f"线上资产需要修复：{error}")
+        else:
+            print(
+                f"无需发布：本地构建与线上逐字节一致（上游 {revision[:12]}，"
+                f"{built_manifest['modelCount']} 个模型）",
+            )
+            return 0
 
     if current is not None:
         delta = built_manifest["sizeBytes"] - current["sizeBytes"]
@@ -425,11 +422,20 @@ def main():
     else:
         print(f"首次发布：{header['built_at']}")
 
-    manifest_bytes = (
-        json.dumps(built_manifest, ensure_ascii=False, indent=2) + "\n"
-    ).encode("utf-8")
-    release = publish_bank.ensure_release(token)
-    publish_bank.replace_asset(token, release, "lite-bank.bin", built, "application/octet-stream")
+    # Recheck after readback waits and immediately before the first mutation. Queueing
+    # prevents overlapping CI jobs, not an old rerun using a superseded builder.
+    current, release = publish_bank.published_identity(token)
+    publish_bank.verify_not_older(built_manifest, current)
+    release, payload_matches = publish_bank.verify_payload_not_older(token, built_manifest, current, release)
+    # A verified newer payload may be the only surviving fence after a crash. Repair
+    # its companion manifest without deleting those correct bytes, even with --force.
+    manifest_current = publish_bank.read_published_manifest(release) if release is not None else None
+    publish_bank.verify_not_older(built_manifest, manifest_current)
+    publish_bank.verify_workflow_head(token)
+    if release is None:
+        release = publish_bank.ensure_release(token)
+    if not payload_matches or (args.force and manifest_current == built_manifest):
+        publish_bank.replace_asset(token, release, "lite-bank.bin", built, "application/octet-stream")
     publish_bank.replace_asset(token, release, "latest.json", manifest_bytes, "application/json")
     release = publish_bank.release_by_tag(token)
     publish_bank.verify(release, built, manifest_bytes)

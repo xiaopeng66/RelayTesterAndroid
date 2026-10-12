@@ -1,35 +1,6 @@
-# Runs the app's own gates on every push and pull request.
-#
-# The other two workflows publish the detection package; neither builds or tests the app,
-# so before this file a compile error, a failing unit test, a lint error or a shrunk-away
-# class could reach `main` unseen — every gate lived on someone's laptop. This job is the
-# missing automatic half: the same commands the release is gated on locally.
-#
-# What it runs, and why only this:
-#   * `:app:testDebugUnitTest` — the 30-odd JVM test classes, including the release
-#     regression and wording suites. Debug rather than optimized because the tests do not
-#     depend on the variant and debug needs no signing key; the *release* variant only
-#     differs by R8, and R8 is covered by building it in the tag/manual step below.
-#   * `:app:lint` — Android Lint's first-run baseline report is clean, so it can be a gate.
-#   * `:app:assembleDebug` as part of the same invocation: it is what the tests compile
-#     against, so it costs nothing extra.
-#
-# Deliberately absent: `assembleOptimized` (needs the release keystore, which is not in CI
-# and must not be), the wording gate (it needs a built *release* APK), and any publish step.
-#
-# Security shape, same posture as the publishing workflows:
-#   * read-only: `contents: read`, no secrets, no PAT — nothing here can write to the
-#     repository or reach a release;
-#   * no third-party actions: the checkout is plain `git`, and the JDK/SDK come from the
-#     runner image (see the notes in update-detection-package.yml for the reasoning);
-#   * a fork's pull request runs here too, which is the point — it is read-only, so there
-#     is nothing for it to abuse beyond the runner's own CPU.
-#
-# Operational notes:
-#   * the Android SDK on the runner may not carry platform 36 yet; the SDK step installs
-#     exactly what `compileSdk`/`buildToolsVersion` need, and fails loudly if it cannot;
-#   * `concurrency` cancels a superseded run of the same branch, so a burst of pushes does
-#     not queue up Gradle jobs behind each other.
+# Read-only gates for the exact push/PR commit: publishing-tool regressions, Android
+# unit tests, lint and a debug APK. Signed optimized builds and release-APK gates stay
+# local because CI has no signing credentials. Failed reports are retained for diagnosis.
 
 name: Verify the app
 
@@ -52,16 +23,19 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Check out this commit
-        # Plain git rather than a checkout action: `$GITHUB_REF` is `refs/heads/…` on a
-        # push and `refs/pull/<n>/merge` on a pull request, and both are fetchable by name
-        # with only the runner's own git. No action tag to trust or to move under us.
         run: |
           set -euo pipefail
           git init --quiet .
           git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
-          git fetch --quiet --depth 1 origin "$GITHUB_REF"
-          git checkout --quiet FETCH_HEAD
+          git fetch --quiet --depth 1 origin "$GITHUB_SHA"
+          git checkout --quiet --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test -f app/build.gradle.kts
+
+      - name: Publishing tool regression tests
+        run: |
+          set -euo pipefail
+          python3 -B tools/verify_ci_tests.py python
 
       - name: Pick a JDK 17+
         # AGP 8.13 needs 17 or newer. The runner image ships several; anything at 17 or
@@ -118,26 +92,11 @@ jobs:
           echo "ANDROID_SDK_ROOT=$sdk" >> "$GITHUB_ENV"
           echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
 
-      - name: Unit tests and lint
-        # `--no-daemon` because each job is one-shot; the wrapper is used as-is so CI runs
-        # the same Gradle the wrapper pins (and verifies, via distributionSha256Sum).
+      - name: Unit tests, lint and debug APK
         run: |
           set -euo pipefail
-          ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest :app:lint
-          python3 - <<'PY'
-          import glob, sys, xml.etree.ElementTree as ET
-          total = failures = errors = 0
-          for path in glob.glob("app/build/test-results/testDebugUnitTest/*.xml"):
-              root = ET.parse(path).getroot()
-              total += int(root.get("tests"))
-              failures += int(root.get("failures"))
-              errors += int(root.get("errors"))
-          if total == 0:
-              sys.exit("没有找到任何单元测试结果，测试任务可能根本没跑")
-          print(f"unit tests: {total} 项，失败 {failures}，错误 {errors}")
-          if failures or errors:
-              sys.exit(1)
-          PY
+          ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest :app:lint :app:assembleDebug
+          python3 -B tools/verify_ci_tests.py android
 
       - name: Upload reports when something failed
         if: failure()
@@ -149,5 +108,6 @@ jobs:
           path: |
             app/build/reports/lint-results-debug.html
             app/build/reports/tests/testDebugUnitTest
+            app/build/test-results/testDebugUnitTest
           if-no-files-found: ignore
           retention-days: 7

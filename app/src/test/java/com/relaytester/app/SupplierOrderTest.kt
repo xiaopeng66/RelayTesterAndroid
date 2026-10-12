@@ -1,5 +1,7 @@
 package com.relaytester.app
 
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.viewModelScope
 import com.relaytester.app.core.model.RelayProtocol
 import com.relaytester.app.core.model.SupplierProfile
 import com.relaytester.app.core.model.TestSettings
@@ -13,8 +15,12 @@ import com.relaytester.app.feature.tester.TesterViewModel
 import com.relaytester.app.feature.tester.overlayOffsetY
 import com.relaytester.app.feature.tester.supplierAutoScrollStep
 import com.relaytester.app.feature.tester.supplierSlotUnderFinger
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
@@ -48,6 +54,9 @@ import org.junit.Test
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class SupplierOrderTest {
     private val mainDispatcher = UnconfinedTestDispatcher()
+    private val lifecycle = ViewModelStore()
+    private val subjects = mutableListOf<TesterViewModel>()
+    private val stores = mutableListOf<RecordingStore>()
 
     @Before
     fun setUp() {
@@ -56,10 +65,42 @@ class SupplierOrderTest {
 
     @After
     fun tearDown() {
-        Dispatchers.resetMain()
+        try {
+            val jobs = subjects.flatMap { it.viewModelScope.coroutineContext[Job]!!.children.toList() }
+            lifecycle.clear()
+            stores.forEach { it.gate?.complete(Unit) }
+            kotlinx.coroutines.runBlocking {
+                withContext(Dispatchers.Default) { withTimeout(5_000) { jobs.forEach { it.join() } } }
+            }
+        } finally {
+            Dispatchers.resetMain()
+        }
     }
 
     // ---- The move lands in the slot it names ------------------------------
+
+    @Test
+    fun `a move remains pending until its storage write commits`() {
+        val gate = CompletableDeferred<Unit>()
+        val store = RecordingStore(gate = gate)
+        val subject = viewModel(store, "a", "b", "c")
+        try {
+            subject.moveSupplierTo(supplierId = "c", targetIndex = 0)
+            kotlinx.coroutines.runBlocking {
+                withContext(Dispatchers.Default) { withTimeout(5_000) { store.entered.await() } }
+            }
+            assertEquals("进入写盘不能提前公布成功提交", 0, store.saveCount)
+            gate.complete(Unit)
+            assertEquals(listOf("c", "a", "b"), awaitSaved(store).map { it.id })
+        } finally {
+            gate.complete(Unit)
+            kotlinx.coroutines.runBlocking {
+                withContext(Dispatchers.Default) {
+                    withTimeout(5_000) { subject.viewModelScope.coroutineContext[Job]!!.cancelAndJoin() }
+                }
+            }
+        }
+    }
 
     @Test
     fun `a move puts the row in the slot it names`() {
@@ -189,9 +230,6 @@ class SupplierOrderTest {
         settle()
         store.failSaves = false
 
-        // The refused save already consumed one count; wait for the one after it. Without the
-        // baseline this assertion races the IO write and reads the empty list the refused
-        // save left behind.
         val savesBefore = store.saveCount
         subject.moveSupplierTo(supplierId = "b", targetIndex = 0)
 
@@ -471,30 +509,26 @@ class SupplierOrderTest {
     }
 
 
-    /**
-     * Waits for a write beyond [before] to land on the real IO dispatcher.
-     *
-     * The baseline matters: a save that was refused has already bumped the count by the time
-     * this is called, so waiting for "any save" would return the previous write's contents —
-     * which is exactly how the failed-then-retry test read an empty list under load.
-     */
     private fun awaitSaved(store: RecordingStore, before: Int = 0): List<SupplierProfile> =
         kotlinx.coroutines.runBlocking {
             withContext(Dispatchers.Default) {
-                withTimeout(5_000) {
-                    while (store.saveCount <= before) {
-                        kotlinx.coroutines.delay(5)
-                    }
-                    store.saved
-                }
+                withTimeout(5_000) { store.commits.first { it.count > before }.suppliers }
             }
         }
 
-    /** Lets the coroutine that would write run to completion, so "nothing was written"
-     *  is a fact rather than a race the assertion won. */
     private fun settle() {
         kotlinx.coroutines.runBlocking {
-            withContext(Dispatchers.Default) { kotlinx.coroutines.delay(50) }
+            withContext(Dispatchers.Default) {
+                withTimeout(5_000) {
+                    while (true) {
+                        val pending = subjects.flatMap {
+                            it.viewModelScope.coroutineContext[Job]!!.children.toList()
+                        }
+                        if (pending.isEmpty()) break
+                        pending.forEach { it.join() }
+                    }
+                }
+            }
         }
     }
 
@@ -504,18 +538,26 @@ class SupplierOrderTest {
      * Recording the whole state (not just the order) is what lets the assertions read the
      * stored list the way the app's own `read()` would.
      */
-    private class RecordingStore(var failSaves: Boolean = false) : SupplierStore(null) {
-        var saved: List<SupplierProfile> = emptyList()
-            private set
-        var saveCount = 0
-            private set
+    private data class Commit(val count: Int = 0, val suppliers: List<SupplierProfile> = emptyList())
 
-        override suspend fun read() = SupplierStoreState(saved, saved.firstOrNull()?.id)
+    private class RecordingStore(
+        @Volatile var failSaves: Boolean = false,
+        val gate: CompletableDeferred<Unit>? = null,
+    ) : SupplierStore(null) {
+        val entered = CompletableDeferred<Unit>()
+        val commits = MutableStateFlow(Commit())
+        val saveCount: Int get() = commits.value.count
+
+        override suspend fun read(): SupplierStoreState {
+            val saved = commits.value.suppliers
+            return SupplierStoreState(saved, saved.firstOrNull()?.id)
+        }
 
         override suspend fun save(state: SupplierStoreState) {
-            saveCount += 1
+            entered.complete(Unit)
+            gate?.await()
             if (failSaves) throw IllegalStateException("磁盘写失败")
-            saved = state.suppliers
+            commits.value = Commit(commits.value.count + 1, state.suppliers)
         }
     }
 
@@ -531,6 +573,9 @@ class SupplierOrderTest {
             balanceApiFactory = { BalanceApi() },
             skipRestore = true,
         )
+        lifecycle.put("subject-${subjects.size}", subject)
+        subjects += subject
+        if (store is RecordingStore) stores += store
         seedProfiles(subject, ids.toList())
         return subject
     }

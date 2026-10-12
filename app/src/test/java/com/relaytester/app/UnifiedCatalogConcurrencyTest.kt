@@ -1,5 +1,7 @@
 package com.relaytester.app
 
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.viewModelScope
 import com.relaytester.app.core.model.ApiResult
 import com.relaytester.app.core.model.ModelCatalogEntry
 import com.relaytester.app.core.model.ModelSource
@@ -14,11 +16,13 @@ import com.relaytester.app.core.storage.SupplierStoreState
 import com.relaytester.app.feature.tester.TesterUiState
 import com.relaytester.app.feature.tester.TesterViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
@@ -41,6 +45,8 @@ private class RecordingApi : RelayApi() {
     val active = AtomicInteger()
     val peak = AtomicInteger()
     val calls = AtomicInteger()
+    val entered = Channel<Unit>(Channel.UNLIMITED)
+    val release = CompletableDeferred<Unit>()
 
     override suspend fun test(
         profile: SupplierProfile,
@@ -53,16 +59,21 @@ private class RecordingApi : RelayApi() {
         calls.incrementAndGet()
         val current = active.incrementAndGet()
         current.let { peak.updateAndGet { maxOf(it, current) } }
-        kotlinx.coroutines.delay(25)
-        active.decrementAndGet()
-        return ModelTestResult(model = model, status = TestStatus.SUCCESS)
+        entered.send(Unit)
+        try {
+            release.await()
+            return ModelTestResult(model = model, status = TestStatus.SUCCESS)
+        } finally {
+            active.decrementAndGet()
+        }
     }
 }
 
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class UnifiedCatalogConcurrencyTest {
     private val mainDispatcher = UnconfinedTestDispatcher()
-    private val scope = CoroutineScope(SupervisorJob() + mainDispatcher)
+    private val lifecycle = ViewModelStore()
+    private val subjects = mutableListOf<TesterViewModel>()
 
     @Before
     fun setUp() {
@@ -71,14 +82,25 @@ class UnifiedCatalogConcurrencyTest {
 
     @After
     fun tearDown() {
-        Dispatchers.resetMain()
-        scope.cancel()
+        try {
+            val jobs = subjects.flatMap { it.viewModelScope.coroutineContext[Job]!!.children.toList() }
+            lifecycle.clear()
+            runBlocking { withTimeout(5_000) { jobs.forEach { it.join() } } }
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    private fun own(subject: TesterViewModel): TesterViewModel {
+        lifecycle.put("subject-${subjects.size}", subject)
+        subjects += subject
+        return subject
     }
 
     @Test
     fun multipleSourceTestsRunConcurrentlyAndKeepIndependentResults() {
         val api = RecordingApi()
-        val subject = TesterViewModel(
+        val subject = own(TesterViewModel(
             supplierStore = RecordingStore(),
             secretStore = object : SecretStore {
                 override fun put(value: String) = "secret-test"
@@ -88,7 +110,7 @@ class UnifiedCatalogConcurrencyTest {
             relayApiFactory = { api },
             balanceApiFactory = { BalanceApi() },
             skipRestore = true,
-        )
+        ))
         val sources = listOf(
             ModelSource("supplier-1", "model-a"),
             ModelSource("supplier-1", "model-b"),
@@ -131,9 +153,12 @@ class UnifiedCatalogConcurrencyTest {
         subject.startUnifiedCatalogSourceTest("parallel", sources[0])
         subject.startUnifiedCatalogSourceTest("parallel", sources[1])
 
-        kotlinx.coroutines.runBlocking {
-            while (subject.uiState.value.unifiedTestingKeys.isNotEmpty()) {
-                kotlinx.coroutines.delay(10)
+        runBlocking {
+            withTimeout(5_000) {
+                repeat(2) { api.entered.receive() }
+                assertEquals("两个来源请求必须同时处于处理中", 2, api.active.get())
+                api.release.complete(Unit)
+                subject.uiState.first { it.unifiedTestingKeys.isEmpty() }
             }
         }
 
@@ -153,10 +178,10 @@ class UnifiedCatalogConcurrencyTest {
 
         subject.startUnifiedCatalogSourceTest("parallel", ModelSource("supplier-1", "model-a"))
         runBlocking {
-            var waited = 0L
-            while (subject.uiState.value.unifiedTestingKeys.isNotEmpty() && waited < 5_000) {
-                kotlinx.coroutines.delay(10)
-                waited += 10
+            withTimeout(5_000) {
+                api.entered.receive()
+                api.release.complete(Unit)
+                subject.uiState.first { it.unifiedTestingKeys.isEmpty() }
             }
         }
 
@@ -174,7 +199,12 @@ class UnifiedCatalogConcurrencyTest {
         val subject = subjectWithOneSource(api, testingDisabled = true)
 
         subject.startUnifiedCatalogSourceTest("parallel", ModelSource("supplier-1", "model-a"))
-        runBlocking { kotlinx.coroutines.delay(200) }
+        runBlocking {
+            withTimeout(5_000) {
+                subject.uiState.first { it.unifiedTestingKeys.isEmpty() }
+                subject.viewModelScope.coroutineContext[Job]!!.children.toList().forEach { it.join() }
+            }
+        }
 
         assertEquals("禁止测试的供应商不得发出请求", 0, api.calls.get())
         assertEquals(
@@ -188,7 +218,7 @@ class UnifiedCatalogConcurrencyTest {
         api: RelayApi,
         testingDisabled: Boolean = false,
     ): TesterViewModel {
-        val subject = TesterViewModel(
+        val subject = own(TesterViewModel(
             supplierStore = RecordingStore(),
             secretStore = object : SecretStore {
                 override fun put(value: String) = "secret-test"
@@ -198,7 +228,7 @@ class UnifiedCatalogConcurrencyTest {
             relayApiFactory = { api },
             balanceApiFactory = { BalanceApi() },
             skipRestore = true,
-        )
+        ))
         val source = ModelSource("supplier-1", "model-a")
         val entry = ModelCatalogEntry(id = "parallel", name = "parallel", sources = listOf(source))
         val profile = SupplierProfile.empty(1).copy(

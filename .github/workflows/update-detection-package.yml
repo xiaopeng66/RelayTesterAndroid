@@ -1,17 +1,12 @@
 # Keeps the `bank` pre-release in step with upstream lm-detector.
 #
-# The app downloads its detection package from that release. This job rebuilds the package
-# from upstream's data and publishes it only when the built bytes differ from what is
-# already published, so a run against an unchanged upstream ends in "无需发布" and changes
-# nothing.
+# The app downloads its detection package from that release. An unchanged build is a
+# no-op only after both published assets pass readback; incomplete uploads are repaired.
 #
 # Security shape, deliberately minimal:
-#   * triggers are `schedule` and `workflow_dispatch` only — no `push` and no
-#     `pull_request*`, so nothing a contributor or a fork sends can run here;
-#   * the only write power asked for is `contents: write`, which is what uploading a
-#     release asset needs. It comes from the run's own short-lived GITHUB_TOKEN, scoped to
-#     this repository and gone when the job ends: no PAT, no repository secret, nothing
-#     long-lived that could leak or be replayed;
+#   * only the default branch may publish, through schedule or workflow_dispatch;
+#   * contents: write uploads assets; issues: write records real publications. Both use
+#     the run's short-lived GITHUB_TOKEN, not a stored PAT;
 #   * no third-party actions are used at all — the steps below are plain git and python
 #     from the runner image, so there is no action whose moved tag could be hijacked;
 #   * the app itself carries no credential: it only GETs public release assets from this
@@ -32,16 +27,15 @@
 #     schedule silently.
 #
 # Failing runs, in two layers — a transient hiccup should not need a person:
-#   * the steps retry what they can do again cheaply (`git ls-remote`, `git clone`);
+#   * the steps retry what they can do again cheaply (`git ls-remote`, `git fetch`);
 #   * `tools/update_fingerprint_package.py` + `tools/publish_bank.py` retry every call they
 #     make to GitHub (5xx, 429, rate-limited 403, DNS/TLS/timeouts/resets) with backoff,
 #     and return permanent answers like a 401/404/422 immediately — see `tools/retry.py`;
 #   * anything a retry inside a step cannot reach (runner killed the job, step timed out,
 #     an unexpected exception) is picked up by `.github/workflows/retry-failed-detection-package.yml`,
 #     which re-runs *this* run's failed jobs, bounded by attempt count and a time window.
-#     The publish is idempotent — a rebuild is deterministic and downloads are compared by
-#     digest — so a re-run either finds nothing to do ("无需发布") or replaces the assets
-#     again; it cannot publish twice or publish something stale.
+#     A re-run uses the same repository commit but resolves upstream HEAD again. Unchanged
+#     healthy assets are a no-op; changed or incomplete assets are published and verified.
 #   * the retry budget is tunable per run without editing code: BANK_RETRY_ATTEMPTS,
 #     BANK_RETRY_BASE_DELAY, BANK_RETRY_MAX_DELAY, BANK_RETRY_JITTER.
 
@@ -72,6 +66,7 @@ concurrency:
 
 jobs:
   update:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -97,35 +92,26 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Check out this repository
-        # A plain clone rather than actions/checkout: the tools are all this job needs, and
-        # this keeps the workflow free of third-party actions to trust. A partial `work`
-        # directory is removed before each attempt so a failed clone cannot be mistaken
-        # for a finished one.
         run: |
           set -euo pipefail
+          git init --quiet work
+          git -C work remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
           for attempt in 1 2 3; do
-            rm -rf work
-            if git clone --depth 1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" work; then
+            if git -C work fetch --quiet --depth 1 origin "$GITHUB_SHA"; then
               break
             fi
-            echo "clone 失败（第 $attempt/3 次），稍后重试" >&2
+            echo "fetch 失败（第 $attempt/3 次），稍后重试" >&2
             sleep $((attempt * 5))
           done
+          git -C work checkout --quiet --detach FETCH_HEAD
+          test "$(git -C work rev-parse HEAD)" = "$GITHUB_SHA"
           test -f work/tools/update_fingerprint_package.py
 
-      - name: Check the publishing tools import
+      - name: Publishing tool regression tests
         working-directory: work
-        # Cheap and first: a broken tools/ push should fail in a second, not after the
-        # 44 MB upstream download. `retry.py` is in the list because every network call in
-        # the tools imports it — a syntax error there would otherwise surface later.
         run: |
-          python3 -m py_compile \
-            tools/build_fingerprint_asset.py \
-            tools/publish_bank.py \
-            tools/update_fingerprint_package.py \
-            tools/upstream_detector.py \
-            tools/retry.py \
-            tools/retry_failed_runs.py
+          set -euo pipefail
+          python3 -B tools/verify_ci_tests.py python
 
       - name: Rebuild and publish if upstream moved
         working-directory: work

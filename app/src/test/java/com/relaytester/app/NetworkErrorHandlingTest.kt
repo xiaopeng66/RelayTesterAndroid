@@ -1,5 +1,6 @@
 package com.relaytester.app
 
+import com.relaytester.app.core.model.ApiResult
 import com.relaytester.app.core.model.BalanceHttpMethod
 import com.relaytester.app.core.model.BalanceQueryResult
 import com.relaytester.app.core.model.BalanceQueryTemplate
@@ -16,6 +17,12 @@ import com.relaytester.app.core.network.isMissingAnswerText
 import com.relaytester.app.core.network.redactSecrets
 import java.io.IOException
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -244,6 +251,113 @@ class NetworkErrorHandlingTest {
         )
 
         assertTrue("凭据还在错误文案里：${error.message}", !error.message.contains(secret))
+    }
+
+    // ---- Refusing a redirect does not make its host display-safe ----------
+
+    @Test
+    fun `redirect refusal from relay model fetching redacts credential shaped host text`() = runBlocking {
+        val secret = "sk-live-abc12345678"
+        withRedirectReply(secret) { client, seen ->
+            val result = RelayApi(client).fetchModels(balanceProfile(), secret, 3)
+            assertTrue("The off-origin redirect must fail", result is ApiResult.Failure)
+            assertSafeRedirectRefusal((result as ApiResult.Failure).error.message, secret, seen)
+        }
+    }
+
+    @Test
+    fun `redirect refusal from relay testing redacts credential shaped host text`() = runBlocking {
+        val secret = "sk-live-abc12345678"
+        withRedirectReply(secret) { client, seen ->
+            val result = RelayApi(client).test(balanceProfile(), secret, "m", "ping", 4, 3)
+            assertNotNull("The refused redirect must remain a failed test", result.error)
+            assertSafeRedirectRefusal(result.error!!.message, secret, seen)
+        }
+    }
+
+    @Test
+    fun `redirect refusal from buffered completion redacts credential shaped host text`() = runBlocking {
+        val secret = "sk-live-abc12345678"
+        withRedirectReply(secret) { client, seen ->
+            val result = RelayApi(client).completeText(balanceProfile(), secret, "m", "ping", 4, 3)
+            assertTrue("The off-origin redirect must fail", result is ApiResult.Failure)
+            assertSafeRedirectRefusal((result as ApiResult.Failure).error.message, secret, seen)
+        }
+    }
+
+    @Test
+    fun `redirect refusal from streaming completion redacts credential shaped host text`() = runBlocking {
+        val secret = "sk-live-abc12345678"
+        withRedirectReply(secret) { client, seen ->
+            val result = RelayApi(client).completeTextStreaming(
+                profile = balanceProfile(),
+                apiKey = secret,
+                model = "m",
+                prompt = "ping",
+                maxTokens = 4,
+                timeoutSeconds = 3,
+                onProgress = { error("A refused redirect cannot supply answer text") },
+            )
+            assertTrue("The off-origin redirect must fail", result is ApiResult.Failure)
+            assertSafeRedirectRefusal((result as ApiResult.Failure).error.message, secret, seen)
+        }
+    }
+
+    @Test
+    fun `redirect refusal from balance querying redacts credential shaped host text`() = runBlocking {
+        val secret = "sk-live-abc12345678"
+        withRedirectReply(secret) { client, seen ->
+            val result = BalanceApi(client).query(
+                profile = balanceProfile(),
+                apiKey = "",
+                accessToken = secret,
+                userId = "",
+                template = template(
+                    headers = listOf(BalanceTemplateHeader("Authorization", "Bearer {{accessToken}}")),
+                ),
+            )
+            assertTrue("The off-origin redirect must fail", result is BalanceQueryResult.Failure)
+            assertSafeRedirectRefusal((result as BalanceQueryResult.Failure).message, secret, seen)
+        }
+    }
+
+    private fun assertSafeRedirectRefusal(message: String, secret: String, seen: List<Request>) {
+        // The reply's host is attacker-controlled even though the *request* was refused.
+        // This token has a supported shape; it is not the documented bare-token limitation.
+        assertEquals("A refused Location must not cause a second request", 1, seen.size)
+        assertEquals("relay.example", seen.single().url.host)
+        assertEquals("Bearer $secret", seen.single().header("Authorization"))
+        assertTrue("Keep the actionable redirect refusal", message.contains("跳转") && message.contains("拒绝"))
+        assertFalse("The refusal echoed a credential into display/export: $message", message.contains(secret))
+    }
+
+    private suspend fun withRedirectReply(
+        secret: String,
+        action: suspend (OkHttpClient, List<Request>) -> Unit,
+    ) {
+        val seen = java.util.concurrent.CopyOnWriteArrayList<Request>()
+        val client = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val request = chain.request()
+                seen += request
+                // Intercept every request, including an accidental followed hop: this test
+                // never resolves DNS or contacts a real endpoint.
+                Response.Builder()
+                    .request(request)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(302)
+                    .message("Found")
+                    .header("Location", "https://$secret.invalid/")
+                    .body("".toResponseBody(null))
+                    .build()
+            }
+            .build()
+        try {
+            withTimeout(5_000) { action(client, seen) }
+        } finally {
+            client.dispatcher.executorService.shutdownNow()
+            client.connectionPool.evictAll()
+        }
     }
 
     // ---- Which headers have to carry a credential placeholder -------------

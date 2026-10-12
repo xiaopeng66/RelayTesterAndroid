@@ -17,9 +17,9 @@ Why that cannot disturb a publish:
   * it never runs the workflow itself — it only re-runs a job GitHub already has, from the
     same commit and with the same inputs. It has no `contents: write`, so it cannot touch
     the release or its assets;
-  * the publish is idempotent: it rebuilds deterministically and compares digests, so a
-    re-run of a job whose upload already happened prints "无需发布" instead of publishing
-    twice, and a re-run after a *half-finished* publish re-uploads the missing asset;
+  * the publish rebuilds deterministically and reads back both assets before a no-op;
+    missing or mismatched assets are repaired. The repository commit and inputs stay
+    fixed, but upstream HEAD is resolved again, and force=true still replaces assets;
   * the publish workflow's own `concurrency` group (`cancel-in-progress: false`) makes two
     runs queue rather than overlap, so a re-run can never race a fresh publish;
   * the work is bounded — `--max-attempts` (default 3) caps how often one run may be
@@ -79,18 +79,18 @@ def select(runs, max_attempts, window_hours, now=None):
 
     Two rules beyond the conclusion filter:
 
-      * a run that already has a *later successful* run is skipped. Whatever went wrong
-        was overtaken by events (a manual dispatch, or the next schedule); re-running the
-        old one would spend a job on work that is already done;
+      * a run whose failure was followed by a completed successful run is skipped.
+        Creation order is not completion order: concurrency queues are not FIFO, and
+        an older run can fail after a newer-created run already succeeded;
       * the newest failures are retried first, and attempts are counted from the run's own
         `run_attempt`, so a re-run does not reset the budget.
     """
     now = now or datetime.datetime.utcnow()
     cutoff = now - datetime.timedelta(hours=window_hours)
     successes = [
-        parse_time(run.get("created_at"))
+        parse_time(run.get("updated_at"))
         for run in runs
-        if run.get("conclusion") == "success"
+        if run.get("conclusion") == "success" and run.get("status") == "completed"
     ]
     successes = [when for when in successes if when is not None]
     newest_success = max(successes) if successes else None
@@ -112,8 +112,9 @@ def select(runs, max_attempts, window_hours, now=None):
             skipped.append((identifier, conclusion,
                             f"已重跑到上限（attempt {attempt}/{max_attempts}）"))
             continue
-        if newest_success is not None and created < newest_success:
-            skipped.append((identifier, conclusion, "已有更新的成功运行，无需重跑"))
+        finished = parse_time(run.get("updated_at"))
+        if newest_success is not None and finished is not None and finished < newest_success:
+            skipped.append((identifier, conclusion, "失败之后已有成功完成的运行，无需重跑"))
             continue
         retryable.append(run)
     return retryable, skipped

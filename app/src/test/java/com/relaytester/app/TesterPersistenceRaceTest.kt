@@ -152,13 +152,12 @@ class TesterPersistenceRaceTest {
             h.vm.refreshSupplierModels(SUPPLIER_ID)
             awaitReal { h.api.modelsEntered.await() }
 
+            val saved = CompletableDeferred<Unit>()
             h.vm.updateBalanceAccessToken("fixture-new-pat")
-            h.vm.saveBalanceCredentials()
-            awaitReal {
-                h.vm.balanceUiState.first {
-                    !it.credentials.accessTokenDirty && it.credentials.accessToken == "fixture-new-pat"
-                }
-            }
+            h.vm.saveBalanceCredentials { saved.complete(Unit) }
+            awaitReal { saved.await() }
+            assertFalse(h.vm.balanceUiState.value.credentials.accessTokenDirty)
+            assertEquals("fixture-new-pat", h.vm.balanceUiState.value.credentials.accessToken)
             assertNull(h.secrets.get("pat-old"))
 
             h.api.modelsRelease.complete(Unit)
@@ -174,25 +173,13 @@ class TesterPersistenceRaceTest {
 
     @Test
     fun `an over-long test prompt is clamped before it reaches durable storage`() = runTest {
-        // 使用边界：测试 Prompt 会被写进落盘配置与加密备份，却是该设置对象里唯一没有上限的
-        // 字段——同组的超时/并发/maxTokens 全部有 coerceIn。一次「全选粘贴」就能把几 MB 文本
-        // 固化进配置。这里钉住：保存时必须被夹到上限，而不是原样落盘。
         withHarness { h ->
-            // 必须先等启动读完再编辑：`updateDraft` 在 `runningOrInitializing()` 期间会**静默
-            // 拒绝**编辑（有意的守卫），而那个守卫认的起手状态不止 isInitializing——密钥水合
-            // （isSecretsHydrating）期间同样拒收。CI 上只等 isInitializing 就编辑过一次：编辑被
-            // 丢掉、落盘的是默认值 "ping"，断言报出的差异完全看不出原因。两个一起等，编辑才进 draft。
-            awaitReal { h.vm.uiState.first { !it.isInitializing && !it.isSecretsHydrating } }
-
-            h.vm.updateSetting(SettingField.PROMPT, "p".repeat(MAX_TEST_PROMPT_CHARS + 5_000))
-            h.vm.saveCurrentSupplier()
-            runCurrent()
-            awaitReal { h.store.state.suppliers.isNotEmpty() }
+            savePromptAndAwaitCommit(h, "p".repeat(MAX_TEST_PROMPT_CHARS + 5_000))
 
             assertEquals(
                 "超长 Prompt 必须被夹到上限后再落盘",
-                MAX_TEST_PROMPT_CHARS,
-                h.store.state.suppliers.single().testSettings.prompt.length,
+                "p".repeat(MAX_TEST_PROMPT_CHARS),
+                h.store.state.suppliers.single().testSettings.prompt,
             )
         }
     }
@@ -200,14 +187,8 @@ class TesterPersistenceRaceTest {
     @Test
     fun `a prompt within the limit is stored verbatim`() = runTest {
         withHarness { h ->
-            // 同前一条：编辑前必须等 `runningOrInitializing()` 的起手状态全部结束（isInitializing
-            // 与 isSecretsHydrating 都结束），否则 updateDraft 会静默丢弃这次编辑。
-            awaitReal { h.vm.uiState.first { !it.isInitializing && !it.isSecretsHydrating } }
             val prompt = "p".repeat(MAX_TEST_PROMPT_CHARS)
-            h.vm.updateSetting(SettingField.PROMPT, prompt)
-            h.vm.saveCurrentSupplier()
-            runCurrent()
-            awaitReal { h.store.state.suppliers.isNotEmpty() }
+            savePromptAndAwaitCommit(h, prompt)
 
             assertEquals(
                 "上限内的 Prompt 不得被改动",
@@ -215,6 +196,21 @@ class TesterPersistenceRaceTest {
                 h.store.state.suppliers.single().testSettings.prompt,
             )
         }
+    }
+
+    private suspend fun TestScope.savePromptAndAwaitCommit(h: Harness, prompt: String) {
+        val original = h.store.state
+        val save = h.store.blockSave { true }
+        val saved = CompletableDeferred<Unit>()
+        h.vm.updateSetting(SettingField.PROMPT, prompt)
+        h.vm.saveCurrentSupplier { saved.complete(Unit) }
+        awaitReal { save.entered.await() }
+        runCurrent()
+
+        assertEquals("提交前不得改动持久化状态", original, h.store.state)
+        assertFalse("保存回调不得早于写入完成", saved.isCompleted)
+        save.release.complete(Unit)
+        awaitReal { saved.await() }
     }
 
     @Test

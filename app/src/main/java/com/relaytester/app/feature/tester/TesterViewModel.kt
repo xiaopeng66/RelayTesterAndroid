@@ -48,6 +48,9 @@ import kotlin.math.roundToLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -629,21 +632,11 @@ class TesterViewModel(
     private var balanceBatchRunning = false
     /** Serializes only the map reservation, never the network request itself. */
     private val balanceJobsMutex = Mutex()
-    /** Lock order: credential transaction -> profile mutation -> configuration write. */
-    private val credentialTransactionMutex = Mutex()
-    /** Serializes profile replacement and persistence when card refreshes finish together. */
-    private val profileMutationMutex = Mutex()
-    private val supplierActivationMutex = Mutex()
-    /**
-     * Serialises every whole-configuration write.
-     *
-     * Each write snapshots the whole [SupplierStoreState] before suspending into IO, so two
-     * writers that overlap can land the earlier snapshot last and silently discard the
-     * other's change — the supplier edit stays on screen but is gone from disk. Balance
-     * snapshots and profile edits are the two paths that do this, so they share the lock
-     * rather than each holding its own.
-     */
+    /** Covers candidate preparation, durable commit, publication and secret cleanup. */
     private val configurationWriteMutex = Mutex()
+    /** A queued discard belongs to the input and form that were visible when it was requested. */
+    private var supplierDraftRevision = 0L
+    private var balanceCredentialsRevision = 0L
     /** Encrypted source bytes only; decrypted configuration is never retained for confirmation. */
     private var pendingConfigurationImportBytes: ByteArray? = null
 
@@ -976,71 +969,57 @@ class TesterViewModel(
         viewModelScope.launch {
             _uiState.update { it.copy(isSavingCatalogEntry = true, catalogSaveOutcome = null) }
             try {
-                val previous = modelCatalog.toList()
-                val entry = ModelCatalogEntry(entryId ?: UUID.randomUUID().toString(), cleanName, cleanSources)
-                val next = if (entryId == null) {
-                    previous + entry
-                } else {
-                    previous.map { if (it.id == entryId) entry else it }
-                }
-                if (next == previous) {
-                    // Two different no-ops used to share one misleading message. A save
-                    // that found its target and changed nothing is a *successful* save;
-                    // a save whose target is gone is a failure and must not pretend
-                    // otherwise.
-                    val targetExists = entryId != null && previous.any { it.id == entryId }
-                    if (targetExists) {
+                configurationTransaction {
+                    if (cleanSources.any { source -> profiles.none { it.id == source.supplierId } }) {
+                        showMessage("模型来源包含已删除的供应商", isError = true)
+                        return@configurationTransaction
+                    }
+                    if (entryId == null && modelCatalog.size >= MAX_MODEL_CATALOG_ENTRIES) {
+                        showMessage("最多保留 $MAX_MODEL_CATALOG_ENTRIES 项来源配置", isError = true)
+                        return@configurationTransaction
+                    }
+                    val previous = modelCatalog.toList()
+                    val entry = ModelCatalogEntry(entryId ?: UUID.randomUUID().toString(), cleanName, cleanSources)
+                    val next = if (entryId == null) previous + entry else {
+                        previous.map { if (it.id == entryId) entry else it }
+                    }
+                    if (next == previous) {
+                        val targetExists = entryId != null && previous.any { it.id == entryId }
+                        val message = if (targetExists) "配置未变化" else "未找到要更新的模型来源"
                         publishCatalogSaveOutcome(
                             entryId = entryId,
-                            success = true,
-                            unchanged = true,
+                            success = targetExists,
+                            unchanged = targetExists,
                             savedName = cleanName,
                             savedSources = cleanSources,
-                            message = "配置未变化",
+                            message = message,
                         )
-                        showMessage("配置未变化")
-                    } else {
+                        showMessage(message, isError = !targetExists)
+                        return@configurationTransaction
+                    }
+                    if (!commitConfigurationLocked(configurationSnapshot().copy(modelCatalog = next))) {
                         publishCatalogSaveOutcome(
                             entryId = entryId,
                             success = false,
                             unchanged = false,
                             savedName = cleanName,
                             savedSources = cleanSources,
-                            message = "未找到要更新的模型来源",
+                            message = "保存模型来源失败：本地配置未能写入，请重试",
                         )
-                        showMessage("未找到要更新的模型来源", isError = true)
+                        showMessage("保存模型来源失败：本地配置未能写入，请重试", isError = true)
+                        return@configurationTransaction
                     }
-                    return@launch
-                }
-                modelCatalog = next.toMutableList()
-                _uiState.update { it.copy(modelCatalog = next) }
-                if (!saveProfiles()) {
-                    modelCatalog = previous.toMutableList()
-                    _uiState.update { it.copy(modelCatalog = previous) }
-                    // The in-memory rollback keeps the catalogue honest; the outcome (and
-                    // the dialog, which keeps the draft until it sees success) lets the
-                    // user simply press save again.
+                    val message = if (entryId == null) "已添加模型来源配置" else "已更新模型来源配置"
                     publishCatalogSaveOutcome(
                         entryId = entryId,
-                        success = false,
+                        success = true,
                         unchanged = false,
                         savedName = cleanName,
                         savedSources = cleanSources,
-                        message = "保存模型来源失败：本地配置未能写入，请重试",
+                        message = message,
                     )
-                    showMessage("保存模型来源失败：本地配置未能写入，请重试", isError = true)
-                    return@launch
+                    showMessage(message)
                 }
-                val message = if (entryId == null) "已添加模型来源配置" else "已更新模型来源配置"
-                publishCatalogSaveOutcome(
-                    entryId = entryId,
-                    success = true,
-                    unchanged = false,
-                    savedName = cleanName,
-                    savedSources = cleanSources,
-                    message = message,
-                )
-                showMessage(message)
             } finally {
                 _uiState.update { it.copy(isSavingCatalogEntry = false) }
             }
@@ -1073,20 +1052,13 @@ class TesterViewModel(
     fun deleteModelCatalogEntry(entryId: String) {
         if (runningOrInitializing()) return
         viewModelScope.launch {
-            val previous = modelCatalog.toList()
-            val removed = previous.firstOrNull { it.id == entryId } ?: return@launch
-            val next = previous.filterNot { it.id == entryId }
-            val removedKeys = removed.sources.mapTo(mutableSetOf()) { it.missingKey() }
-            modelCatalog = next.toMutableList()
-            _uiState.update {
-                it.copy(
-                    modelCatalog = next,
-                    catalogMissingSources = it.catalogMissingSources - removedKeys,
-                )
-            }
-            if (!saveProfiles()) {
-                modelCatalog = previous.toMutableList()
-                _uiState.update { it.copy(modelCatalog = previous) }
+            configurationTransaction {
+                val removed = modelCatalog.firstOrNull { it.id == entryId } ?: return@configurationTransaction
+                val next = modelCatalog.filterNot { it.id == entryId }
+                val removedKeys = removed.sources.mapTo(mutableSetOf()) { it.missingKey() }
+                commitConfigurationLocked(configurationSnapshot().copy(modelCatalog = next)) {
+                    _uiState.update { it.copy(catalogMissingSources = it.catalogMissingSources - removedKeys) }
+                }
             }
         }
     }
@@ -1187,30 +1159,21 @@ class TesterViewModel(
     fun removeModelSourceFromCatalog(entryId: String, source: ModelSource) {
         if (runningOrInitializing()) return
         viewModelScope.launch {
-            val previous = modelCatalog.toList()
-            val entry = previous.firstOrNull { it.id == entryId } ?: return@launch
-            val nextSources = entry.sources.filterNot {
-                it.supplierId == source.supplierId && it.modelId == source.modelId
-            }
-            if (nextSources.size == entry.sources.size) return@launch
-            // An entry with no sources is not a valid stored state: both
-            // persistModelCatalogEntry and SupplierStore.load drop such entries.
-            // Removing the last source therefore removes the whole entry.
-            val next = if (nextSources.isEmpty()) {
-                previous.filterNot { it.id == entryId }
-            } else {
-                previous.map { if (it.id == entryId) it.copy(sources = nextSources) else it }
-            }
-            modelCatalog = next.toMutableList()
-            _uiState.update {
-                it.copy(
-                    modelCatalog = next,
-                    catalogMissingSources = it.catalogMissingSources - source.missingKey(),
-                )
-            }
-            if (!saveProfiles()) {
-                modelCatalog = previous.toMutableList()
-                _uiState.update { it.copy(modelCatalog = previous) }
+            configurationTransaction {
+                val entry = modelCatalog.firstOrNull { it.id == entryId } ?: return@configurationTransaction
+                val nextSources = entry.sources.filterNot {
+                    it.supplierId == source.supplierId && it.modelId == source.modelId
+                }
+                if (nextSources.size == entry.sources.size) return@configurationTransaction
+                // Entries without a source cannot be represented in the stored catalogue.
+                val next = if (nextSources.isEmpty()) {
+                    modelCatalog.filterNot { it.id == entryId }
+                } else {
+                    modelCatalog.map { if (it.id == entryId) it.copy(sources = nextSources) else it }
+                }
+                commitConfigurationLocked(configurationSnapshot().copy(modelCatalog = next)) {
+                    _uiState.update { it.copy(catalogMissingSources = it.catalogMissingSources - source.missingKey()) }
+                }
             }
         }
     }
@@ -1461,6 +1424,7 @@ class TesterViewModel(
 
     fun updateBalanceAccessToken(value: String) {
         if (balanceOperationBlocked()) return
+        balanceCredentialsRevision++
         _balanceUiState.update { state ->
             state.copy(
                 credentials = state.credentials.copy(accessToken = value, accessTokenDirty = true),
@@ -1471,25 +1435,22 @@ class TesterViewModel(
     }
 
     fun discardBalanceCredentialsChanges() {
-        val activeId = activeSupplierId
-        val profile = activeId?.let { id -> profiles.firstOrNull { it.id == id } }
-        _balanceUiState.update {
-            it.copy(
-                credentials = profile
-                    ?.let { saved -> BalanceCredentialsDraft.from(saved, "") }
-                    ?: BalanceCredentialsDraft(),
-                credentialErrors = BalanceCredentialsErrors(),
-            )
-        }
-        if (profile != null) {
-            viewModelScope.launch {
-                loadStartupCredentials(profile).let { credentials ->
-                    _balanceUiState.update {
-                        it.copy(
-                            credentials = BalanceCredentialsDraft.from(
-                                profile,
-                                credentials.balanceAccessToken,
-                            ),
+        val supplierId = _balanceUiState.value.activeSupplierId ?: return
+        val revision = balanceCredentialsRevision
+        viewModelScope.launch {
+            configurationTransaction {
+                if (activeSupplierId != supplierId || balanceCredentialsRevision != revision) {
+                    return@configurationTransaction
+                }
+                val profile = profiles.firstOrNull { it.id == supplierId } ?: return@configurationTransaction
+                val credentials = loadStartupCredentials(profile)
+                _balanceUiState.update { state ->
+                    if (state.activeSupplierId != supplierId || balanceCredentialsRevision != revision) {
+                        state
+                    } else {
+                        state.copy(
+                            credentials = BalanceCredentialsDraft.from(profile, credentials.balanceAccessToken),
+                            credentialErrors = BalanceCredentialsErrors(),
                         )
                     }
                 }
@@ -1499,6 +1460,7 @@ class TesterViewModel(
 
     fun updateBalanceUserId(value: String) {
         if (balanceOperationBlocked()) return
+        balanceCredentialsRevision++
         _balanceUiState.update { state ->
             state.copy(
                 credentials = state.credentials.copy(userId = value),
@@ -1511,8 +1473,9 @@ class TesterViewModel(
     fun saveBalanceCredentials(onSaved: () -> Unit = {}) {
         if (balanceOperationBlocked()) return
         viewModelScope.launch {
-            // 成功与否由调用方拿回调分辨：失败时弹窗留在原地看错误，成功时弹窗自己关。
-            if (persistBalanceCredentials() != null) onSaved()
+            val saved = persistBalanceCredentials() ?: return@launch
+            val current = _balanceUiState.value.credentials
+            if (!current.accessTokenDirty && current.userId.trim() == saved.balanceUserId) onSaved()
         }
     }
 
@@ -1629,9 +1592,11 @@ class TesterViewModel(
                 it.copy(isBusy = true, exportPayload = null, message = null, isMessageError = false)
             }
             try {
-                checkNotNull(persistDraft()) { "当前供应商配置无法保存" }
-                checkNotNull(persistBalanceCredentials()) { "当前余额凭据无法保存" }
-                val backup = withContext(Dispatchers.IO) { createConfigurationBackupSnapshot() }
+                val backup = configurationTransaction {
+                    checkNotNull(persistDraftLocked()) { "当前供应商配置无法保存" }
+                    checkNotNull(persistBalanceCredentialsLocked()) { "当前余额凭据无法保存" }
+                    withContext(Dispatchers.IO) { createConfigurationBackupSnapshot() }
+                }
                 val exportBytes = withContext(Dispatchers.IO) {
                     if (encrypted) {
                     ConfigurationBackupCodec.encrypt(backup, password.toCharArray())
@@ -1802,20 +1767,27 @@ class TesterViewModel(
         if (balanceOperationBlocked()) return
         if (balanceTemplates.none { it.id == id }) return
         viewModelScope.launch {
-            if (persistDraft() == null) return@launch
-            val activeId = activeSupplierId ?: return@launch
-            val previousTemplateId = profiles.firstOrNull { it.id == activeId }?.balanceTemplateId
-            assignBalanceTemplateToActiveSupplier(id)
-            if (!saveProfiles(setOf(activeId))) {
-                assignBalanceTemplateToActiveSupplier(previousTemplateId)
-                return@launch
-            }
-            _balanceUiState.update { state ->
-                state.copy(
-                    balanceErrors = state.balanceErrors - activeId,
-                    message = "已切换余额查询模板",
-                    isMessageError = false,
+            configurationTransaction {
+                if (balanceTemplates.none { it.id == id }) return@configurationTransaction
+                if (persistDraftLocked() == null) return@configurationTransaction
+                val activeId = activeSupplierId ?: return@configurationTransaction
+                val candidate = configurationSnapshot().copy(
+                    suppliers = profiles.map { if (it.id == activeId) it.copy(balanceTemplateId = id) else it },
                 )
+                commitConfigurationLocked(candidate, setOf(activeId)) {
+                    _uiState.update { state ->
+                        state.copy(draft = state.draft?.let { draft ->
+                            if (draft.id == activeId) draft.copy(balanceTemplateId = id) else draft
+                        })
+                    }
+                    _balanceUiState.update { state ->
+                        state.copy(
+                            balanceErrors = state.balanceErrors - activeId,
+                            message = "已切换余额查询模板",
+                            isMessageError = false,
+                        )
+                    }
+                }
             }
         }
     }
@@ -1939,41 +1911,38 @@ class TesterViewModel(
             return
         }
         viewModelScope.launch {
-            val previousTemplates = balanceTemplates.toMutableList()
-            val previousProfiles = profiles.toMutableList()
-            val affectedSupplierIds = previousProfiles
-                .filter { it.balanceTemplateId == templateId }
-                .mapTo(mutableSetOf()) { it.id }
-            balanceTemplates.removeAll { it.id == templateId }
-            val fallbackId = balanceTemplates.firstOrNull()?.id
-            profiles = profiles.map { profile ->
-                if (profile.balanceTemplateId == templateId) {
-                    profile.copy(balanceTemplateId = fallbackId)
-                } else {
-                    profile
+            configurationTransaction {
+                val current = balanceTemplates.firstOrNull { it.id == templateId } ?: return@configurationTransaction
+                if (current.builtIn) return@configurationTransaction
+                val affectedSupplierIds = profiles.filter { it.balanceTemplateId == templateId }
+                    .mapTo(mutableSetOf()) { it.id }
+                val nextTemplates = balanceTemplates.filterNot { it.id == templateId }
+                val fallbackId = nextTemplates.firstOrNull()?.id
+                val candidate = configurationSnapshot().copy(
+                    balanceTemplates = nextTemplates,
+                    suppliers = profiles.map { profile ->
+                        if (profile.balanceTemplateId == templateId) profile.copy(balanceTemplateId = fallbackId)
+                        else profile
+                    },
+                )
+                commitConfigurationLocked(candidate, affectedSupplierIds) {
+                    _uiState.update { state ->
+                        val draft = state.draft
+                        state.copy(
+                            draft = draft
+                                ?.takeIf { it.id == activeSupplierId && it.balanceTemplateId == templateId }
+                                ?.copy(balanceTemplateId = fallbackId)
+                                ?: draft,
+                        )
+                    }
+                    _balanceUiState.update { state ->
+                        state.copy(
+                            balanceErrors = state.balanceErrors - affectedSupplierIds,
+                            message = "已删除余额模板",
+                            isMessageError = false,
+                        )
+                    }
                 }
-            }.toMutableList()
-            if (!saveProfiles(affectedSupplierIds)) {
-                balanceTemplates = previousTemplates
-                profiles = previousProfiles
-                return@launch
-            }
-            _uiState.update { state ->
-                val draft = state.draft
-                state.copy(
-                    suppliers = profiles.toList(),
-                    draft = draft
-                        ?.takeIf { it.id == activeSupplierId && it.balanceTemplateId == templateId }
-                        ?.copy(balanceTemplateId = fallbackId)
-                        ?: draft,
-                )
-            }
-            _balanceUiState.update { state ->
-                state.copy(
-                    balanceErrors = state.balanceErrors - affectedSupplierIds,
-                    message = "已删除余额模板",
-                    isMessageError = false,
-                )
             }
         }
     }
@@ -2075,30 +2044,46 @@ class TesterViewModel(
     fun saveCurrentSupplier(onSaved: () -> Unit = {}) {
         if (runningOrInitializing()) return
         viewModelScope.launch {
-            if (persistDraft() != null) {
-                onSaved()
-            }
+            val saved = persistDraft() ?: return@launch
+            val current = _uiState.value.draft ?: return@launch
+            // Global filters autosave independently of the supplier editor's legacy fields.
+            val supplierFields = current.copy(
+                keyword = saved.testSettings.keyword,
+                quickFilterTerms = saved.testSettings.quickFilterTerms,
+            )
+            if (!current.apiKeyDirty && supplierFields.toProfile(
+                    saved.apiKeySecretId, saved.balanceAccessTokenSecretId, saved.balanceUserId,
+                ) == saved
+            ) onSaved()
         }
     }
 
     fun discardCurrentSupplierChanges() {
-        val profile = activeSupplierId?.let { id -> profiles.firstOrNull { it.id == id } } ?: return
-        _uiState.update {
-            it.copy(
-                draft = SupplierDraft.from(profile, ""),
-                errors = FormErrors(),
-                message = null,
-            )
-        }
+        val supplierId = _uiState.value.draft?.id ?: return
+        val revision = supplierDraftRevision
         viewModelScope.launch {
-            val credentials = loadStartupCredentials(profile)
-            _uiState.update {
-                it.copy(
-                    draft = SupplierDraft.from(
-                        profile.copy(),
-                        credentials.apiKey,
-                    ),
-                )
+            configurationTransaction {
+                if (activeSupplierId != supplierId || supplierDraftRevision != revision) {
+                    return@configurationTransaction
+                }
+                val profile = profiles.firstOrNull { it.id == supplierId } ?: return@configurationTransaction
+                val credentials = loadStartupCredentials(profile)
+                _uiState.update { state ->
+                    if (state.activeSupplierId != supplierId || state.draft?.id != supplierId ||
+                        supplierDraftRevision != revision
+                    ) {
+                        state
+                    } else {
+                        state.copy(
+                            draft = SupplierDraft.from(profile, credentials.apiKey).copy(
+                                keyword = state.modelFilterKeyword,
+                                quickFilterTerms = state.quickFilterTerms,
+                            ),
+                            errors = FormErrors(),
+                            message = null,
+                        )
+                    }
+                }
             }
         }
     }
@@ -2127,46 +2112,19 @@ class TesterViewModel(
             return
         }
         viewModelScope.launch {
-            val activated = supplierActivationMutex.withLock {
-                activateSupplier(id)
-            }
+            val activated = configurationTransaction { activateSupplierLocked(id) }
             onActivated(activated)
         }
     }
 
-    /** Activates a supplier in the caller coroutine so follow-up work cannot use the previous site. */
-    private suspend fun activateSupplier(id: String): Boolean {
+    /** Activates a supplier while holding the configuration transaction lock. */
+    private suspend fun activateSupplierLocked(id: String): Boolean {
         if (profiles.none { it.id == id }) return false
-        if (id == _uiState.value.activeSupplierId) return true
+        if (id == activeSupplierId) return true
         val nextProfile = profiles.firstOrNull { it.id == id } ?: return false
-        val previousActiveSupplierId = activeSupplierId
         val previousUiState = _uiState.value
         val previousBalanceUiState = _balanceUiState.value
-
-        fun restoreSelection() {
-            activeSupplierId = previousActiveSupplierId
-            _uiState.update { state ->
-                state.copy(
-                    activeSupplierId = previousActiveSupplierId,
-                    results = previousUiState.results,
-                    selectedModels = previousUiState.selectedModels,
-                    summary = previousUiState.summary,
-                    progressDone = previousUiState.progressDone,
-                    progressTotal = previousUiState.progressTotal,
-                    errors = previousUiState.errors,
-                )
-            }
-            _balanceUiState.update { state ->
-                state.copy(
-                    activeSupplierId = previousActiveSupplierId,
-                    credentialErrors = previousBalanceUiState.credentialErrors,
-                )
-            }
-        }
-
-        // The visible selection should change in the same frame as the tap.
-        // The draft and credentials remain associated with the previous site
-        // until their durable writes below complete.
+        var activated = false
         _uiState.update {
             it.copy(
                 activeSupplierId = id,
@@ -2178,55 +2136,61 @@ class TesterViewModel(
                 errors = FormErrors(),
             )
         }
-        _balanceUiState.update {
-            it.copy(
-                activeSupplierId = id,
-                credentialErrors = BalanceCredentialsErrors(),
-            )
+        _balanceUiState.update { it.copy(activeSupplierId = id, credentialErrors = BalanceCredentialsErrors()) }
+        try {
+            if (persistDraftLocked() == null || persistBalanceCredentialsLocked() == null) return false
+            return commitConfigurationLocked(configurationSnapshot().copy(activeSupplierId = id)) {
+                installDraft(nextProfile)
+                activated = true
+            }
+        } finally {
+            if (!activated) {
+                _uiState.update { state ->
+                    state.copy(
+                        activeSupplierId = activeSupplierId,
+                        results = previousUiState.results,
+                        selectedModels = previousUiState.selectedModels,
+                        summary = previousUiState.summary,
+                        progressDone = previousUiState.progressDone,
+                        progressTotal = previousUiState.progressTotal,
+                        errors = previousUiState.errors,
+                    )
+                }
+                _balanceUiState.update { state ->
+                    state.copy(
+                        activeSupplierId = activeSupplierId,
+                        credentialErrors = previousBalanceUiState.credentialErrors,
+                    )
+                }
+            }
         }
-
-        if (persistDraft() == null || persistBalanceCredentials() == null) {
-            restoreSelection()
-            return false
-        }
-        activeSupplierId = id
-        if (!saveProfiles()) {
-            restoreSelection()
-            return false
-        }
-        installDraft(nextProfile)
-        // No second credential read here: installDraft already loaded both secrets (on IO)
-        // and published them, so re-reading only repeated two Keystore decrypts — on the
-        // main dispatcher, because this runs inside the selection coroutine.
-        return true
     }
 
     fun addSupplier() {
         if (runningOrInitializing()) return
         viewModelScope.launch {
-            if (persistDraft() == null || persistBalanceCredentials() == null) return@launch
-            val previousActiveSupplierId = activeSupplierId
-            val profile = SupplierProfile.empty(profiles.size + 1)
-            profiles += profile
-            activeSupplierId = profile.id
-            if (!saveProfiles()) {
-                profiles.removeAll { it.id == profile.id }
-                activeSupplierId = previousActiveSupplierId
-                return@launch
-            }
-            installDraft(profile)
-            _uiState.update {
-                it.copy(
-                    suppliers = profiles.toList(),
+            configurationTransaction {
+                if (persistDraftLocked() == null || persistBalanceCredentialsLocked() == null) return@configurationTransaction
+                val profile = SupplierProfile.empty(profiles.size + 1)
+                val candidate = configurationSnapshot().copy(
+                    suppliers = profiles + profile,
                     activeSupplierId = profile.id,
-                    results = emptyList(),
-                    selectedModels = profile.models.toSet(),
-                    summary = null,
-                    message = "已添加供应商",
-                    isMessageError = false,
                 )
+                commitConfigurationLocked(candidate) {
+                    installDraft(profile)
+                    _uiState.update {
+                        it.copy(
+                            activeSupplierId = profile.id,
+                            results = emptyList(),
+                            selectedModels = profile.models.toSet(),
+                            summary = null,
+                            message = "已添加供应商",
+                            isMessageError = false,
+                        )
+                    }
+                    _balanceUiState.update { it.copy(credentialErrors = BalanceCredentialsErrors()) }
+                }
             }
-            _balanceUiState.update { it.copy(credentialErrors = BalanceCredentialsErrors()) }
         }
     }
 
@@ -2242,53 +2206,42 @@ class TesterViewModel(
             return
         }
         viewModelScope.launch {
-            val removed = profiles.firstOrNull { it.id == supplierId } ?: return@launch
-            val previousProfiles = profiles.toMutableList()
-            val previousActiveSupplierId = activeSupplierId
-            val previousCatalog = modelCatalog.toList()
-            val wasActive = activeSupplierId == supplierId
-            profiles.removeAll { it.id == supplierId }
-            modelCatalog = modelCatalog.map { entry ->
-                entry.copy(sources = entry.sources.filterNot { it.supplierId == supplierId })
-            }.filter { it.sources.isNotEmpty() }.toMutableList()
-            val next = if (wasActive) {
-                profiles.firstOrNull() ?: return@launch
-            } else {
-                profiles.firstOrNull { it.id == activeSupplierId } ?: profiles.firstOrNull()
-                    ?: return@launch
-            }
-            if (wasActive) activeSupplierId = next.id
-            if (!saveProfiles(setOf(supplierId))) {
-                profiles = previousProfiles
-                activeSupplierId = previousActiveSupplierId
-                modelCatalog = previousCatalog.toMutableList()
-                return@launch
-            }
-            // Delete only after the replacement supplier list is durable. A
-            // deletion failure leaves an unreachable encrypted record instead
-            // of destroying a key that the stored profile still references.
-            withContext(Dispatchers.IO) {
-                listOfNotNull(removed.apiKeySecretId, removed.balanceAccessTokenSecretId)
-                    .forEach { secretId -> runCatching { secretStore.delete(secretId) } }
-            }
-            if (wasActive) installDraft(next)
-            _uiState.update {
-                it.copy(
-                    suppliers = profiles.toList(),
-                    activeSupplierId = activeSupplierId,
-                    results = if (wasActive) emptyList() else it.results,
-                    selectedModels = if (wasActive) next.models.toSet() else it.selectedModels,
-                    modelCatalog = modelCatalog.toList(),
-                    summary = if (wasActive) null else it.summary,
-                    message = "已删除供应商 ${removed.name}",
-                    isMessageError = false,
+            configurationTransaction {
+                if (profiles.size <= 1) {
+                    showMessage("请至少保留一个供应商", isError = true)
+                    return@configurationTransaction
+                }
+                val removed = profiles.firstOrNull { it.id == supplierId } ?: return@configurationTransaction
+                val wasActive = activeSupplierId == supplierId
+                val remaining = profiles.filterNot { it.id == supplierId }
+                val next = remaining.firstOrNull { !wasActive && it.id == activeSupplierId } ?: remaining.first()
+                val candidate = configurationSnapshot().copy(
+                    suppliers = remaining,
+                    activeSupplierId = if (wasActive) next.id else activeSupplierId,
+                    modelCatalog = modelCatalog.map { entry ->
+                        entry.copy(sources = entry.sources.filterNot { it.supplierId == supplierId })
+                    }.filter { it.sources.isNotEmpty() },
                 )
-            }
-            _balanceUiState.update { state ->
-                state.copy(
-                    balanceErrors = state.balanceErrors - supplierId,
-                    credentialErrors = BalanceCredentialsErrors(),
-                )
+                commitConfigurationLocked(candidate, setOf(supplierId)) {
+                    deleteUnusedSecrets(listOfNotNull(removed.apiKeySecretId, removed.balanceAccessTokenSecretId))
+                    if (wasActive) installDraft(next)
+                    _uiState.update {
+                        it.copy(
+                            activeSupplierId = activeSupplierId,
+                            results = if (wasActive) emptyList() else it.results,
+                            selectedModels = if (wasActive) next.models.toSet() else it.selectedModels,
+                            summary = if (wasActive) null else it.summary,
+                            message = "已删除供应商 ${removed.name}",
+                            isMessageError = false,
+                        )
+                    }
+                    _balanceUiState.update { state ->
+                        state.copy(
+                            balanceErrors = state.balanceErrors - supplierId,
+                            credentialErrors = BalanceCredentialsErrors(),
+                        )
+                    }
+                }
             }
         }
     }
@@ -2299,39 +2252,24 @@ class TesterViewModel(
     }
 
     /**
-     * Puts one supplier in the slot at [targetIndex], clamped to the list, resolved
-     * against the live list when the call lands.
-     *
-     * Stated as a **position** rather than as a partner to swap with, and that is the fix
-     * for a real defect rather than a style choice: the drag resolves its target from where
-     * the finger is, and a finger that has not moved keeps naming the same slot. A pointer
-     * event that arrives before the recomposition lands therefore asks for the slot the row
-     * already holds, which is a no-op here. The id-based move this replaces was relative —
-     * "swap with that neighbour" — so the same repeated event named the neighbour the row
-     * had just left and moved it straight back: two rows bouncing up and down for as long as
-     * the finger stayed put (or drifted slowly), which is exactly what it looked like.
-     *
-     * Supplier order is the profiles list's own order — there is no separate rank field — so
-     * every surface that renders that list (the test tab's cards, the balance grid, the
-     * fingerprint picker after its tab-entry refresh) follows at once. The move reaches the
-     * UI state before the save, because a drag must not wait on disk; a failed save rolls
-     * the whole move back, the same discipline as [deleteSupplier]. Rapid moves inside one
-     * gesture queue behind the same write mutex and each snapshot carries every earlier one,
-     * so the last write lands the final order rather than an intermediate one.
+     * Resolves a positional move against the latest committed order. The preview may move
+     * before disk completes, but other transactions must never snapshot that preview.
      */
     fun moveSupplierTo(supplierId: String, targetIndex: Int) {
         if (runningOrInitializing()) return
         viewModelScope.launch {
-            val from = profiles.indexOfFirst { it.id == supplierId }
-            if (from < 0) return@launch
-            val to = targetIndex.coerceIn(0, profiles.lastIndex)
-            if (from == to) return@launch
-            val previousProfiles = profiles.toMutableList()
-            profiles.add(to, profiles.removeAt(from))
-            _uiState.update { it.copy(suppliers = profiles.toList()) }
-            if (!saveProfiles()) {
-                profiles = previousProfiles
-                _uiState.update { it.copy(suppliers = profiles.toList()) }
+            configurationTransaction {
+                val from = profiles.indexOfFirst { it.id == supplierId }
+                if (from < 0) return@configurationTransaction
+                val to = targetIndex.coerceIn(0, profiles.lastIndex)
+                if (from == to) return@configurationTransaction
+                val next = profiles.toMutableList().apply { add(to, removeAt(from)) }
+                _uiState.update { it.copy(suppliers = next) }
+                try {
+                    commitConfigurationLocked(configurationSnapshot().copy(suppliers = next))
+                } finally {
+                    _uiState.update { it.copy(suppliers = profiles.toList()) }
+                }
             }
         }
     }
@@ -2896,39 +2834,41 @@ class TesterViewModel(
             }
             return null
         }
-        if (balanceTemplates.firstOrNull { it.id == template.id }?.builtIn == true) {
-            showBalanceMessage("内置模板请通过“复制为自定义模板”创建副本", isError = true)
-            return null
-        }
-
-        val previousTemplates = balanceTemplates.toMutableList()
-        val previousProfiles = profiles.toMutableList()
-        val activeId = activeSupplierId
-        val previousTemplateId = activeId
-            ?.let { id -> profiles.firstOrNull { it.id == id }?.balanceTemplateId }
-        val index = balanceTemplates.indexOfFirst { it.id == template.id }
-        if (index >= 0) {
-            balanceTemplates[index] = template
-        } else {
-            balanceTemplates += template
-        }
-        assignBalanceTemplateToActiveSupplier(template.id)
-        if (!saveProfiles(activeId?.let { setOf(it) }.orEmpty())) {
-            balanceTemplates = previousTemplates
-            profiles = previousProfiles
-            assignBalanceTemplateToActiveSupplier(previousTemplateId)
-            return null
-        }
-        _balanceUiState.update { state ->
-            state.copy(
-                editor = null,
-                errors = BalanceTemplateErrors(),
-                balanceErrors = activeId?.let { state.balanceErrors - it } ?: state.balanceErrors,
-                message = "余额模板已保存",
-                isMessageError = false,
+        return configurationTransaction {
+            if (balanceTemplates.firstOrNull { it.id == template.id }?.builtIn == true) {
+                showBalanceMessage("内置模板请通过“复制为自定义模板”创建副本", isError = true)
+                return@configurationTransaction null
+            }
+            val activeId = activeSupplierId
+            val nextTemplates = if (balanceTemplates.any { it.id == template.id }) {
+                balanceTemplates.map { if (it.id == template.id) template else it }
+            } else {
+                balanceTemplates + template
+            }
+            val candidate = configurationSnapshot().copy(
+                balanceTemplates = nextTemplates,
+                suppliers = profiles.map { profile ->
+                    if (profile.id == activeId) profile.copy(balanceTemplateId = template.id) else profile
+                },
             )
+            val saved = commitConfigurationLocked(candidate, activeId?.let { setOf(it) }.orEmpty()) {
+                _uiState.update { state ->
+                    state.copy(draft = state.draft?.let { current ->
+                        if (current.id == activeId) current.copy(balanceTemplateId = template.id) else current
+                    })
+                }
+                _balanceUiState.update { state ->
+                    state.copy(
+                        editor = state.editor.takeUnless { it == draft },
+                        errors = BalanceTemplateErrors(),
+                        balanceErrors = activeId?.let { state.balanceErrors - it } ?: state.balanceErrors,
+                        message = "余额模板已保存",
+                        isMessageError = false,
+                    )
+                }
+            }
+            template.takeIf { saved }
         }
-        return template
     }
 
     /** Marks or clears one supplier's in-flight placeholder; other suppliers are untouched. */
@@ -3282,20 +3222,6 @@ class TesterViewModel(
         )
     }
 
-    private fun assignBalanceTemplateToActiveSupplier(templateId: String?) {
-        val activeId = activeSupplierId ?: return
-        val index = profiles.indexOfFirst { it.id == activeId }
-        if (index < 0) return
-        profiles[index] = profiles[index].copy(balanceTemplateId = templateId)
-        _uiState.update { state ->
-            val draft = state.draft
-            state.copy(
-                suppliers = profiles.toList(),
-                draft = if (draft?.id == activeId) draft.copy(balanceTemplateId = templateId) else draft,
-            )
-        }
-    }
-
     private fun BalanceQueryTemplate.referencesBalancePlaceholder(placeholder: String): Boolean = when (queryMode) {
         BalanceQueryMode.SCRIPT -> scriptCode?.contains(placeholder) == true
         BalanceQueryMode.FORM -> buildList {
@@ -3384,98 +3310,80 @@ class TesterViewModel(
             throw ConfigurationBackupException("备份中的余额模板无效，当前配置未更改")
         }
 
-        credentialTransactionMutex.withLock {
-            profileMutationMutex.withLock {
-                configurationWriteMutex.withLock {
-                    val oldSecretIds = profiles.flatMap { profile ->
-                        listOfNotNull(profile.apiKeySecretId, profile.balanceAccessTokenSecretId)
-                    }.distinct()
-                    val createdSecretIds = mutableListOf<String>()
-                    var dataStoreCommitted = false
-                    try {
-                        val imported = withContext(Dispatchers.IO) {
-                            backup.suppliers.map { source ->
-                                val apiKeySecretId = source.apiKey.trim().takeIf(String::isNotBlank)?.let { apiKey ->
-                                    secretStore.put(apiKey).also(createdSecretIds::add)
-                                }
-                                val balanceTokenSecretId = source.balanceAccessToken.trim()
-                                    .takeIf(String::isNotBlank)
-                                    ?.let { token -> secretStore.put(token).also(createdSecretIds::add) }
-                                ImportedConfigurationSupplier(
-                                    profile = SupplierProfile(
-                                        id = source.id,
-                                        name = source.name.trim().ifBlank { "未命名供应商" },
-                                        baseUrl = source.baseUrl.trim(),
-                                        protocol = source.protocol,
-                                        apiKeySecretId = apiKeySecretId,
-                                        models = source.models.distinct().sorted(),
-                                        testSettings = source.testSettings,
-                                        balanceTemplateId = source.balanceTemplateId,
-                                        balanceAccessTokenSecretId = balanceTokenSecretId,
-                                        balanceUserId = source.balanceUserId.trim(),
-                                        isTestingDisabled = source.isTestingDisabled,
-                                    ),
-                                    apiKey = source.apiKey.trim(),
-                                    balanceAccessToken = source.balanceAccessToken.trim(),
-                                )
-                            }
+        configurationTransaction {
+            val oldSecretIds = profiles.flatMap { listOfNotNull(it.apiKeySecretId, it.balanceAccessTokenSecretId) }
+            val createdSecretIds = mutableListOf<String>()
+            try {
+                val imported = withContext(Dispatchers.IO) {
+                    backup.suppliers.map { source ->
+                        currentCoroutineContext().ensureActive()
+                        val apiKeySecretId = source.apiKey.trim().takeIf(String::isNotBlank)?.let { apiKey ->
+                            secretStore.put(apiKey).also(createdSecretIds::add)
                         }
-                        val activeId = backup.activeSupplierId
-                            ?.takeIf { candidate -> imported.any { it.profile.id == candidate } }
-                            ?: imported.first().profile.id
-                        val stateToSave = SupplierStoreState(
-                            suppliers = imported.map(ImportedConfigurationSupplier::profile),
-                            activeSupplierId = activeId,
-                            balanceTemplates = backup.balanceTemplates,
-                            modelCatalog = backup.modelCatalog,
-                            modelFilterKeyword = backup.modelFilterKeyword,
-                            quickFilterTerms = backup.quickFilterTerms,
+                        currentCoroutineContext().ensureActive()
+                        val balanceTokenSecretId = source.balanceAccessToken.trim()
+                            .takeIf(String::isNotBlank)
+                            ?.let { token -> secretStore.put(token).also(createdSecretIds::add) }
+                        ImportedConfigurationSupplier(
+                            profile = SupplierProfile(
+                                id = source.id,
+                                name = source.name.trim().ifBlank { "未命名供应商" },
+                                baseUrl = source.baseUrl.trim(),
+                                protocol = source.protocol,
+                                apiKeySecretId = apiKeySecretId,
+                                models = source.models.distinct().sorted(),
+                                testSettings = source.testSettings,
+                                balanceTemplateId = source.balanceTemplateId,
+                                balanceAccessTokenSecretId = balanceTokenSecretId,
+                                balanceUserId = source.balanceUserId.trim(),
+                                isTestingDisabled = source.isTestingDisabled,
+                            ),
+                            apiKey = source.apiKey.trim(),
+                            balanceAccessToken = source.balanceAccessToken.trim(),
                         )
-                        withContext(Dispatchers.IO) { supplierStore.save(stateToSave) }
-                        dataStoreCommitted = true
-
-                        profiles = imported.map(ImportedConfigurationSupplier::profile).toMutableList()
-                        activeSupplierId = activeId
-                        balanceTemplates = backup.balanceTemplates.toMutableList()
-                        modelCatalog = backup.modelCatalog.toMutableList()
-                        val active = requireNotNull(imported.firstOrNull { it.profile.id == activeId })
-                        _uiState.value = TesterUiState(
-                            isInitializing = false,
-                            suppliers = profiles.toList(),
-                            activeSupplierId = activeId,
-                            draft = SupplierDraft.from(active.profile, active.apiKey),
-                            selectedModels = active.profile.models.toSet(),
-                            modelFilterKeyword = backup.modelFilterKeyword,
-                            quickFilterTerms = backup.quickFilterTerms,
-                            modelCatalog = modelCatalog.toList(),
-                            message = "配置已导入",
-                            isMessageError = false,
-                        )
-                        _balanceUiState.value = BalanceUiState(
-                            isInitializing = false,
-                            suppliers = profiles.toList(),
-                            activeSupplierId = activeId,
-                            templates = balanceTemplates.toList(),
-                            credentials = BalanceCredentialsDraft.from(active.profile, active.balanceAccessToken),
-                            message = "配置已导入",
-                            isMessageError = false,
-                        )
-                        // Deletion happens after the state is durable. A best-effort failure leaves only
-                        // inaccessible ciphertext behind and must never roll back a successful import.
-                        withContext(Dispatchers.IO) {
-                            oldSecretIds.forEach { secretId -> runCatching { secretStore.delete(secretId) } }
-                        }
-                    } catch (error: CancellationException) {
-                        throw error
-                    } catch (error: Throwable) {
-                        if (!dataStoreCommitted) {
-                            withContext(Dispatchers.IO) {
-                                createdSecretIds.forEach { secretId -> runCatching { secretStore.delete(secretId) } }
-                            }
-                        }
-                        throw error
                     }
                 }
+                val activeId = backup.activeSupplierId
+                    ?.takeIf { candidate -> imported.any { it.profile.id == candidate } }
+                    ?: imported.first().profile.id
+                val candidate = SupplierStoreState(
+                    suppliers = imported.map(ImportedConfigurationSupplier::profile),
+                    activeSupplierId = activeId,
+                    balanceTemplates = backup.balanceTemplates,
+                    modelCatalog = backup.modelCatalog,
+                    modelFilterKeyword = backup.modelFilterKeyword,
+                    quickFilterTerms = backup.quickFilterTerms,
+                )
+                val saved = commitConfigurationLocked(candidate, attempts = 1, onFailure = {}) {
+                    val active = imported.first { it.profile.id == activeId }
+                    supplierDraftRevision++
+                    balanceCredentialsRevision++
+                    _uiState.value = TesterUiState(
+                        isInitializing = false,
+                        suppliers = profiles.toList(),
+                        activeSupplierId = activeId,
+                        draft = SupplierDraft.from(active.profile, active.apiKey),
+                        selectedModels = active.profile.models.toSet(),
+                        modelFilterKeyword = backup.modelFilterKeyword,
+                        quickFilterTerms = backup.quickFilterTerms,
+                        modelCatalog = modelCatalog.toList(),
+                        message = "配置已导入",
+                        isMessageError = false,
+                    )
+                    _balanceUiState.value = BalanceUiState(
+                        isInitializing = false,
+                        suppliers = profiles.toList(),
+                        activeSupplierId = activeId,
+                        templates = balanceTemplates.toList(),
+                        credentials = BalanceCredentialsDraft.from(active.profile, active.balanceAccessToken),
+                        message = "配置已导入",
+                        isMessageError = false,
+                    )
+                    deleteUnusedSecrets(oldSecretIds)
+                }
+                if (!saved) throw ConfigurationBackupException("配置导入失败，当前配置未更改")
+            } finally {
+                deleteUnusedSecrets(createdSecretIds)
             }
         }
     }
@@ -3612,6 +3520,8 @@ class TesterViewModel(
     }
 
     private suspend fun installDraft(profile: SupplierProfile) {
+        supplierDraftRevision++
+        balanceCredentialsRevision++
         val credentials = loadStartupCredentials(profile)
         val globalFilters = _uiState.value
         _uiState.update {
@@ -3741,6 +3651,7 @@ class TesterViewModel(
 
     private fun updateDraft(transform: SupplierDraft.() -> SupplierDraft) {
         if (runningOrInitializing()) return
+        supplierDraftRevision++
         _uiState.update { state ->
             val draft = state.draft ?: return@update state
             state.copy(
@@ -3781,101 +3692,108 @@ class TesterViewModel(
         return withContext(Dispatchers.IO) { secretStore.get(secretId) }.orEmpty()
     }
 
-    private suspend fun persistDraft(): SupplierProfile? = credentialTransactionMutex.withLock {
+    private suspend fun persistDraft(): SupplierProfile? = configurationTransaction {
+        persistDraftLocked()
+    }
+
+    private suspend fun persistDraftLocked(): SupplierProfile? {
+        var createdSecretId: String? = null
         try {
-            val draft = _uiState.value.draft ?: return@withLock null
-            val existing = profiles.firstOrNull { it.id == draft.id } ?: return@withLock null
-            val oldSecretId = existing.apiKeySecretId
-            var createdSecretId: String? = null
+            val draft = _uiState.value.draft ?: return null
+            val existing = profiles.firstOrNull { it.id == draft.id } ?: return null
             val secretId = if (draft.apiKeyDirty) {
-                if (draft.apiKey.isBlank()) {
-                    null
-                } else {
-                    withContext(Dispatchers.IO) { secretStore.put(draft.apiKey.trim()) }
-                        .also { createdSecretId = it }
+                if (draft.apiKey.isBlank()) null else withContext(Dispatchers.IO) {
+                    // Record ownership before the cancellable return to Main.
+                    secretStore.put(draft.apiKey.trim()).also { createdSecretId = it }
                 }
             } else {
-                oldSecretId
+                existing.apiKeySecretId
             }
-            val profile = mutateProfile(draft.id) { latest ->
-                draft.toProfile(
-                    apiKeySecretId = secretId,
-                    balanceAccessTokenSecretId = latest.balanceAccessTokenSecretId,
-                    balanceUserId = latest.balanceUserId,
-                )
-            }
-            if (profile == null) {
-                createdSecretId?.let { createdId ->
-                    withContext(Dispatchers.IO) { runCatching { secretStore.delete(createdId) } }
+            val profile = draft.toProfile(
+                apiKeySecretId = secretId,
+                balanceAccessTokenSecretId = existing.balanceAccessTokenSecretId,
+                balanceUserId = existing.balanceUserId,
+            )
+            val candidate = configurationSnapshot().copy(
+                suppliers = profiles.map { if (it.id == profile.id) profile else it },
+            )
+            val saved = commitConfigurationLocked(candidate) {
+                _uiState.update { state ->
+                    val current = state.draft
+                    state.copy(
+                        draft = when {
+                            current?.id != draft.id -> current
+                            current == draft -> SupplierDraft.from(profile, draft.apiKey).copy(
+                                keyword = state.modelFilterKeyword,
+                                quickFilterTerms = state.quickFilterTerms,
+                            )
+                            else -> current.copy(
+                                apiKeySecretId = secretId,
+                                apiKeyDirty = current.apiKeyDirty && current.apiKey != draft.apiKey,
+                            )
+                        },
+                    )
                 }
-                return@withLock null
+                deleteUnusedSecrets(listOfNotNull(existing.apiKeySecretId))
             }
-            if (draft.apiKeyDirty && oldSecretId != null && oldSecretId != secretId) {
-                withContext(Dispatchers.IO) { runCatching { secretStore.delete(oldSecretId) } }
-            }
-            _uiState.update {
-                it.copy(
-                    draft = SupplierDraft.from(profile, draft.apiKey),
-                    suppliers = profiles.toList(),
-                )
-            }
-            profile
+            return profile.takeIf { saved }
         } catch (error: CancellationException) {
             throw error
         } catch (_: Throwable) {
             showMessage("供应商配置保存失败", isError = true)
-            null
+            return null
+        } finally {
+            deleteUnusedSecrets(listOfNotNull(createdSecretId))
         }
     }
 
-    private suspend fun persistGlobalModelFilters(): Boolean {
-        return saveProfiles()
+    private suspend fun persistGlobalModelFilters(): Boolean = configurationTransaction {
+        commitConfigurationLocked(configurationSnapshot())
     }
 
-    private suspend fun persistBalanceCredentials(): SupplierProfile? = credentialTransactionMutex.withLock {
+    private suspend fun persistBalanceCredentials(): SupplierProfile? = configurationTransaction {
+        persistBalanceCredentialsLocked()
+    }
+
+    private suspend fun persistBalanceCredentialsLocked(): SupplierProfile? {
+        var createdSecretId: String? = null
         try {
-            val activeId = activeSupplierId ?: return@withLock null
-            val existing = profiles.firstOrNull { it.id == activeId } ?: return@withLock null
+            val activeId = activeSupplierId ?: return null
+            val existing = profiles.firstOrNull { it.id == activeId } ?: return null
             val credentials = _balanceUiState.value.credentials
-            val oldSecretId = existing.balanceAccessTokenSecretId
-            var createdSecretId: String? = null
             val secretId = if (credentials.accessTokenDirty) {
-                if (credentials.accessToken.isBlank()) {
-                    null
-                } else {
-                    withContext(Dispatchers.IO) { secretStore.put(credentials.accessToken.trim()) }
-                        .also { createdSecretId = it }
+                if (credentials.accessToken.isBlank()) null else withContext(Dispatchers.IO) {
+                    secretStore.put(credentials.accessToken.trim()).also { createdSecretId = it }
                 }
             } else {
-                oldSecretId
+                existing.balanceAccessTokenSecretId
             }
-            val profile = mutateProfile(activeId) { latest ->
-                latest.copy(
-                    balanceAccessTokenSecretId = secretId,
-                    balanceUserId = credentials.userId.trim(),
-                )
-            }
-            if (profile == null) {
-                createdSecretId?.let { createdId ->
-                    withContext(Dispatchers.IO) { runCatching { secretStore.delete(createdId) } }
+            val profile = existing.copy(
+                balanceAccessTokenSecretId = secretId,
+                balanceUserId = credentials.userId.trim(),
+            )
+            val candidate = configurationSnapshot().copy(
+                suppliers = profiles.map { if (it.id == activeId) profile else it },
+            )
+            val saved = commitConfigurationLocked(candidate) {
+                _balanceUiState.update { state ->
+                    val current = state.credentials
+                    state.copy(
+                        credentials = if (current == credentials) {
+                            BalanceCredentialsDraft.from(profile, credentials.accessToken.trim())
+                        } else {
+                            current.copy(
+                                accessTokenSecretId = secretId,
+                                accessTokenDirty = current.accessTokenDirty &&
+                                    current.accessToken != credentials.accessToken,
+                            )
+                        },
+                        credentialErrors = BalanceCredentialsErrors(),
+                    )
                 }
-                return@withLock null
+                deleteUnusedSecrets(listOfNotNull(existing.balanceAccessTokenSecretId))
             }
-            if (credentials.accessTokenDirty && oldSecretId != null && oldSecretId != secretId) {
-                withContext(Dispatchers.IO) { runCatching { secretStore.delete(oldSecretId) } }
-            }
-            _uiState.update { it.copy(suppliers = profiles.toList()) }
-            _balanceUiState.update {
-                it.copy(
-                    credentials = BalanceCredentialsDraft.from(profile, credentials.accessToken.trim()),
-                    credentialErrors = BalanceCredentialsErrors(),
-                    // 保存成功的提示走页面层的 StatusToast（与模型测试页同一组件），
-                    // 不再经过 message/snackbar：那条黑色提示条会被还开着的弹窗压在遮罩下。
-                    message = it.message,
-                    isMessageError = it.isMessageError,
-                )
-            }
-            profile
+            return profile.takeIf { saved }
         } catch (error: CancellationException) {
             throw error
         } catch (_: Throwable) {
@@ -3886,99 +3804,107 @@ class TesterViewModel(
                     isMessageError = true,
                 )
             }
-            null
+            return null
+        } finally {
+            deleteUnusedSecrets(listOfNotNull(createdSecretId))
         }
     }
 
     private suspend fun mutateProfile(
         supplierId: String,
         transform: (SupplierProfile) -> SupplierProfile,
-    ): SupplierProfile? = profileMutationMutex.withLock {
-        val index = profiles.indexOfFirst { it.id == supplierId }
-        if (index < 0) return@withLock null
-        val previous = profiles[index]
+    ): SupplierProfile? = configurationTransaction {
+        val previous = profiles.firstOrNull { it.id == supplierId } ?: return@configurationTransaction null
         val profile = transform(previous)
-        profiles[index] = profile
-        if (saveProfiles()) return@withLock profile
-        profiles[index] = previous
-        null
-    }
-
-    private suspend fun saveProfiles(
-        invalidatedBalanceSupplierIds: Set<String> = emptySet(),
-    ): Boolean {
-        // 写失败不再把状态锁在「半改」上：调用方拿到 false 会立刻回滚 profiles，而回滚与这次
-        // 写读到的列表是同一份。重试放在锁外、只发一次，是为了让「界面回滚」与「磁盘最终收敛
-        // 到用户要的顺序」各归各的：调用方照旧按失败处理，存储在下一次落盘窗口里追上。
-        configurationWriteMutex.withLock {
-            if (writeProfiles(invalidatedBalanceSupplierIds)) return true
-        }
-        // 走到这里说明是真正的写错误（取消会直接抛出）。
-        viewModelScope.launch {
-            configurationWriteMutex.withLock { writeProfiles(invalidatedBalanceSupplierIds) }
-        }
-        return false
-    }
-
-    /**
-     * One attempt at the configuration write. Caller holds [configurationWriteMutex]: the
-     * state is sampled under the lock so a queued save cannot read a half-applied mutation.
-     */
-    private suspend fun writeProfiles(invalidatedBalanceSupplierIds: Set<String>): Boolean {
-        val stateToSave = SupplierStoreState(
-            suppliers = profiles.toList(),
-            activeSupplierId = activeSupplierId,
-            balanceTemplates = balanceTemplates.toList(),
-            modelCatalog = modelCatalog.toList(),
-            balanceSnapshots = _balanceUiState.value.balanceSnapshots - invalidatedBalanceSupplierIds,
-            modelFilterKeyword = _uiState.value.modelFilterKeyword,
-            quickFilterTerms = _uiState.value.quickFilterTerms,
+        val candidate = configurationSnapshot().copy(
+            suppliers = profiles.map { if (it.id == supplierId) profile else it },
         )
-        try {
-            withContext(Dispatchers.IO) { supplierStore.save(stateToSave) }
-        } catch (error: CancellationException) {
-            throw error
-        } catch (_: Throwable) {
-            // Keep the caller's pre-save state intact. A failed configuration
-            // write must not make the UI claim a durable edit or invalidate an
-            // older secret reference.
+        profile.takeIf { commitConfigurationLocked(candidate) }
+    }
+
+    private suspend fun <T> configurationTransaction(block: suspend () -> T): T =
+        configurationWriteMutex.withLock {
+            currentCoroutineContext().ensureActive()
+            val result = block()
+            currentCoroutineContext().ensureActive()
+            result
+        }
+
+    private fun configurationSnapshot() = SupplierStoreState(
+        suppliers = profiles.toList(),
+        activeSupplierId = activeSupplierId,
+        balanceTemplates = balanceTemplates.toList(),
+        modelCatalog = modelCatalog.toList(),
+        balanceSnapshots = _balanceUiState.value.balanceSnapshots,
+        modelFilterKeyword = _uiState.value.modelFilterKeyword,
+        quickFilterTerms = _uiState.value.quickFilterTerms,
+    )
+
+    /** Caller holds the transaction lock; only a durable candidate becomes shared state. */
+    private suspend fun commitConfigurationLocked(
+        candidate: SupplierStoreState,
+        invalidatedBalanceSupplierIds: Set<String> = emptySet(),
+        attempts: Int = 2,
+        onFailure: () -> Unit = {
             showMessage("本地配置保存失败，请检查存储空间", isError = true)
             showBalanceMessage("本地配置保存失败，请检查存储空间", isError = true)
-            return false
+        },
+        afterCommit: suspend () -> Unit = {},
+    ): Boolean {
+        currentCoroutineContext().ensureActive()
+        val stateToSave = candidate.copy(
+            balanceSnapshots = candidate.balanceSnapshots - invalidatedBalanceSupplierIds,
+        )
+        // Cancellation may not separate a successful disk commit from its references/cleanup.
+        return withContext(NonCancellable) {
+            repeat(attempts) {
+                val saved = try {
+                    withContext(Dispatchers.IO) { supplierStore.save(stateToSave) }
+                    true
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (_: Throwable) {
+                    false
+                }
+                if (saved) {
+                    profiles = stateToSave.suppliers.toMutableList()
+                    activeSupplierId = stateToSave.activeSupplierId
+                    balanceTemplates = stateToSave.balanceTemplates.toMutableList()
+                    modelCatalog = stateToSave.modelCatalog.toMutableList()
+                    _uiState.update { state ->
+                        state.copy(suppliers = profiles.toList(), modelCatalog = modelCatalog.toList())
+                    }
+                    _balanceUiState.update { state ->
+                        state.copy(balanceSnapshots = state.balanceSnapshots - invalidatedBalanceSupplierIds)
+                    }
+                    publishBalanceState()
+                    afterCommit()
+                    return@withContext true
+                }
+            }
+            onFailure()
+            false
         }
-        // Publish invalidation while the lock is still held so queued saves sample the new state.
-        _balanceUiState.update { state ->
-            state.copy(balanceSnapshots = state.balanceSnapshots - invalidatedBalanceSupplierIds)
-        }
-        publishBalanceState()
-        return true
     }
 
-    /**
-     * Stores successful balance responses independently from credentials. This
-     * runs after the UI update so a storage failure never hides a fresh result.
-     */
-    private suspend fun persistBalanceSnapshots(): Boolean {
-        return configurationWriteMutex.withLock {
-            val stateToSave = SupplierStoreState(
-                suppliers = profiles.toList(),
-                activeSupplierId = activeSupplierId,
-                balanceTemplates = balanceTemplates.toList(),
-                modelCatalog = modelCatalog.toList(),
-                balanceSnapshots = _balanceUiState.value.balanceSnapshots,
-                modelFilterKeyword = _uiState.value.modelFilterKeyword,
-                quickFilterTerms = _uiState.value.quickFilterTerms,
-            )
-            try {
-                withContext(Dispatchers.IO) { supplierStore.save(stateToSave) }
-                true
-            } catch (error: CancellationException) {
-                throw error
-            } catch (_: Throwable) {
-                showBalanceMessage("余额已更新，但本地结果未能保存", isError = true)
-                false
-            }
+    /** Only unreachable records may be removed, including after a cancelled preparation. */
+    private suspend fun deleteUnusedSecrets(secretIds: Collection<String>) {
+        if (secretIds.isEmpty()) return
+        val referenced = profiles.flatMap { listOfNotNull(it.apiKeySecretId, it.balanceAccessTokenSecretId) }.toSet()
+        val unused = secretIds.distinct().filterNot { it in referenced }
+        if (unused.isEmpty()) return
+        withContext(NonCancellable + Dispatchers.IO) {
+            unused.forEach { secretId -> runCatching { secretStore.delete(secretId) } }
         }
+    }
+
+    /** A storage failure must not hide a freshly received balance from the UI. */
+    private suspend fun persistBalanceSnapshots(): Boolean = configurationTransaction {
+        commitConfigurationLocked(
+            configurationSnapshot(),
+            attempts = 1,
+            onFailure = { showBalanceMessage("余额已更新，但本地结果未能保存", isError = true) },
+        )
     }
 
     private fun publishBalanceState(isInitializing: Boolean = _balanceUiState.value.isInitializing) {

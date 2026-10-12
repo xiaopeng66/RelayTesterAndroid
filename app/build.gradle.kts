@@ -39,10 +39,9 @@ android {
             storeFile = rootProject.file("keystore-relay-tester-release.p12")
             storeType = "PKCS12"
             keyAlias = "relaytester"
-            // v2 is what installs; v3 is the one that carries a key-rotation lineage. Signing
-            // with v3 now means that if this key is ever lost, a new key can be introduced as
-            // an update (with a proof-of-rotation lineage) instead of making every user
-            // uninstall — Android 9+ honours it. Costs nothing today.
+            // v3 supports a proof-of-rotation lineage on Android 9+. Creating that lineage
+            // still requires the old private key: it enables planned rotation, not recovery
+            // after the signing key or its password has been lost.
             enableV3Signing = true
             storePassword = project.secret("relaytester.storePassword")
             // PKCS12 uses one password for the store and the key; the separate property stays
@@ -303,8 +302,11 @@ android {
         // 与混合权重一并移植，包格式升为 LMFPA004 并写入上游 schema 名；003/002 旧包仍按各自公式
         // 照常评分，而 schema 比本版新的包会明确拒绝安装（否则「看起来在工作」恰恰是最坏的结果）。
         // 检测包发布侧 minAppVersionCode 相应提到 10801。
-        versionCode = 10_801
-        versionName = "1.8.1"
+        // 1.8.2：配置候选在提交后才发布，凭据清理与提交保持一致，保存和撤销都保留后续输入；
+        // 收紧检测包分配与数值校验、错误信息脱敏及预览 CSP，发布中断恢复不得回退更新源；
+        // 检测包保持现有格式与 10801 兼容门槛。
+        versionCode = 10_802
+        versionName = "1.8.2"
         ndk {
             // arm64 only: the published update ships one APK, and every device the app is
             // meant for is arm64. The 32-bit and x86 ABIs would each add a copy of the two
@@ -383,6 +385,7 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
     testImplementation("org.json:json:20240303")
+    testImplementation("org.jsoup:jsoup:1.23.2")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

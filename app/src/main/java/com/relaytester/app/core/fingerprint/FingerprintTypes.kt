@@ -285,7 +285,9 @@ internal class QuantizedReferences(
     /** Distance from [vector] to [row], clamped at zero exactly as upstream does. */
     fun squaredDistance(vector: DoubleArray, row: Int, vectorNorm: Double): Double {
         val distance = vectorNorm + rowNorms[row] - 2.0 * dot(vector, row)
-        return if (distance > 0.0) distance else 0.0
+        // Match Math.max(0, distance): preserve NaN so the ranker's finite gate
+        // rejects it instead of mistaking an invalid vector for a perfect match.
+        return kotlin.math.max(0.0, distance)
     }
 }
 

@@ -398,6 +398,10 @@ class FingerprintBankStore(
     /** Adopts the rollback copy, reporting [reason]; false when there is no usable one. */
     private fun adoptBackup(reason: String): Boolean {
         val fallback = try {
+            // The fallback has the same pre-read ceiling as the primary. Checking only
+            // after readBytes() would already have materialised an oversized restore.
+            val length = files.backupLength() ?: return false
+            if (length > maxInstalledBytes) return false
             files.readBackup()
         } catch (error: IOException) {
             null
