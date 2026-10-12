@@ -18,6 +18,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
@@ -39,6 +40,7 @@ private class RecordingStore : SupplierStore(
 private class RecordingApi : RelayApi() {
     val active = AtomicInteger()
     val peak = AtomicInteger()
+    val calls = AtomicInteger()
 
     override suspend fun test(
         profile: SupplierProfile,
@@ -48,6 +50,7 @@ private class RecordingApi : RelayApi() {
         maxTokens: Int,
         timeoutSeconds: Int,
     ): ModelTestResult {
+        calls.incrementAndGet()
         val current = active.incrementAndGet()
         current.let { peak.updateAndGet { maxOf(it, current) } }
         kotlinx.coroutines.delay(25)
@@ -138,6 +141,85 @@ class UnifiedCatalogConcurrencyTest {
         assertTrue(subject.uiState.value.unifiedResults.all { it.result.status == TestStatus.SUCCESS })
         assertTrue(api.peak.get() >= 2)
         assertFalse(subject.uiState.value.isUnifiedTesting)
+    }
+
+    @Test
+    fun `an advanced source test starts while a normal run is in flight`() {
+        // 本轮要求：高级测试可自由测试，不再因为普通模型测试在跑而被无声拒绝。以前
+        // startUnifiedCatalogTests 把 isRunning 当门槛，界面上按钮可点、点下去什么都不发生。
+        val api = RecordingApi()
+        val subject = subjectWithOneSource(api)
+        setRunningForTest(subject)
+
+        subject.startUnifiedCatalogSourceTest("parallel", ModelSource("supplier-1", "model-a"))
+        runBlocking {
+            var waited = 0L
+            while (subject.uiState.value.unifiedTestingKeys.isNotEmpty() && waited < 5_000) {
+                kotlinx.coroutines.delay(10)
+                waited += 10
+            }
+        }
+
+        assertEquals("普通测试在跑时高级来源测试也必须发出请求", 1, api.calls.get())
+        assertEquals(
+            "结果必须落在自己的键上",
+            1,
+            subject.uiState.value.unifiedResults.size,
+        )
+    }
+
+    @Test
+    fun `an advanced source test still refuses a testing-disabled supplier`() {
+        val api = RecordingApi()
+        val subject = subjectWithOneSource(api, testingDisabled = true)
+
+        subject.startUnifiedCatalogSourceTest("parallel", ModelSource("supplier-1", "model-a"))
+        runBlocking { kotlinx.coroutines.delay(200) }
+
+        assertEquals("禁止测试的供应商不得发出请求", 0, api.calls.get())
+        assertEquals(
+            "它应被标为跳过而不是失败",
+            TestStatus.SKIPPED,
+            subject.uiState.value.unifiedResults.single().result.status,
+        )
+    }
+
+    private fun subjectWithOneSource(
+        api: RelayApi,
+        testingDisabled: Boolean = false,
+    ): TesterViewModel {
+        val subject = TesterViewModel(
+            supplierStore = RecordingStore(),
+            secretStore = object : SecretStore {
+                override fun put(value: String) = "secret-test"
+                override fun get(secretId: String): String = "api-key"
+                override fun delete(secretId: String) = Unit
+            },
+            relayApiFactory = { api },
+            balanceApiFactory = { BalanceApi() },
+            skipRestore = true,
+        )
+        val source = ModelSource("supplier-1", "model-a")
+        val entry = ModelCatalogEntry(id = "parallel", name = "parallel", sources = listOf(source))
+        val profile = SupplierProfile.empty(1).copy(
+            id = "supplier-1",
+            name = "supplier-1",
+            apiKeySecretId = "api-secret",
+            models = listOf("model-a"),
+            isTestingDisabled = testingDisabled,
+        )
+        setInternalCatalogForTest(subject, entry)
+        setInternalProfilesForTest(subject, profile)
+        setUiStateForTest(subject, listOf(entry), listOf(profile))
+        return subject
+    }
+
+    private fun setRunningForTest(subject: TesterViewModel) {
+        val field = TesterViewModel::class.java.getDeclaredField("_uiState")
+        field.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val state = field.get(subject) as MutableStateFlow<TesterUiState>
+        state.value = state.value.copy(isRunning = true)
     }
 
     @Suppress("UNCHECKED_CAST")

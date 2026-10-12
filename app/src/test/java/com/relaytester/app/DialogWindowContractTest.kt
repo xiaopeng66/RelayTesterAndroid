@@ -2,6 +2,7 @@ package com.relaytester.app
 
 import java.io.File
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -235,7 +236,7 @@ class DialogWindowContractTest {
         )
         assertTrue(
             "落格函数没有减掉列表顶边与上内边距：同一根手指在不同滚动位置上会算出不同的格子",
-            "fingerRootY - listTopInRoot + viewportStartOffset" in text,
+            "- listTopInRoot + viewportStartOffset" in text,
         )
         assertTrue(
             "没有用四舍五入落格：半格处不换位，拖到两行之间时换位会迟一格",
@@ -249,6 +250,30 @@ class DialogWindowContractTest {
             "格子间距没有量自列表布局（相邻行的 offset 之差）：行距一改换算就失准",
             "visible[1].offset - visible[0].offset" in text,
         )
+        // ⑤ 列表要跟着手指沿边缘滚（用户 1.7.17：拖到顶/底时列表不跟手、手指越出可见窗口
+        //    就断了；与边缘那一格换位是闪切）。三件事缺一不可：指尖夹进视口、按实际消费量
+        //    逐帧滚、把滚过的位移补进判定。
+        assertTrue(
+            "指尖没有夹进视口：越出边缘的手指会被算成列表中很远的一格（甚至直接末格），" +
+                "被拖的行一步跳出去、出了组合，手势当场取消",
+            "fingerRootY.coerceIn(" in text,
+        )
+        assertTrue(
+            "边缘滚动的方向与速度没有走那个纯函数：逐帧速度在设备上量不出来",
+            "supplierAutoScrollStep(" in text,
+        )
+        assertTrue(
+            "自动滚动没有逐帧步进：一次跳一屏会连着跳过好几格，换位就成了闪切",
+            "withFrameNanos {" in text,
+        )
+        assertTrue(
+            "自动滚动没有按实际消费量累计：滚不动时（到顶/到底）还在长，判定会一直往前跑",
+            "listState.scroll { consumed = scrollBy(step) }" in text,
+        )
+        assertTrue(
+            "自动滚过的位移没有补进判定：内容从手指底下滑过去，指尖底下的格子必须跟着前进",
+            "+ autoScrolledPx" in text,
+        )
         // ④ 判定用的那一帧在手指按下时采一次，整次拖动不再重读（设备实测的第二类缺陷：
         //    被拖的行如果是列表第一可见那行，换位会让列表跟着滚一格，逐帧重读就把这次滚动
         //    算成指尖的位移——手指只走一格、判定说走两格，行越拖越跑）。
@@ -257,14 +282,102 @@ class DialogWindowContractTest {
                 "算进指尖位移，手指走一格、判定说走两格",
             "dragFrame = currentSupplierDragFrame(" in text,
         )
+        // ⑥ 设备实测抓到的第三类缺陷（修复途中又抓到第四类）：第三类＝停在边缘不动时没有
+        //    MOVE 事件，只认 onDragAt 的判定永远不重跑——列表在自动滚动，被拖行的落点却停在
+        //    起拖时那一格（实测滚了 5 行，行落在了起拖时底边那一格上）。修法＝逐帧循环里每
+        //    滚过一帧就用同一份 judgeSlot 重新落格，手势与循环共用这一份判定。
         assertTrue(
-            "判定没有用按下时采的那一帧：布局一变，同一根手指就算出不同的格子",
-            "val frame = dragFrame ?: return@SupplierOrderRow" in text,
+            "自动滚动滚过的帧没有重新落格：手指停在边缘时没有 MOVE 事件，只认 onDragAt 的" +
+                "判定永远不会重跑，列表滚了、落点不动",
+            "judgeSlot(pointerRootY)?.let { onMove(draggedId, it) }" in text,
+        )
+        // ④ 的姊妹缺陷（设备实测：拖到底边按住，第一次换位后拖动当场断，行不再高亮）：
+        //    换位会让列表的滚动锚点跟着挪一格。旧修法用 scrollToItem+scrollBy 把窗口「滚回」
+        //    按下时的位置——它参与滚动互斥，会取消逐帧循环正在进行的那次滚动（循环整个死掉）；
+        //    两次调用之间还可能渲染一帧按下时的窗口，被拖行那时已经前进到视口之外，行被裁出
+        //    组合，长按手势当场取消——「在边界处停留并取消选中态」正是它。修法＝每帧用
+        //    requestScrollToItem 把窗口「请求」成按下那一格 + 自动滚过的距离：不参与互斥、
+        //    不打断滚动、只在下一次测量生效，换位落地的测量消费到的永远是正确窗口。
+        assertTrue(
+            "换位后的窗口恢复没有用请求式钉窗（requestScrollToItem）：scrollToItem 会跟" +
+                "逐帧循环抢滚动锁互相取消，中间态那一帧还会把已移出视口的被拖行裁掉、断掉手势",
+            "listState.requestScrollToItem(index, offset.roundToInt())" in text,
         )
         assertTrue(
-            "拖动期间没有把窗口钉回按下时的位置：被拖的是第一可见行时，窗口会跟着换位往下滚，" +
-                "行被钉在原地不跟手",
-            "scrollToItem(frame.scrollIndex, frame.scrollOffset)" in text,
+            "钉窗目标没有折算「按下那一格 + 自动滚过的像素」：换位附带的滚动会留下来，" +
+                "行不跟手",
+            "frame.scrollIndex * frame.pitch + frame.scrollOffset + autoScrollPx" in text,
+        )
+        assertTrue(
+            "钉窗目标没有夹住可滚下限：目标折出的行号是负的（-1），请求无效，换位落地的" +
+                "那次测量没人挡着，锚点跟随会把被拖行拽出视口、断掉手势（设备实测）",
+            ".coerceAtLeast(frame.viewportStartOffset.toFloat())" in text,
+        )
+        assertTrue(
+            "拖动事件里的换位没有当场钉窗：换位的数据在事件线程落地，下一次测量就是它——" +
+                "只靠下一帧的逐帧钉窗，锚点跟随会在中间那一帧把被拖行拽出视口（用户看到的" +
+                "就是与边缘换位时的「闪切」）",
+            Regex("""judgeSlot\(fingerRootY\)\?\.let \{\s*onMove\(movedId, it\)\s*pinWindow\(\)""")
+                .containsMatchIn(text),
+        )
+        assertTrue(
+            "钉窗没有每帧重发：换位的数据晚一帧落地时，落地的测量消费不到请求，" +
+                "锚点跟随会把窗口又拽偏一格",
+            Regex("""(?s)LaunchedEffect\(draggingId\) \{.*?pinWindow\(\)\n        \}\n    \}""")
+                .containsMatchIn(text),
+        )
+    }
+
+    @Test
+    fun `the animation toolbar is four bare icon buttons and no button keeps a press ghost`() {
+        // 用户 1.7.17 的要求：动画面板底部左边四个按钮不写文字、去掉外边框、只留图标，
+        // 重新排大小与间隔；而且「所有按钮不需要选中的虚影，包括其他地方的按钮」——
+        // 按下时那层涟漪／状态层留下的半透明色，看着像选中态却又不代表任何状态。
+        //
+        // 渲染在 JVM 里量不到，能钉住的是源码里的三件事：按钮换成了 QuietIconButton
+        // （现成的无涟漪件）、按钮里不再画 Text、以及主题层把涟漪的两个开关一起关了。
+        val panel = code(File(sourceRoot, "com/relaytester/app/feature/fingerprint/AnimationPanel.kt"))
+        assertTrue("找不到 AnimationPanel.kt", panel.isNotEmpty())
+        val button = Regex("(?s)private fun AnimationActionButton\\((.*?)\\n}")
+            .find(panel)?.groupValues?.get(1)
+        assertNotNull("四个次要动作按钮的构造函数不在了", button)
+        assertTrue(
+            "动作按钮又画上文字了：四个按钮只留图标，文案只作为无障碍名（读屏照旧念得出）",
+            "Text(" !in button!!,
+        )
+        assertTrue(
+            "动作按钮没有用无涟漪的 QuietIconButton：按下会留下一层「虚影」",
+            "QuietIconButton(" in button,
+        )
+        assertTrue(
+            "图标没有把动作名当作无障碍标签：读屏会念成四个一模一样的匿名按钮",
+            "contentDescription = label" in button,
+        )
+        assertTrue(
+            "图标尺寸没有固定：方按钮里的图标要自己的尺寸，不随字体重排",
+            "SECONDARY_ACTION_ICON_SIZE" in panel,
+        )
+        assertTrue(
+            "四个方按钮没有固定等边边长：weight 分配出的宽度会随布局变化，四个按钮会被拉成大小不一的大方格",
+            "Modifier.size(SECONDARY_ACTION_SIZE)" in panel,
+        )
+        assertTrue(
+            "四个方按钮的边长常量不在了",
+            "SECONDARY_ACTION_SIZE = 44.dp" in panel,
+        )
+        assertFalse(
+            "「按宽度藏图标、缩字号」的老取舍逻辑又回来了：没有文案可切，这套规则不该复活",
+            "secondaryActionFit" in panel,
+        )
+        val theme = code(File(sourceRoot, "com/relaytester/app/ui/theme/Theme.kt"))
+        assertTrue("找不到 Theme.kt", theme.isNotEmpty())
+        assertTrue(
+            "主题层没有关掉 M3 组件的涟漪：按钮按下时的「虚影」会在所有页面复活",
+            "LocalRippleConfiguration provides null" in theme,
+        )
+        assertTrue(
+            "主题层没有关掉自绘 clickable 的默认涟漪：自绘按钮仍会留下「虚影」",
+            "LocalIndication provides NoPressGhostIndication" in theme,
         )
     }
 
@@ -503,6 +616,318 @@ class DialogWindowContractTest {
         assertTrue(
             "编辑器与页面同时托管同一个宿主：同一条消息会被渲染两次",
             "if (!editorOpen) {" in balance,
+        )
+    }
+
+    @Test
+    fun `the animation panel is a card, not a full-bleed sheet`() {
+        // 动画面板原来是一张铺满窗口的 surface：没有卡片边缘，也没有圆角，读起来像换了个
+        // 页面而不是弹了个框。合同＝它和其它弹窗同一形状：屏宽 94% 的圆角卡片，高度随内容
+        // 收缩但落在上下限之间（上限 0.9 屏高，与「关于与更新」同一条）。
+        val file = File(
+            sourceRoot,
+            "com/relaytester/app/feature/fingerprint/AnimationPanel.kt",
+        )
+        assertTrue("找不到 AnimationPanel.kt：${file.absolutePath}", file.isFile)
+        val text = code(file)
+        assertTrue(
+            "动画面板不再按屏宽 94% 收窄：又变成铺满窗口了",
+            "fillMaxWidth(ANIMATION_CARD_WIDTH_FRACTION)" in text,
+        )
+        assertTrue(
+            "动画面板的宽度比例不是 0.94",
+            "ANIMATION_CARD_WIDTH_FRACTION = 0.94f" in text,
+        )
+        assertTrue(
+            "动画面板没有高度上下限：收起提示词时会留一张空卡片，或者内容把按钮顶出屏幕",
+            Regex("""heightIn\(\s*min = screenHeight \* ANIMATION_CARD_MIN_HEIGHT_FRACTION,\s*max = screenHeight \* ANIMATION_CARD_MAX_HEIGHT_FRACTION,""")
+                .containsMatchIn(text),
+        )
+        assertTrue(
+            "动画面板的高度上限不再是 0.9 屏高（与其它弹窗不一致）",
+            "ANIMATION_CARD_MAX_HEIGHT_FRACTION = 0.9f" in text,
+        )
+        assertTrue(
+            "动画面板不再铺满窗口时忘了圆角：卡片边缘看不出来",
+            "shape = MaterialTheme.shapes.extraLarge" in text,
+        )
+    }
+
+    @Test
+    fun `the animation panel's prompt box collapses on request`() {
+        // 长提示词加结果区在任何字号下都塞不进一张卡片；提示词框收起是给结果腾地方的手段。
+        // 合同＝收起入口存在、状态是 saveable 的（旋转不丢），且收起态真的只有一行高。
+        val file = File(
+            sourceRoot,
+            "com/relaytester/app/feature/fingerprint/AnimationPanel.kt",
+        )
+        val text = code(file)
+        // 收起状态必须跟着当前展示的那一条记录走：卡片现在是两层弹窗，详情那一层的参数
+        // 就是那条记录本身，键还写成常量的话，换一条记录时收起状态会串到上一条上（或者
+        // 旋转移位后无法还原到它真正属于哪条记录）。键必须提到 sessionId，写法不限。
+        val promptKey = Regex(
+            """var promptExpanded by rememberSaveable\(([^)]*)\)""",
+        ).find(text)?.groupValues?.get(1)
+        assertNotNull(
+            "提示词框没有收起状态（旋转会丢）",
+            promptKey,
+        )
+        assertTrue(
+            "提示词框的收起状态没有按记录分开：换一条记录会串到上一条上（键实际是「$promptKey」）",
+            "sessionId" in promptKey!!,
+        )
+        assertTrue(
+            "提示词区没有收起/展开入口",
+            "onToggleExpanded" in text,
+        )
+        assertTrue(
+            "收起态的提示词框没有收成一行",
+            Regex("""min = PROMPT_COLLAPSED_HEIGHT, max = PROMPT_COLLAPSED_HEIGHT""")
+                .containsMatchIn(text),
+        )
+        // 收起态必须真的收成单行：多行框即使压到 56dp 也还是多行控件，光标会跳行。
+        assertTrue(
+            "收起态的提示词框还在按多行渲染",
+            "singleLine = !expanded" in text,
+        )
+        // 默认收起：面板打开时用户要看的是生成过程与结果，不是那段固定模板。
+        val defaultState = Regex(
+            """var promptExpanded by rememberSaveable\([^)]*\) \{ mutableStateOf\((\w+)\) \}""",
+        ).find(text)?.groupValues?.get(1)
+        assertEquals(
+            "提示词又默认展开了：打开面板先占掉半屏给一段不用改的模板",
+            "false",
+            defaultState,
+        )
+    }
+
+    @Test
+    fun `the generation shows the document instead of a bare spinner`() {
+        // 生成过程要可视化：一段大文档在写的时候，只给一个转圈等于什么都不说。合同＝
+        // 生成中有专门的一段显示正在写入的文本，且完成/失败后这一段必须让位。
+        val file = File(
+            sourceRoot,
+            "com/relaytester/app/feature/fingerprint/AnimationPanel.kt",
+        )
+        val text = code(file)
+        assertTrue(
+            "生成中不再显示正在写入的文档",
+            "AnimationStreamingSection(" in text,
+        )
+        assertTrue(
+            "生成中与结果区没有互斥：两者会同时出现，动画画完也顶不掉生成过程",
+            "if (session.phase == AnimationPhase.GENERATING) {" in text,
+        )
+        assertTrue(
+            "生成视图不读 streamingText：显示的还是写死的内容",
+            "session.streamingText" in text,
+        )
+    }
+
+    @Test
+    fun `the animation test opens on its list, and a record is what opens the detail`() {
+        // 入口点进去必须先看到「选模型 + 测试记录」，点进某一条才是测试界面：这两件事原来
+        // 挤在同一张卡片里靠选中态切换，于是入口会直接落到上次看了一半的那条记录上。合同＝
+        // 两个各管一件事的弹窗，列表那一层有选模型与记录列表，详情那一层有提示词与操作栏。
+        val file = File(
+            sourceRoot,
+            "com/relaytester/app/feature/fingerprint/AnimationPanel.kt",
+        )
+        val text = code(file)
+        val rawDialogs = Regex("(?m)^\\s*Dialog\\(").findAll(text).count()
+        assertEquals(
+            "动画测试不再是两层弹窗：入口要么直接弹进某条记录的详情，要么列表与详情又挤在一层里",
+            2,
+            rawDialogs,
+        )
+        val list = Regex("(?s)private fun AnimationTestListDialog\\((.*?)\n\\}\n")
+            .find(text)?.groupValues?.get(1)
+        assertNotNull("找不到列表那一层的实现", list)
+        assertTrue(
+            "列表那一层没有选供应商/模型与开始生成",
+            "AnimationSetupSection(" in list!!,
+        )
+        assertTrue(
+            "列表那一层没有测试记录列表：点进去看进度之后就回不到列表了",
+            "AnimationSessionList(" in list,
+        )
+        assertTrue(
+            "列表那一层混进了单条记录的东西：它只负责选模型与列记录",
+            "AnimationActionBar(" !in list && "AnimationPromptSection(" !in list,
+        )
+        val detail = Regex("(?s)private fun AnimationTestDetailDialog\\((.*?)\n\\}\n")
+            .find(text)?.groupValues?.get(1)
+        assertNotNull("找不到详情那一层的实现", detail)
+        assertTrue(
+            "详情那一层没有提示词与操作栏：测试界面缺了它自己的两部分",
+            "AnimationPromptSection(" in detail!! && "AnimationActionBar(" in detail,
+        )
+        assertTrue(
+            "详情那一层混进了选模型与记录列表：它只负责一条记录",
+            "AnimationSetupSection(" !in detail && "AnimationSessionList(" !in detail,
+        )
+        // 一次只弹一层：两层同开会让返回落到一个不存在的中间态。
+        assertTrue(
+            "两层弹窗不是互斥的：会同时画在屏幕上",
+            Regex("(?s)if \\(selected == null\\) \\{\\s*AnimationTestListDialog\\(").containsMatchIn(text) &&
+                Regex("(?s)\\} else \\{\\s*AnimationTestDetailDialog\\(").containsMatchIn(text),
+        )
+        // 入口必须落在列表那一层，否则这条合同只在「上次没看记录」时成立。
+        val vm = File(
+            sourceRoot,
+            "com/relaytester/app/feature/fingerprint/FingerprintViewModel.kt",
+        )
+        val open = Regex("(?s)fun openAnimationPanel\\(\\) \\{(.*?)\\n    \\}").find(code(vm))
+            ?.groupValues?.get(1)
+        assertNotNull("找不到 openAnimationPanel 的实现", open)
+        assertTrue(
+            "入口打开时没有清掉上次选中的记录：点入口会直接弹进那条记录的详情",
+            "selectedSessionId = null" in open!!,
+        )
+    }
+
+    @Test
+    fun `the animation entry sits next to the advanced test button`() {
+        // 入口原先挤在指纹页模型名那一行上，用纯文字避开边框与涟漪。现在它搬到了模型测试
+        // 页的「高级测试」旁边，和后者同规格：一个标准描边按钮。合同＝入口在 TesterScreen
+        // 里、是 OutlinedButton、与高级测试并排，且生成中时按钮上有角标——否则用户以为
+        // 卡片一关测试就没了。
+        val fingerprint = File(
+            sourceRoot,
+            "com/relaytester/app/feature/fingerprint/FingerprintScreen.kt",
+        )
+        assertTrue(
+            "动画测试入口还留在指纹页：模型卡那一行又会被挤出一个按钮",
+            "AnimationTestButton" !in code(fingerprint) &&
+                "onOpenAnimationTest" !in code(fingerprint),
+        )
+
+        val tester = File(
+            sourceRoot,
+            "com/relaytester/app/feature/tester/TesterScreen.kt",
+        )
+        val text = code(tester)
+        val block = Regex(
+            "(?s)private fun AnimationTestEntry\\(generating: Boolean, onClick: \\(\\) -> Unit\\) \\{(.*?)\\n\\}",
+        ).find(text)?.groupValues?.get(1)
+        assertNotNull("找不到 AnimationTestEntry 的实现", block)
+        assertTrue(
+            "动画测试入口不是与高级测试同规格的描边按钮",
+            "OutlinedButton(" in block!!,
+        )
+        assertTrue(
+            "入口丢了触摸高度下限：大字号下点不中",
+            "heightIn(" in block,
+        )
+        assertTrue(
+            "入口没有进行中角标：关掉卡片后看不出还有测试在跑",
+            "generating" in block && "CircleShape" in text,
+        )
+        // 两个入口必须在同一处渲染，否则「并排」这条合同是假的。
+        val header = Regex("(?s)private fun TestSettingsCard\\((.*?)\n\\}").find(text)
+            ?.groupValues?.get(1)
+        assertNotNull("找不到 TestSettingsCard 的实现", header)
+        assertTrue(
+            "动画测试入口没有与高级测试并排渲染",
+            "AnimationTestEntry(" in header!! && "AdvancedCatalogButton(" in header,
+        )
+    }
+
+    @Test
+    fun `closing the animation card keeps the test running`() {
+        // 卡片从「一关就整个会话没了」改成了列表：关掉卡片只是收起界面，进行中的生成必须
+        // 继续跑，用户才能再点进来接着看。这条合同守卫的正是那个改动。
+        val panel = File(
+            sourceRoot,
+            "com/relaytester/app/feature/fingerprint/AnimationPanel.kt",
+        )
+        val text = code(panel)
+        assertTrue(
+            "卡片不再有列表视图：关掉卡片后没有地方能重新看到进行中的测试",
+            "AnimationSessionList(" in text,
+        )
+        assertTrue(
+            "卡片不能从详情返回列表：点进去看进度之后就再也回不到列表了",
+            "onOpenSession" in text && "ArrowBack" in text,
+        )
+        val vm = File(
+            sourceRoot,
+            "com/relaytester/app/feature/fingerprint/FingerprintViewModel.kt",
+        )
+        val vmText = code(vm)
+        val close = Regex("(?s)fun closeAnimationPanel\\(\\) \\{(.*?)\\n    \\}").find(vmText)
+            ?.groupValues?.get(1)
+        assertNotNull("找不到 closeAnimationPanel 的实现", close)
+        assertTrue(
+            "关掉卡片时不再只是收起界面：它又去动了会话，进行中的测试会被掐掉",
+            "panelOpen = false" in close!! && "cancel" !in close,
+        )
+    }
+
+    @Test
+    fun `the model list is filtered by one field, and it exists even with no catalogue`() {
+        // 两件事都只有源码能钉：
+        // 1. 曾经同时存在两个筛选词（页面级 + 弹窗级），弹窗里的列表是两者交集，而页面上那个
+        //    在模态弹窗背后根本改不到——列表被一个看不见的词筛窄了。合同＝弹窗的筛选只认传入的
+        //    那一份状态，不再自带一个 rememberSaveable 的 query。
+        // 2. 目录为空时的提示写着「可直接输入模型名」，而输入框当时被 else 分支挡在外面，那句话
+        //    自相矛盾。合同＝输入框无条件渲染。
+        val screen = File(
+            sourceRoot,
+            "com/relaytester/app/feature/fingerprint/FingerprintScreen.kt",
+        )
+        val text = code(screen)
+        val picker = Regex(
+            "(?s)private fun ModelPicker\\((.*?)\\n\\}\\n",
+        ).find(text)?.groupValues?.get(1)
+        assertNotNull("找不到 ModelPicker 的实现", picker)
+        val dialog = Regex(
+            "(?s)private fun ModelListDialog\\((.*?)\\n\\}\\n",
+        ).find(text)?.groupValues?.get(1)
+        assertNotNull("找不到 ModelListDialog 的实现", dialog)
+
+        assertTrue(
+            "页面这一层又出现了筛选输入：屏幕上会有两个筛选词，其中一个藏在弹窗背后改不到",
+            "OutlinedTextField(" !in picker!! && "onFilterChange" in picker,
+        )
+        assertTrue(
+            "弹窗没有自己的筛选框：列表只能在页面上那个看不见的字段里筛",
+            "OutlinedTextField(" in dialog!! && "filter" in dialog,
+        )
+        assertFalse(
+            "弹窗又自带了一个筛选词：它和页面级的那份会互相盖住，列表成了两者的交集",
+            "var query by rememberSaveable" in dialog,
+        )
+        // 输入框必须在 catalogueEmpty 的分支之外：空目录正是它唯一有用的时候。
+        val emptyBranch = Regex(
+            "(?s)catalogueEmpty && unmatched == null\\) \\{(.*?)\\n                \\}",
+        ).find(dialog)?.groupValues?.get(1)
+        assertNotNull("找不到目录为空时的提示分支", emptyBranch)
+        assertTrue(
+            "目录为空时只给了文字提示、没给输入框：让用户直接输模型名，却没有地方输",
+            "OutlinedTextField(" !in emptyBranch!!,
+        )
+    }
+
+    @Test
+    fun `the parallel switch says out loud what it switches`() {
+        // 开关旁边只有「并行发送三题」这个无障碍描述时，看得见的用户看不到它开的是什么——
+        // 屏幕上只有一个没有标签的开关。合同＝同一行里有一句可读的文字，且它不重复播报。
+        val screen = File(
+            sourceRoot,
+            "com/relaytester/app/feature/fingerprint/FingerprintScreen.kt",
+        )
+        val picker = Regex(
+            "(?s)private fun ModelPicker\\((.*?)\\n\\}\\n",
+        ).find(code(screen))?.groupValues?.get(1)
+        assertNotNull("找不到 ModelPicker 的实现", picker)
+        assertTrue(
+            "并行开关没有可见的文字说明：标志词只存在于无障碍描述里",
+            "三题并行" in picker!!,
+        )
+        assertTrue(
+            "可见的那行字也参与了播报：读屏会把同一句话念两遍",
+            "clearAndSetSemantics" in picker,
         )
     }
 }

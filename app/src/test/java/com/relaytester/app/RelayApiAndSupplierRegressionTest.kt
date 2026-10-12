@@ -17,6 +17,7 @@ import com.relaytester.app.core.network.forSameOriginRequests
 import com.relaytester.app.core.network.sameOriginRedirect
 import com.relaytester.app.core.storage.SupplierStore
 import com.relaytester.app.core.storage.SupplierStoreState
+import com.relaytester.app.core.model.MAX_TEST_PROMPT_CHARS
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import org.json.JSONArray
@@ -171,6 +172,36 @@ class RelayApiAndSupplierRegressionTest {
     }
 
     @Test
+    fun anOversizedPromptInAnAlreadySavedConfigurationIsBroughtBackIntoBounds() {
+        // 升级路径：旧版本没有上限，落盘里可能已经存着一个超长 Prompt。只做写入端夹紧不够——
+        // 用户不重新编辑那个供应商就永远不会被改写，1.8.0 装上后仍会把数 MB 文本读进内存并
+        // 随备份搬来搬去。读取端必须同样把它收进边界内。
+        val oversized = JSONObject()
+            .put(
+                "suppliers",
+                JSONArray().put(
+                    JSONObject()
+                        .put("id", "one")
+                        .put("name", "one")
+                        .put("baseUrl", "https://relay.test/v1")
+                        .put(
+                            "settings",
+                            JSONObject().put("prompt", "p".repeat(MAX_TEST_PROMPT_CHARS + 4_000)),
+                        ),
+                ),
+            )
+
+        val prompt = SupplierStore.decodeStateForTest(oversized)
+            .suppliers.single().testSettings.prompt
+
+        assertEquals(
+            "已保存的超长 Prompt 必须在读取时被收回上限",
+            MAX_TEST_PROMPT_CHARS,
+            prompt.length,
+        )
+    }
+
+    @Test
     fun anOrdinaryBlobAndAFreshInstallAreNotReportedAsDamaged() {
         // The other side of the rule: a false alarm on every launch would train the user to
         // ignore the one that matters. Empty arrays and absent optional sections are normal.
@@ -301,6 +332,25 @@ class RelayApiAndSupplierRegressionTest {
         assertEquals(42_000, shaped.readTimeoutMillis)
         assertEquals(42_000, shaped.writeTimeoutMillis)
         assertEquals(42_000, shaped.callTimeoutMillis)
+    }
+
+    @Test
+    fun aStreamingCallIsNotBoundedAsAWholeButIsStillWatchedForSilence() {
+        // 实测依据：这条链路上游先静默 30–58 秒才回响应头，然后用 850 秒产出正文（期间字节
+        // 持续到达，完全健康）。旧写法把 whole-call 上限也设成 605 秒，于是这次请求在思考
+        // 中途被应用自己掐断并报「请求超时」——应用里从来没能看到鹈鹕成功，就是这个原因。
+        // 流式请求的 total 是模型的思考时长，应用无法预知，所以只保留「沉默看门狗」。
+        val shaped = OkHttpClient.Builder().build()
+            .forSameOriginRequests(connectSeconds = 605, readSeconds = 605, writeSeconds = 605)
+
+        assertEquals("整段请求不设上限：0 是 OkHttp 的「无 whole-call 超时」", 0, shaped.callTimeoutMillis)
+        assertEquals(
+            "连接/读/写仍必须有界：读窗口才是真正的看门狗（只要还有字节到达就不会触发）",
+            605_000,
+            shaped.readTimeoutMillis,
+        )
+        assertEquals(605_000, shaped.connectTimeoutMillis)
+        assertEquals(605_000, shaped.writeTimeoutMillis)
     }
 
     // ---- Balance script validation (static only) -------------------------

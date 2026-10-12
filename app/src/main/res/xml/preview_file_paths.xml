@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  What the animation preview may hand to a browser: the single directory a generated document
+  is written into, and nothing else. Kept separate from `update_file_paths.xml` so the provider
+  that opens pages in a browser cannot reach the downloaded APK, and the provider that feeds
+  the installer cannot reach a generated page.
+-->
+<paths>
+    <cache-path
+        name="previews"
+        path="preview/" />
+</paths>

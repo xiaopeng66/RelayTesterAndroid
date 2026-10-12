@@ -10,6 +10,7 @@ import com.relaytester.app.core.storage.SupplierStore
 import com.relaytester.app.core.storage.SupplierStoreState
 import com.relaytester.app.feature.tester.TesterUiState
 import com.relaytester.app.feature.tester.TesterViewModel
+import com.relaytester.app.feature.tester.supplierAutoScrollStep
 import com.relaytester.app.feature.tester.supplierSlotUnderFinger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -364,7 +365,87 @@ class SupplierOrderTest {
         )
     }
 
-    // ---- Harness -----------------------------------------------------------
+    // ---- The list follows the finger along the edges -------------------------
+
+    /**
+     * 指尖贴住视口边缘时列表要跟着滚，而判定要跟着这次滚动一起走。
+     *
+     * 用户 1.7.17 报的两件事都在这里：拖到顶/底时列表不跟手（手指一越出可见窗口，被拖的行
+     * 就出了组合、手势当场取消，「选中态」随之消失），以及与边缘那一格换位是闪切而不是平移
+     * （判定一次就跳过好几格，中间那些格子根本没进过画面）。修法两条：指尖夹进视口（按
+     * 边缘往里半行算，正好让被拖的行整行可见），以及自动滚过的位移计入判定。
+     *
+     * 几何取自 48dp 行 + 2dp 行距（density 2.625）：行高 126px、格距 131.25px，视口 700px，
+     * 窗口停在 8 行的第 2 行上（anchorIndex = 2，内容原点就在第 2 行顶边）。
+     */
+    @Test
+    fun `a finger held at an edge names that edge slot and the auto-scroll carries it on`() {
+        val pitch = 131.25f
+        val rowHeight = 126
+        val listTop = 500f
+        val listBottom = 1200f
+
+        fun slotAt(fingerRootY: Float, autoScrolledPx: Float = 0f): Int = supplierSlotUnderFinger(
+            fingerRootY = fingerRootY,
+            listTopInRoot = listTop,
+            viewportStartOffset = -21,
+            anchorIndex = 2,
+            anchorOffset = 0,
+            anchorSize = rowHeight,
+            pitch = pitch,
+            lastIndex = 7,
+            autoScrolledPx = autoScrolledPx,
+            listBottomInRoot = listBottom,
+        )
+
+        // 指尖压在上/下边缘：算到的是视口里最上/最下那一格——中间那些格子要由自动滚动
+        // 一格一格送过来，不能一步跳到列表两端。
+        assertEquals("指尖贴住上边缘＝窗口里最上面那一格", 2, slotAt(listTop))
+        assertEquals("指尖贴住下边缘＝窗口里最下面那一格", 6, slotAt(listBottom))
+        // 指尖拖出视口（拖到标题上、拖到屏幕外）也还是同一格：手指按边缘算，
+        // 剩下的交给滚动。以前这里会直接算成末格，中间的行连画面都没进过——闪切。
+        assertEquals("拖到视口上方之外", 2, slotAt(-5000f))
+        assertEquals("拖到视口下方之外", 6, slotAt(5000f))
+        // 列表自己滚过一整格，同一根手指底下的格子就前进一格：这就是「跟着手指一直滑到
+        // 最顶部/最底部」。不把滚过的位移补进来，判定会越滚越落后一格。
+        assertEquals("滚过一格，指尖底下的格子前进一格", 7, slotAt(5000f, autoScrolledPx = pitch))
+        assertEquals(
+            "滚到列表尽头后判定夹在末格",
+            7,
+            slotAt(5000f, autoScrolledPx = pitch * 2f),
+        )
+        // 半行余量是让末格进得了判定：滚到尽头时，指尖（按边缘往里半行算）正落在末格中心。
+        // 少这个余量，末格永远差半格、拖不到列表最后（源码事实由 DialogWindowContractTest 钉住）。
+    }
+
+    /**
+     * 边缘感应区里滚动速度的爬升。
+     *
+     * 纯函数，逐帧速度在设备上没法一档一档地量：这里钉住四个事实——视口中间不滚、
+     * 刚进感应区几乎不滚、压住边缘是满速、手指拖出视口仍是满速（列表一直滚到没得滚）。
+     */
+    @Test
+    fun `the edge zone ramps the auto-scroll speed from zero to the ceiling`() {
+        val top = 500f
+        val bottom = 1200f
+        val zone = 147f
+        val maxStep = 12f
+
+        fun stepAt(y: Float): Float = supplierAutoScrollStep(y, top, bottom, zone, maxStep)
+
+        assertEquals("视口中间不滚", 0f, stepAt((top + bottom) / 2f), 0.0001f)
+        assertEquals("感应区的内沿上不滚", 0f, stepAt(top + zone), 0.0001f)
+        assertEquals("感应区的内沿上不滚", 0f, stepAt(bottom - zone), 0.0001f)
+        assertEquals("刚进下沿感应区：往下滚，速度从零起爬", 0.08f, stepAt(bottom - zone + 1f), 0.01f)
+        assertEquals("上沿感应区同理、方向相反", -maxStep / 2f, stepAt(top + zone / 2f), 0.0001f)
+        assertEquals("压住下边缘：满速", maxStep, stepAt(bottom), 0.0001f)
+        assertEquals("压住上边缘：满速", -maxStep, stepAt(top), 0.0001f)
+        assertEquals("拖出视口之外仍是满速（一直滚到顶/底）", maxStep, stepAt(bottom + 400f), 0.0001f)
+        assertEquals("拖出视口之外仍是满速（一直滚到顶/底）", -maxStep, stepAt(top - 400f), 0.0001f)
+        // 视口还没量出来（NaN）时不滚：不能凭一个 NaN 去推动列表。
+        assertEquals("视口未测量时不滚", 0f, stepAt(Float.NaN), 0.0001f)
+    }
+
 
     /**
      * Waits for a write beyond [before] to land on the real IO dispatcher.

@@ -13,6 +13,7 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -55,6 +56,8 @@ import androidx.compose.material.icons.outlined.DragHandle
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.EditNote
 import androidx.compose.material.icons.outlined.Fingerprint
+import androidx.compose.material.icons.outlined.PlayCircleOutline
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
@@ -96,6 +99,7 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -132,6 +136,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import kotlin.math.floor
 import kotlin.math.roundToInt
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.relaytester.app.core.model.ModelTestResult
@@ -144,7 +149,14 @@ import com.relaytester.app.feature.tester.UnifiedModelTestResult
 import com.relaytester.app.feature.tester.CatalogSearchResult
 import com.relaytester.app.core.model.matchesAnyModelFilterTerm
 import com.relaytester.app.core.model.mergeModelFilterTerms
+import com.relaytester.app.ui.components.PullOnlyMarker
 import com.relaytester.app.core.network.RelayBaseUrl
+import com.relaytester.app.feature.fingerprint.AnimationPhase
+import com.relaytester.app.core.update.PreviewOpener
+import com.relaytester.app.feature.fingerprint.AnimationTestPanel
+import com.relaytester.app.feature.fingerprint.AnimationUiState
+import com.relaytester.app.feature.fingerprint.AnimationView
+import com.relaytester.app.feature.fingerprint.SupplierOption
 import com.relaytester.app.ui.navigation.AppDestination
 import com.relaytester.app.ui.components.DialogDismissScrim
 import com.relaytester.app.ui.components.QuietIconButton
@@ -201,6 +213,32 @@ fun TesterScreen(
     onFingerprintModel: (String) -> Unit = {},
     onOpenUpdates: () -> Unit = {},
     hasAppUpdate: Boolean = false,
+    /**
+     * The animation test card's state and actions.
+     *
+     * Owned by the fingerprint view model — that is where the sandbox, the request path and
+     * the preview already live — and lent to this screen because the entry point sits here,
+     * next to 高级测试. Passing the state in rather than duplicating the machine keeps one
+     * implementation of "what is generating" for both the card and its button badge.
+     */
+    animationState: AnimationUiState = AnimationUiState(),
+    animationSuppliers: List<SupplierOption> = emptyList(),
+    onAnimationSupplierChange: (String) -> Unit = {},
+    onAnimationModelToggle: (String) -> Unit = {},
+    onStartAnimationSelected: (String) -> Unit = {},
+    onOpenAnimationSession: (Long?) -> Unit = {},
+    onRemoveAnimationSession: (Long) -> Unit = {},
+    onAnimationPromptChange: (String) -> Unit = {},
+    onRestoreAnimationPrompt: () -> Unit = {},
+    onRegenerateAnimation: () -> Unit = {},
+    onCancelAnimation: () -> Unit = {},
+    onReplayAnimation: () -> Unit = {},
+    onAnimationViewChange: (AnimationView) -> Unit = {},
+    onAnimationRenderFailure: (String) -> Unit = {},
+    onAnimationSnapshot: (Long, ByteArray) -> Unit = { _, _ -> },
+    onAnimationReasoningHold: (Boolean) -> Unit = {},
+    onOpenAnimation: () -> Unit = {},
+    onCloseAnimation: () -> Unit = {},
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val context = LocalContext.current
@@ -212,6 +250,9 @@ fun TesterScreen(
     // be un-leaked.
     var pendingExport by remember { mutableStateOf<ExportPayload?>(null) }
     var showModelCatalog by rememberSaveable { mutableStateOf(false) }
+    // 动画测试卡片。它是页面这一层的一层覆盖：关掉以后滚动位置与下面的状态原样保留，
+    // 与目录弹窗同一条做法。
+    var showAnimationSheet by rememberSaveable { mutableStateOf(false) }
     var configurationSupplierId by rememberSaveable { mutableStateOf<String?>(null) }
     var showSupplierOrder by rememberSaveable { mutableStateOf(false) }
     var saveCompletedAt by rememberSaveable { mutableLongStateOf(0L) }
@@ -337,6 +378,14 @@ fun TesterScreen(
                         }
                     },
                     onOpenModelCatalog = { showModelCatalog = true },
+                    // 入口永远落在「选模型 + 测试记录」那一层：onOpenAnimation 会把上一次
+                    // 看着的那条记录取消选中，否则卡片会直接弹进那条的详情，而用户想点的是
+                    // 列表——尤其是他刚生成完、正想再开一条的时候。
+                    onOpenAnimationSheet = {
+                        showAnimationSheet = true
+                        onOpenAnimation()
+                    },
+                    animationGenerating = animationState.generating != null,
                     onFingerprintModel = onFingerprintModel,
                     showDeferredContent = showDeferredContent,
                     contentPadding = innerPadding,
@@ -358,6 +407,39 @@ fun TesterScreen(
                 )
             }
         }
+    }
+    if (showAnimationSheet) {
+        AnimationTestPanel(
+            state = animationState,
+            suppliers = animationSuppliers,
+            onSupplierChange = onAnimationSupplierChange,
+            onModelToggle = onAnimationModelToggle,
+            onStartSelected = onStartAnimationSelected,
+            onOpenSession = onOpenAnimationSession,
+            onRemoveSession = onRemoveAnimationSession,
+            onPromptChange = onAnimationPromptChange,
+            onRestoreDefault = onRestoreAnimationPrompt,
+            onRegenerate = onRegenerateAnimation,
+            onCancel = onCancelAnimation,
+            onReplay = onReplayAnimation,
+            onOpenInBrowser = {
+                // Hands the sandboxed document to a real browser. Deliberately the one path
+                // that leaves the restrictions in `AnimationPreview` — the user asked for it,
+                // presses a button for it, and the preview stays sandboxed either way.
+                animationState.selected?.html?.let { html ->
+                    PreviewOpener.open(context, html)
+                } ?: false
+            },
+            onViewChange = onAnimationViewChange,
+            onRenderFailure = onAnimationRenderFailure,
+            onSnapshot = onAnimationSnapshot,
+            onReasoningHold = onAnimationReasoningHold,
+            // 关闭只是收起这一层：生成中的测试继续跑，入口按钮上的角标继续显示进度。
+            onDismiss = {
+                showAnimationSheet = false
+                onCloseAnimation()
+            },
+        )
     }
     if (showModelCatalog && state.draft != null) {
         ModelCatalogDialog(
@@ -486,6 +568,8 @@ private fun TesterContent(
     onCopy: (String, List<String>) -> Unit,
     onExport: () -> Unit,
     onOpenModelCatalog: () -> Unit,
+    onOpenAnimationSheet: () -> Unit,
+    animationGenerating: Boolean,
     onFingerprintModel: (String) -> Unit,
     showDeferredContent: Boolean,
     contentPadding: PaddingValues,
@@ -558,6 +642,8 @@ private fun TesterContent(
                     onFetchModels = onFetchModels,
                     onStartTest = onStartTest,
                     onOpenModelCatalog = onOpenModelCatalog,
+                    onOpenAnimationSheet = onOpenAnimationSheet,
+                    animationGenerating = animationGenerating,
                     onCancel = onCancelRun,
                     onCancelUnifiedTest = onCancelUnifiedRun,
                     isFetchingModels = state.isFetchingModels,
@@ -607,12 +693,25 @@ private fun TesterContent(
 }
 
 // 排序面板的行高：固定值让每格的高度一致，指尖落在哪一格就移到哪一格时几何才算得准，
-// 也免得名字长短不一时行高参差。
-private val SUPPLIER_ORDER_ROW_HEIGHT = 56.dp
+// 也免得名字长短不一时行高参差。48dp 也是触摸目标的下限——行高再矮下去，手指落在行与行
+// 之间时会更常压到相邻那格（用户 1.7.17 反馈「供应商之间上下间隔太大」，收的是行高与行距，
+// 不是把行压到按不准）。
+private val SUPPLIER_ORDER_ROW_HEIGHT = 48.dp
 
 // 两行之间的行距。换位判据要的是「一格」的间距（行高 + 行距），它由列表的布局信息量出来，
 // 这个常量只在列表里只剩一行可量时兜底。
-private val SUPPLIER_ORDER_ROW_SPACING = 6.dp
+private val SUPPLIER_ORDER_ROW_SPACING = 2.dp
+
+/** 指尖离视口上下边缘这么近时，列表开始跟着手指自己滚；也是滚动速度的爬升区间。 */
+private val SUPPLIER_ORDER_EDGE_ZONE = 56.dp
+
+/**
+ * 自动滚动的速度上限：每帧像素。
+ *
+ * 60fps 下约 720px/s——比手滑得快一点，又不至于一帧跨过一整格（一格 48dp ≈ 126px），
+ * 否则换位会连跳两格。
+ */
+private const val SUPPLIER_ORDER_AUTO_SCROLL_MAX_PX_PER_FRAME = 12f
 
 /**
  * Which slot the finger at [fingerRootY] is over, as an index into the supplier list.
@@ -624,14 +723,27 @@ private val SUPPLIER_ORDER_ROW_SPACING = 6.dp
  * content padding, which the layout publishes as a negative [viewportStartOffset]. Judging
  * the finger without it puts it one padding lower than it is — on the device that was 8dp
  * (21px), so every slot boundary fired 21px early and a finger resting on a boundary moved
- * the row one slot too far.
+ * the row one slot too far. The measured coordinates that pinned it (density 2.625, the
+ * 56dp/6dp rows of that build) are the numbers [SupplierOrderTest] still uses; the function
+ * itself only reads the [pitch] it is handed, so they stay valid however the rows are sized.
  *
  * The rest of the mapping is what makes the target a pure function of where the finger is:
  * the anchor's own geometry fixes the frame, and every other visible row sits a whole
  * [pitch] away from it. A finger that has not moved therefore resolves to the same slot
  * however much the rows have shifted underneath, which is what stops the rows bouncing.
- * Slots outside the list are clamped to its ends, so dragging past an end means "put it
- * first/last" rather than being dropped.
+ *
+ * Two terms were added when the list learned to follow the finger along the edges:
+ *  * the finger is first clamped to the viewport **inset by half a row** ([listBottomInRoot] is
+ *    the viewport's lower edge, the row height is [anchorSize]), so a finger dragged past an end
+ *    names the slot at that edge instead of jumping straight to the end of the list, and the row
+ *    it names is always a whole row inside the viewport — the dragged row never hangs half out
+ *    of the window. The auto-scroll loop keeps scrolling from there, and each row it brings past
+ *    the finger advances the slot by one, which is what "drag it to the very bottom" looks like.
+ *    The half-row inset is also exactly what lets the last slot be reached: at the end of the
+ *    list the fingertip at an edge lands on the last row's centre.
+ *  * [autoScrolledPx] is how far that loop has scrolled the content since the drag began.
+ *    Content that slid out from under the finger must advance the slot under it by the same
+ *    amount, or the target falls a row further behind with every scrolled row.
  */
 internal fun supplierSlotUnderFinger(
     fingerRootY: Float,
@@ -642,10 +754,47 @@ internal fun supplierSlotUnderFinger(
     anchorSize: Int,
     pitch: Float,
     lastIndex: Int,
+    autoScrolledPx: Float = 0f,
+    listBottomInRoot: Float = Float.POSITIVE_INFINITY,
 ): Int {
-    val fingerInContent = fingerRootY - listTopInRoot + viewportStartOffset
+    val halfRow = anchorSize / 2f
+    val fingerInViewport = fingerRootY.coerceIn(
+        minimumValue = listTopInRoot + halfRow,
+        maximumValue = maxOf(listTopInRoot + halfRow, listBottomInRoot - halfRow),
+    )
+    val fingerInContent = fingerInViewport - listTopInRoot + viewportStartOffset + autoScrolledPx
     val raw = anchorIndex + (fingerInContent - (anchorOffset + anchorSize / 2f)) / pitch
     return raw.roundToInt().coerceIn(0, lastIndex)
+}
+
+/**
+ * How far the list should scroll this frame for a finger at [fingerRootY], in pixels —
+ * negative for up, positive for down, 0 when the finger is not near an edge.
+ *
+ * A pure function because the ramp is the part a device cannot check frame by frame: over
+ * [edgeZonePx] the speed rises linearly from 0 at the zone's inner edge to [maxStepPxPerFrame]
+ * at the viewport's edge, and a finger held past the edge (dragged off the list or off the
+ * screen) keeps the ceiling, so the list scrolls until it runs out of content. That is the
+ * "the list doesn't follow my finger all the way to the top/bottom" report: without this the
+ * finger simply ran off the visible window and the drag was cancelled there.
+ */
+internal fun supplierAutoScrollStep(
+    fingerRootY: Float,
+    viewportTop: Float,
+    viewportBottom: Float,
+    edgeZonePx: Float,
+    maxStepPxPerFrame: Float,
+): Float {
+    if (edgeZonePx <= 0f) return 0f
+    val fromTop = fingerRootY - viewportTop
+    if (fromTop < edgeZonePx) {
+        return -maxStepPxPerFrame * ((edgeZonePx - fromTop) / edgeZonePx).coerceIn(0f, 1f)
+    }
+    val fromBottom = viewportBottom - fingerRootY
+    if (fromBottom < edgeZonePx) {
+        return maxStepPxPerFrame * ((edgeZonePx - fromBottom) / edgeZonePx).coerceIn(0f, 1f)
+    }
+    return 0f
 }
 
 /**
@@ -757,6 +906,9 @@ internal fun copyAlignmentOffset(slotWidth: Dp, pillInset: Dp, pillLabelWidth: D
 internal fun statusChipLabel(status: TestStatus, isFetchedOnly: Boolean): String = when (status) {
     TestStatus.SUCCESS -> "可用"
     TestStatus.FAILED -> "失败"
+    // A pull-only source was never sent anywhere: it reads "仅拉取", not "失败", so the
+    // deliberate skip is not counted as a network error anywhere the chip is read.
+    TestStatus.SKIPPED -> "仅拉取"
     // PENDING covers both "queued behind other models" and "this row's request is in
     // flight", so "进行中" here contradicted the body text on the same row. The row
     // itself is what says it is running; the badge only says it is not finished yet.
@@ -923,15 +1075,10 @@ private fun SupplierSelector(
                                 // A pull-only marker that draws over the corner instead of
                                 // taking layout space, so every card keeps the same height
                                 // and the two columns stay level.
-                                Box(
+                                PullOnlyMarker(
                                     modifier = Modifier
                                         .align(Alignment.TopStart)
-                                        .padding(start = 5.dp, top = 7.dp)
-                                        .size(width = 3.dp, height = 18.dp)
-                                        .background(
-                                            color = MaterialTheme.colorScheme.error,
-                                            shape = MaterialTheme.shapes.extraSmall,
-                                        ),
+                                        .padding(start = 5.dp, top = 7.dp),
                                 )
                             }
                             Column(
@@ -1085,22 +1232,97 @@ private fun SupplierOrderDialog(
     var draggingId by remember { mutableStateOf<String?>(null) }
     // 指尖位置是在「列表视口」这个坐标系里判定的。列表自己不随换位移动，所以同一根手指停在
     // 同一处，判定出的永远是同一格——换成累加被拖行自己的位移，换位会让行自己挪一格，位移里
-    // 就凭空多出一格，行会立刻往回换（两行来回跳的根因）。视口的顶边在根坐标里量一次即可。
+    // 就凭空多出一格，行会立刻往回换（两行来回跳的根因）。视口的上下边在根坐标里各量一次即可。
     var listTopInRoot by remember { mutableFloatStateOf(Float.NaN) }
+    var listBottomInRoot by remember { mutableFloatStateOf(Float.NaN) }
     // 判定用的那一帧在手指按下时采一次，整次拖动不再重读。被拖的行如果是列表的滚动锚点
     // （第一行可见的就是它），换位会让列表跟着滚一格：布局里的锚点位移于是凭空少一格/多一格，
     // 逐帧重读就把这次滚动算进指尖的位移里，手指只走了一格、判定却说走了两格，行越拖越跑。
     var dragFrame by remember { mutableStateOf<SupplierDragFrame?>(null) }
+    // 自动滚动：指尖贴住视口上下边缘时列表自己走。指尖最后一个位置（每帧的滚动方向由它算）、
+    // 以及这一趟已经滚过的像素——判定要用它把「内容从手指底下滑过去」的那部分补上，每帧的
+    // 钉窗也要以它为偏移（见下）。
+    var pointerRootY by remember { mutableFloatStateOf(Float.NaN) }
+    var autoScrollPx by remember { mutableFloatStateOf(0f) }
     // 只剩一行可量时兜底用的行距；正常路径下格子间距直接量自布局信息。
     val spacingPx = with(LocalDensity.current) { SUPPLIER_ORDER_ROW_SPACING.toPx() }
-    // 拖动期间把窗口按「第几行」钉住。列表自己会跟着第一可见那行的 key 保持位置：被拖的行如果
-    // 就是它，换位一次列表就往下滚一格，行被钉在按下的位置不动、内容从手下滑走，看起来像行不跟手
-    // （手指走了一格、行还在原地）。每次顺序变化后把窗口恢复成按下时的那一格，画面里就只剩行
-    // 在动；手指不动时恢复成同一个位置，等于没恢复。放下之后不再干预，列表照常可以自己滚。
-    LaunchedEffect(draggingId, suppliers) {
-        val frame = dragFrame ?: return@LaunchedEffect
-        if (draggingId == null) return@LaunchedEffect
-        listState.scrollToItem(frame.scrollIndex, frame.scrollOffset)
+    val edgeZonePx = with(LocalDensity.current) { SUPPLIER_ORDER_EDGE_ZONE.toPx() }
+    // 「指尖底下是第几格」的判定收口成一处：拖动事件与自动滚动都走它。闭包里 suppliers 的
+    // 数目在弹窗存活期内不变（弹窗开着时增删不了供应商），其余输入全是状态，读到的永远是
+    // 当前值——所以这个闭包被逐帧循环抓着用也不会陈旧。
+    val judgeSlot: (Float) -> Int? = { fingerY ->
+        val frame = dragFrame
+        if (frame == null) {
+            null
+        } else {
+            supplierSlotUnderFinger(
+                fingerRootY = fingerY,
+                listTopInRoot = frame.listTopInRoot,
+                viewportStartOffset = frame.viewportStartOffset,
+                anchorIndex = frame.anchorIndex,
+                anchorOffset = frame.anchorOffset,
+                anchorSize = frame.anchorSize,
+                pitch = frame.pitch,
+                lastIndex = suppliers.lastIndex,
+                autoScrolledPx = autoScrollPx,
+                listBottomInRoot = listBottomInRoot,
+            )
+        }
+    }
+    // 换位会把列表的滚动锚点一起挪：被拖的行如果是第一可见那行，换位一次列表就跟着滚一格，
+    // 行被钉在按下的位置不动、内容从手下滑走，看起来像行不跟手；更要命的是被拖行换进第一格
+    // 的那一次，锚点跟随把窗口拽下一格，被拖行（就在第一格）当场整个滚出视口——行被裁出组合，
+    // 长按手势立刻断掉（设备实测：拖到顶边的行总在第一次换位后断）。窗口要在换位落地的同一次
+    // 测量里就恢复成「按下那一格 + 手指让列表滚过的距离」。用 requestScrollToItem 而不是
+    // scrollToItem 滚回去：后者参与滚动互斥，会取消正在进行的逐帧滚动（循环就是这么死的），
+    // 它与补滚之间还可能渲染一帧按下时的窗口。请求式钉窗不参与互斥、不打断滚动，只规定下一
+    // 次测量的位置；每帧重发一次，任何一次测量（换位的也好、滚动的也好）看到的都是正确窗口。
+    // 行高等长，目标位置折成「整行数 + 行内偏移」；列表顶端之上只有上内边距可滚，目标位置
+    // 不许越过它——否则折出来的行号是负的，请求无效，换位落地的那次测量没人挡着。
+    fun pinWindow() {
+        val frame = dragFrame ?: return
+        val target = (frame.scrollIndex * frame.pitch + frame.scrollOffset + autoScrollPx)
+            .coerceAtLeast(frame.viewportStartOffset.toFloat())
+        var index = floor(target / frame.pitch).toInt()
+        var offset = target - index * frame.pitch
+        if (index < 0) {
+            // 目标落在第 0 行上缘之上（上内边距里）：第 0 行顶在视口起点之下，偏移为负。
+            index = 0
+            offset = target
+        } else if (offset >= frame.anchorSize) {
+            // 行距 = 行高 + 间隔：偏移落到「行高与行距之间」时那一行其实已完全滚出视口。
+            offset -= frame.anchorSize
+            index += 1
+        }
+        listState.requestScrollToItem(index, offset.roundToInt())
+    }
+    // 指尖贴着视口边缘时列表跟着手指滚，一直滚到顶/底：手指停在边缘不动也不会中断
+    // （滚不动时消费为 0，累积不再增长，判定就停在那一格）。逐帧步进，不是一次跳一屏。
+    // 滚动发生的那一帧必须重判一次指尖底下的格子——手指不动、内容在动，只靠拖动事件
+    // 判定的行会停在原地被内容推走（设备实测：按住下边缘，列表滚过五行，行没跟上）。
+    LaunchedEffect(draggingId) {
+        val draggedId = draggingId ?: return@LaunchedEffect
+        while (true) {
+            withFrameNanos { }
+            val step = supplierAutoScrollStep(
+                fingerRootY = pointerRootY,
+                viewportTop = listTopInRoot,
+                viewportBottom = listBottomInRoot,
+                edgeZonePx = edgeZonePx,
+                maxStepPxPerFrame = SUPPLIER_ORDER_AUTO_SCROLL_MAX_PX_PER_FRAME,
+            )
+            if (step != 0f) {
+                var consumed = 0f
+                listState.scroll { consumed = scrollBy(step) }
+                autoScrollPx += consumed
+                if (consumed != 0f) {
+                    judgeSlot(pointerRootY)?.let { onMove(draggedId, it) }
+                }
+            }
+            // 每帧都钉：换位的数据下一帧才落地，落地的测量必须已经有人规定好窗口，
+            // 锚点跟随才没有露脸的机会（请求是最后一笔，落地的测量一定消费到它）。
+            pinWindow()
+        }
     }
 
     Dialog(
@@ -1126,20 +1348,19 @@ private fun SupplierOrderDialog(
                                 top = 20.dp,
                                 bottom = 4.dp,
                             ),
-                            verticalArrangement = Arrangement.spacedBy(2.dp),
                         ) {
+                            // 标题下面那行说明（「按住任意一行拖动即可换位…」）按用户要求删掉了：
+                            // 面板上只有一种操作，行右边就是拖动手柄，说明文字只是占地方。
                             Text("供应商排序", style = MaterialTheme.typography.headlineSmall)
-                            Text(
-                                "按住任意一行拖动即可换位；顺序在模型测试、余额查询与指纹检测三处一致。",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
                         }
                         LazyColumn(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .weight(1f, fill = false)
-                                .onGloballyPositioned { listTopInRoot = it.positionInRoot().y },
+                                .onGloballyPositioned {
+                                    listTopInRoot = it.positionInRoot().y
+                                    listBottomInRoot = it.positionInRoot().y + it.size.height
+                                },
                             state = listState,
                             verticalArrangement = Arrangement.spacedBy(SUPPLIER_ORDER_ROW_SPACING),
                             contentPadding = PaddingValues(
@@ -1162,6 +1383,8 @@ private fun SupplierOrderDialog(
                                     isDragging = supplier.id == draggingId,
                                     onStartDrag = {
                                         draggingId = supplier.id
+                                        pointerRootY = Float.NaN
+                                        autoScrollPx = 0f
                                         dragFrame = currentSupplierDragFrame(
                                             listState,
                                             listTopInRoot,
@@ -1171,26 +1394,22 @@ private fun SupplierOrderDialog(
                                     onStopDrag = {
                                         draggingId = null
                                         dragFrame = null
+                                        pointerRootY = Float.NaN
+                                        autoScrollPx = 0f
                                     },
                                     // 换位判据是「指尖落在哪一格」，不是「行了多少行」：行自己会随着
                                     // 换位挪动，累加它的位移会把换位本身算进去，越拖越乱；格子的位置
                                     // 只由列表的布局决定，手指不动就不换。落在两格之间按最近的算，
-                                    // 越出列表按两端夹住——拖到列表外面就是「放到最前／最后」。
-                                    onDragAt = { movedId, pointerRootY ->
-                                        val frame = dragFrame ?: return@SupplierOrderRow
-                                        onMove(
-                                            movedId,
-                                            supplierSlotUnderFinger(
-                                                fingerRootY = pointerRootY,
-                                                listTopInRoot = frame.listTopInRoot,
-                                                viewportStartOffset = frame.viewportStartOffset,
-                                                anchorIndex = frame.anchorIndex,
-                                                anchorOffset = frame.anchorOffset,
-                                                anchorSize = frame.anchorSize,
-                                                pitch = frame.pitch,
-                                                lastIndex = suppliers.lastIndex,
-                                            ),
-                                        )
+                                    // 越出视口按边缘夹住——再往外拖由自动滚动把格子送到指尖底下。
+                                    // 判定本体在 judgeSlot：逐帧循环与这里共用同一份。钉窗必须紧跟
+                                    // 换位发出去：换位的数据在事件线程当场写好，下一次测量就是换位
+                                    // 落地的那次——晚一帧的话，锚点跟随会在那一帧把被拖行拽出视口。
+                                    onDragAt = { movedId, fingerRootY ->
+                                        pointerRootY = fingerRootY
+                                        judgeSlot(fingerRootY)?.let {
+                                            onMove(movedId, it)
+                                            pinWindow()
+                                        }
                                     },
                                 )
                             }
@@ -1588,6 +1807,121 @@ private fun PullOnlyModeRow(
     }
 }
 
+/**
+ * The animation test entry, beside 高级测试 in the settings header.
+ *
+ * The running state is a dot on the icon, never a change of label: the button's job is to
+ * be findable, and a label that rewrites itself under the user's eyes moves the target they
+ * were aiming at. The dot alone carries "something of yours is still generating", and it
+ * rides on the icon so it survives the label being truncated.
+ */
+@Composable
+private fun AnimationTestEntry(generating: Boolean, onClick: () -> Unit) {
+    OutlinedButton(
+        onClick = onClick,
+        contentPadding = PaddingValues(horizontal = 6.dp),
+        modifier = Modifier
+            .heightIn(min = 28.dp, max = 30.dp)
+            .widthIn(min = 64.dp, max = HEADER_BUTTON_MAX_WIDTH.scaledForFont()),
+    ) {
+        Box {
+            Icon(
+                Icons.Outlined.PlayCircleOutline,
+                contentDescription = null,
+                modifier = Modifier.size(14.dp),
+            )
+            if (generating) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .offset(x = 3.dp, y = (-3).dp)
+                        .size(6.dp)
+                        .background(MaterialTheme.colorScheme.primary, CircleShape),
+                )
+            }
+        }
+        Spacer(Modifier.width(3.dp))
+        Text(
+            "动画测试",
+            style = MaterialTheme.typography.labelMedium,
+            maxLines = 1,
+            softWrap = false,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+/** The model catalog entry; unchanged apart from being extracted from the header row. */
+@Composable
+private fun AdvancedCatalogButton(
+    enabled: Boolean,
+    isUnifiedTesting: Boolean,
+    onClick: () -> Unit,
+) {
+    OutlinedButton(
+        onClick = onClick,
+        // 统一测试跑着的时候，这个按钮是回弹窗看进度、取消测试的唯一入口：
+        // 关掉弹窗后主界面没有任何进行中指示，再禁掉它，用户就被锁在一轮
+        // 看不见的测试外面了。普通批量测试运行中它仍然禁用（那是另一条链）。
+        enabled = enabled,
+        contentPadding = PaddingValues(horizontal = 6.dp),
+        modifier = Modifier
+            .heightIn(min = 28.dp, max = 30.dp)
+            .widthIn(min = 64.dp, max = HEADER_BUTTON_MAX_WIDTH.scaledForFont()),
+    ) {
+        Icon(Icons.Outlined.Tune, contentDescription = null, modifier = Modifier.size(14.dp))
+        Spacer(Modifier.width(3.dp))
+        Text(
+            if (isUnifiedTesting) "统一测试中…" else "高级测试",
+            style = MaterialTheme.typography.labelMedium,
+            maxLines = 1,
+            softWrap = false,
+        )
+    }
+}
+
+/**
+ * Width the two header entries need together, plus the gap between them, at font scale 1.
+ *
+ * 动画测试 and 高级测试 are each four characters plus a 14dp icon and 6dp of padding on both
+ * sides; this is the pair's natural width, and it is what the header's wrap test is measured
+ * against. It has to move with the buttons: left too wide, the header wraps to its fallback
+ * layout on a screen where the row actually fits, and the two buttons drop below the title the
+ * user asked to see them aligned with.
+ */
+private val SETTINGS_HEADER_BUTTONS_WIDTH = 168.dp
+
+/**
+ * How wide one header entry may grow, at font scale 1.
+ *
+ * A cap and not a fixed width: at 1.0 the two entries sit at their natural size, and the
+ * ceiling only stops one of them from eating the row.
+ */
+private val HEADER_BUTTON_MAX_WIDTH = 92.dp
+
+/**
+ * The cap, widened by the font scale.
+ *
+ * `widthIn(max = …)` is in dp while the label is in sp, so a fixed ceiling truncates the
+ * text as soon as the user raises 字体大小 — at 1.5x 动画测试 was rendering as 动画… and at
+ * 2.0x as 动…, which is the one thing the entry cannot afford: the two buttons are how the
+ * user tells the animation test from the catalog, and a label that reads 动… says neither.
+ * Scaling the ceiling keeps the label whole; the header's wrap test
+ * ([SETTINGS_HEADER_BUTTONS_WIDTH] × fontScale) already measures the row against the same
+ * scale, so the pair still drops below the title when the row genuinely does not fit.
+ */
+@Composable
+private fun Dp.scaledForFont(): Dp {
+    val fontScale = LocalDensity.current.fontScale
+    return this * (if (fontScale > 1f) fontScale else 1f)
+}
+
+/** Room the 测试参数 title must keep to avoid being squeezed into a one-character column. */
+private val SETTINGS_HEADER_TITLE_MIN_WIDTH = 68.dp
+
+/** The gap between the title and the first entry, and between the two entries. */
+private val SETTINGS_HEADER_GAP = 16.dp
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun TestSettingsCard(
@@ -1604,12 +1938,15 @@ private fun TestSettingsCard(
     onFetchModels: () -> Unit,
     onStartTest: () -> Unit,
     onOpenModelCatalog: () -> Unit,
+    onOpenAnimationSheet: () -> Unit,
+    animationGenerating: Boolean,
     onCancel: () -> Unit,
     onCancelUnifiedTest: () -> Unit,
     isFetchingModels: Boolean,
     isRunning: Boolean,
     isUnifiedTesting: Boolean,
 ) {
+    val density = LocalDensity.current
     var showAdvanced by rememberSaveable(draft.id) { mutableStateOf(false) }
     var showQuickFilterDialog by rememberSaveable(draft.id) { mutableStateOf(false) }
     var quickFilterInput by rememberSaveable(draft.id) { mutableStateOf("") }
@@ -1621,32 +1958,57 @@ private fun TestSettingsCard(
             modifier = Modifier.fillMaxWidth().padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    SectionTitle("测试参数")
-                }
-                OutlinedButton(
-                    onClick = onOpenModelCatalog,
-                    // 统一测试跑着的时候，这个按钮是回弹窗看进度、取消测试的唯一入口：
-                    // 关掉弹窗后主界面没有任何进行中指示，再禁掉它，用户就被锁在一轮
-                    // 看不见的测试外面了。普通批量测试运行中它仍然禁用（那是另一条链）。
-                    enabled = enabled || isUnifiedTesting,
-                    contentPadding = PaddingValues(horizontal = 10.dp),
-                    modifier = Modifier
-                        .heightIn(min = 40.dp, max = 44.dp)
-                        .widthIn(min = 96.dp, max = 112.dp),
-                ) {
-                    Icon(Icons.Outlined.Tune, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text(
-                        if (isUnifiedTesting) "统一测试中…" else "高级测试",
-                        maxLines = 1,
-                        softWrap = false,
-                    )
+            BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+                // 两个入口（动画测试、高级测试）与标题争的是同一行的宽度：按钮的宽度随字号
+                // 一起长，所以判断也要跟着字号走，而不是写死一个宽度阈值。按字号缩放按钮需求
+                // 宽度，再留出标题不被挤成竖排的最小宽度，放不下才让标题独占一行、两个按钮
+                // 另起一行靠右——与操作栏、挑战头部同一条「放不下就换行」的规则。
+                val buttonScale = if (density.fontScale > 1f) density.fontScale else 1f
+                val sideBySide = maxWidth >=
+                    SETTINGS_HEADER_TITLE_MIN_WIDTH +
+                    SETTINGS_HEADER_BUTTONS_WIDTH * buttonScale +
+                    SETTINGS_HEADER_GAP
+                if (sideBySide) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            SectionTitle("测试参数")
+                        }
+                        AnimationTestEntry(
+                            generating = animationGenerating,
+                            onClick = onOpenAnimationSheet,
+                        )
+                        AdvancedCatalogButton(
+                            enabled = enabled || isUnifiedTesting,
+                            isUnifiedTesting = isUnifiedTesting,
+                            onClick = onOpenModelCatalog,
+                        )
+                    }
+                } else {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        SectionTitle("测试参数")
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            AnimationTestEntry(
+                                generating = animationGenerating,
+                                onClick = onOpenAnimationSheet,
+                            )
+                            AdvancedCatalogButton(
+                                enabled = enabled || isUnifiedTesting,
+                                isUnifiedTesting = isUnifiedTesting,
+                                onClick = onOpenModelCatalog,
+                            )
+                        }
+                    }
                 }
             }
             NumberRow(
@@ -2200,13 +2562,11 @@ private fun LazyListScope.resultSection(
 
 @Composable
 private fun ResultSummaryCard(state: TesterUiState) {
-    val (total, succeeded, failed) = remember(state.results) {
-        Triple(
-            state.results.size,
-            state.results.count { it.status == TestStatus.SUCCESS },
-            state.results.count { it.status == TestStatus.FAILED },
-        )
-    }
+    val results = state.results
+    val succeeded = remember(results) { results.count { it.status == TestStatus.SUCCESS } }
+    val failed = remember(results) { results.count { it.status == TestStatus.FAILED } }
+    val skipped = remember(results) { results.count { it.status == TestStatus.SKIPPED } }
+    val total = results.size
     val summary = state.summary
     ElevatedCard(
         colors = CardDefaults.elevatedCardColors(
@@ -2227,6 +2587,14 @@ private fun ResultSummaryCard(state: TesterUiState) {
                     pushStyle(SpanStyle(color = MaterialTheme.colorScheme.error))
                     append("不可用 " + failed)
                     pop()
+                    // 仅拉取的行既没跑也没失败，单独报数：把它并进「不可用」会让一次
+                    // 按策略完成的全跳过测试看起来像全军覆没。
+                    if (skipped > 0) {
+                        append(" · ")
+                        pushStyle(SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant))
+                        append("已跳过 " + skipped)
+                        pop()
+                    }
                 },
             )
             if (state.isRunning && state.progressTotal > 0) {
@@ -2369,6 +2737,7 @@ private fun ResultItem(
     val statusColor = when (result.status) {
         TestStatus.SUCCESS -> Color(0xFF16A34A)
         TestStatus.FAILED -> MaterialTheme.colorScheme.error
+        TestStatus.SKIPPED -> MaterialTheme.colorScheme.onSurfaceVariant
         TestStatus.PENDING -> MaterialTheme.colorScheme.tertiary
     }
     val failureDetail = result.error?.message
@@ -2498,6 +2867,15 @@ private fun ResultItem(
                             ResultMetricChip(
                                 result.error?.kind?.label ?: "请求失败",
                                 MaterialTheme.colorScheme.error,
+                                Modifier.weight(1f, fill = false),
+                            )
+                        }
+                        TestStatus.SKIPPED -> {
+                            // No request was sent, so there is no latency, token count or
+                            // HTTP code to print — only the reason it was skipped.
+                            ResultMetricChip(
+                                result.error?.message ?: "该供应商已禁止测试，仅允许拉取模型",
+                                MaterialTheme.colorScheme.onSurfaceVariant,
                                 Modifier.weight(1f, fill = false),
                             )
                         }
@@ -2858,6 +3236,7 @@ private fun ResultStatusChip(status: TestStatus, isFetchedOnly: Boolean = false)
     val color = when (status) {
         TestStatus.SUCCESS -> Color(0xFF15803D)
         TestStatus.FAILED -> MaterialTheme.colorScheme.error
+        TestStatus.SKIPPED -> MaterialTheme.colorScheme.onSurfaceVariant
         TestStatus.PENDING -> if (isFetchedOnly) {
             MaterialTheme.colorScheme.onSurfaceVariant
         } else {
@@ -2951,7 +3330,10 @@ private fun ModelCatalogDialog(
 ) {
     var editingEntryId by rememberSaveable { mutableStateOf<String?>(null) }
     var entryName by rememberSaveable { mutableStateOf("") }
-    var selectedSupplierId by rememberSaveable { mutableStateOf(state.suppliers.firstOrNull()?.id) }
+    val selectableSuppliers = state.suppliers.filterNot { it.isTestingDisabled }
+    var selectedSupplierId by rememberSaveable {
+        mutableStateOf(selectableSuppliers.firstOrNull()?.id)
+    }
     var selectedModel by rememberSaveable { mutableStateOf("") }
     // Saved like the rest of the editor: without this, a rotation restored the title and the
     // name but emptied the source list, and the next 保存修改 replaced the entry's stored
@@ -2974,15 +3356,18 @@ private fun ModelCatalogDialog(
     var entryToDeleteId by rememberSaveable { mutableStateOf<String?>(null) }
     var supplierMenuExpanded by rememberSaveable { mutableStateOf(false) }
     var modelMenuExpanded by rememberSaveable { mutableStateOf(false) }
-    val selectedSupplier = state.suppliers.firstOrNull { it.id == selectedSupplierId }
+    val selectedSupplier = selectableSuppliers.firstOrNull { it.id == selectedSupplierId }
     val pickerModels = state.catalogPickerModels
     val searchResults = state.catalogSearchResults
     val unifiedByEntry = state.unifiedResults.groupBy { it.entryId }
     val editingEnabled = !state.isUnifiedTesting
     val entryNameError = if (entryName.length > 256) "模型名称不能超过 256 个字符" else null
     val sourceLimitReached = pendingSources.size >= MAX_MODEL_SOURCES_PER_ENTRY
+    // 认的是「这个供应商现在还可选」，不是「当初记住了一个 id」：弹窗开着时用户可能把当前
+    // 供应商设成「禁止测试」（另一个页面），只判 id 非空就还能从它添加来源——而那个来源
+    // 之后必然被策略拒绝，等于在弹窗里留下一条永远跑不了的配置。
     val canAddSource = editingEnabled && !sourceLimitReached &&
-        selectedSupplierId != null && selectedModel.isNotBlank()
+        selectedSupplier?.id != null && selectedModel.isNotBlank()
     val canSave = editingEnabled &&
         entryName.trim().isNotEmpty() &&
         entryNameError == null &&
@@ -2997,6 +3382,16 @@ private fun ModelCatalogDialog(
         editingSearchKeyword = ""
         selectedSearchKeys = emptySet()
         onClearPicker()
+    }
+
+    // R03：草稿只在持久化成功之后清空。结果带着保存时提交的草稿快照，只有当前草稿
+    // 仍是那一份时才重置：失败保留全部输入，保存后再编辑、换草稿或关掉重开都不会被
+    // 晚到的成功事件清掉。
+    LaunchedEffect(state.catalogSaveOutcome?.id) {
+        val outcome = state.catalogSaveOutcome ?: return@LaunchedEffect
+        if (catalogSaveResetsDraft(outcome, editingEntryId, entryName, pendingSources)) {
+            resetDraft()
+        }
     }
 
     // 卡片要占屏宽 94%，所以关掉平台的默认宽度（它只给约 320dp）；代价是 Compose 会按整屏测量
@@ -3224,7 +3619,7 @@ private fun ModelCatalogDialog(
                                 Box(modifier = Modifier.fillMaxWidth()) {
                                     OutlinedButton(
                                         onClick = { supplierMenuExpanded = true },
-                                        enabled = editingEnabled && !state.isCatalogFetching && state.suppliers.isNotEmpty(),
+                                        enabled = editingEnabled && !state.isCatalogFetching && selectableSuppliers.isNotEmpty(),
                                         modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                                     ) {
                                         Text(
@@ -3240,7 +3635,7 @@ private fun ModelCatalogDialog(
                                         onDismissRequest = { supplierMenuExpanded = false },
                                         modifier = Modifier.heightIn(max = 280.dp),
                                     ) {
-                                        state.suppliers.forEach { supplier ->
+                                        selectableSuppliers.forEach { supplier ->
                                             DropdownMenuItem(
                                                 text = { Text(supplier.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                                                 onClick = {
@@ -3397,6 +3792,10 @@ private fun ModelCatalogDialog(
                                     }
                                     ModelCatalogEntryCard(
                                         entry = entry,
+                                        // 完整供应商列表，不是 selectableSuppliers：这张卡要显示
+                                        // 历史来源所属供应商的名称与「仅拉取」标记。传过滤后的列表
+                                        // 会让已禁止测试的供应商显示成「已删除供应商」，用户以为
+                                        // 配置丢了。是否可新增/可发起测试由卡片自己的策略判定。
                                         suppliers = state.suppliers,
                                         results = unifiedByEntry[entry.id].orEmpty(),
                                         testingKeys = state.unifiedTestingKeys,
@@ -3411,7 +3810,9 @@ private fun ModelCatalogDialog(
                                             editingEntryId = entry.id
                                             entryName = entry.name
                                             pendingSources = entry.sources
-                    selectedSupplierId = entry.sources.firstOrNull()?.supplierId ?: state.suppliers.firstOrNull()?.id
+                    selectedSupplierId = entry.sources.firstOrNull { source ->
+                        selectableSuppliers.any { it.id == source.supplierId }
+                    }?.supplierId ?: selectableSuppliers.firstOrNull()?.id
                     selectedModel = ""
                     catalogSearchKeyword = editingSearchKeyword
                     onClearPickerPreservingSearch()
@@ -3437,40 +3838,28 @@ private fun ModelCatalogDialog(
                         }
                     }
                     HorizontalDivider()
-                    Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        TextButton(onClick = onDismiss, modifier = Modifier.heightIn(min = 48.dp)) { Text("关闭") }
-                        Spacer(Modifier.weight(1f))
-                        OutlinedButton(
-                            onClick = {
-                                val supplierId = selectedSupplierId
-                                if (supplierId != null && selectedModel.isNotBlank()) {
-                                    pendingSources = (pendingSources + ModelSource(supplierId, selectedModel))
-                                        .distinctBy { it.supplierId + "\u0000" + it.modelId }
-                                    selectedModel = ""
-                                }
-                            },
-                            enabled = canAddSource,
-                            contentPadding = PaddingValues(horizontal = 8.dp),
-                            modifier = Modifier.heightIn(min = 48.dp),
-                        ) {
-                            Icon(Icons.Outlined.Add, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(3.dp))
-                            Text("添加来源", maxLines = 1)
-                        }
-                        Button(
-                            onClick = {
-                                onSaveEntry(editingEntryId, entryName, pendingSources)
-                                resetDraft()
-                            },
-                            enabled = canSave,
-                            contentPadding = PaddingValues(horizontal = 10.dp),
-                            modifier = Modifier.heightIn(min = 48.dp),
-                        ) { Text(if (editingEntryId == null) "保存模型来源" else "保存修改") }
-                    }
+                    CatalogSaveFeedback(
+                        outcome = state.catalogSaveOutcome,
+                        modifier = Modifier.padding(horizontal = 20.dp),
+                    )
+                    CatalogDialogActionBar(
+                        canSave = canSave && !state.isSavingCatalogEntry,
+                        isSaving = state.isSavingCatalogEntry,
+                        canAddSource = canAddSource,
+                        editingExisting = editingEntryId != null,
+                        onClose = onDismiss,
+                        onAddSource = {
+                            // 与 canAddSource 同一判据：只接受当前仍可选的供应商，避免在
+                            // 按钮被禁用后，这条路径仍把禁止测试的来源写进待保存列表。
+                            val supplierId = selectedSupplier?.id
+                            if (supplierId != null && selectedModel.isNotBlank()) {
+                                pendingSources = (pendingSources + ModelSource(supplierId, selectedModel))
+                                    .distinctBy { it.supplierId + "\u0000" + it.modelId }
+                                selectedModel = ""
+                            }
+                        },
+                        onSave = { onSaveEntry(editingEntryId, entryName, pendingSources) },
+                    )
                 }
             }
         }
@@ -3534,6 +3923,152 @@ private fun ModelCatalogDialog(
             }
     }
 }
+
+/**
+ * Whether a finished save still owns the draft on screen, and may therefore clear it.
+ *
+ * The comparison is the whole guard: only a draft that still *is* the saved content —
+ * same entry, same name, same sources — gets reset. A draft the user typed into after
+ * the click keeps its newer edits, and a dialog reopened fresh never matches (its name
+ * is blank), so a late success from a previous session cannot wipe it.
+ */
+internal fun catalogSaveResetsDraft(
+    outcome: CatalogSaveOutcome,
+    editingEntryId: String?,
+    entryName: String,
+    pendingSources: List<ModelSource>,
+): Boolean = outcome.success &&
+    outcome.entryId == editingEntryId &&
+    outcome.savedName == entryName &&
+    outcome.savedSources == pendingSources
+
+/**
+ * The save outcome, drawn where the save button can be seen.
+ *
+ * A failure has to be visible inside the dialog: the page-level snackbar lives under
+ * this window, and「按了保存却什么都没发生」is the one reading a failed save must not
+ * get. The message stays until the next save starts (the outcome is replaced) or the
+ * dialog is left; a success publishes no line here — the toast lives above the dialog.
+ */
+@Composable
+private fun CatalogSaveFeedback(
+    outcome: CatalogSaveOutcome?,
+    modifier: Modifier = Modifier,
+) {
+    val failure = outcome?.takeIf { !it.success } ?: return
+    Text(
+        failure.message,
+        modifier = modifier.padding(top = 4.dp),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.error,
+    )
+}
+
+/**
+ * The advanced-catalog dialog's bottom actions.
+ *
+ * One fixed row fits ordinary widths at ordinary font scales. On a narrow screen or a
+ * large font scale it does not: 320dp at 字号 1.6 squeezed「保存模型来源」into three
+ * lines and grew the bar over the scrollable body. There the primary save takes a
+ * full-width row of its own and the secondary actions share the other — the body stays
+ * its own scroll area either way.
+ */
+@Composable
+private fun CatalogDialogActionBar(
+    canSave: Boolean,
+    isSaving: Boolean,
+    canAddSource: Boolean,
+    editingExisting: Boolean,
+    onClose: () -> Unit,
+    onAddSource: () -> Unit,
+    onSave: () -> Unit,
+) {
+    val fontScale = LocalDensity.current.fontScale
+    BoxWithConstraints {
+        val stacked = maxWidth < CATALOG_ACTION_BAR_STACK_WIDTH ||
+            fontScale >= CATALOG_ACTION_BAR_STACK_FONT_SCALE
+        if (stacked) {
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    TextButton(onClick = onClose, modifier = Modifier.heightIn(min = 48.dp)) {
+                        Text("关闭")
+                    }
+                    Spacer(Modifier.weight(1f))
+                    OutlinedButton(
+                        onClick = onAddSource,
+                        enabled = canAddSource,
+                        contentPadding = PaddingValues(horizontal = 8.dp),
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) {
+                        Icon(Icons.Outlined.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(3.dp))
+                        Text("添加来源", maxLines = 1)
+                    }
+                }
+                Button(
+                    onClick = onSave,
+                    enabled = canSave,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                ) {
+                    if (isSaving) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(8.dp))
+                    }
+                    Text(
+                        if (editingExisting) "保存修改" else "保存模型来源",
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        } else {
+            Row(
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TextButton(onClick = onClose, modifier = Modifier.heightIn(min = 48.dp)) { Text("关闭") }
+                Spacer(Modifier.weight(1f))
+                OutlinedButton(
+                    onClick = onAddSource,
+                    enabled = canAddSource,
+                    contentPadding = PaddingValues(horizontal = 8.dp),
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) {
+                    Icon(Icons.Outlined.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(3.dp))
+                    Text("添加来源", maxLines = 1)
+                }
+                Button(
+                    onClick = onSave,
+                    enabled = canSave,
+                    contentPadding = PaddingValues(horizontal = 10.dp),
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) {
+                    if (isSaving) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(6.dp))
+                    }
+                    Text(if (editingExisting) "保存修改" else "保存模型来源", maxLines = 1)
+                }
+            }
+        }
+    }
+}
+
+/** Below this effective width the dialog's bottom actions stack into two rows. */
+private val CATALOG_ACTION_BAR_STACK_WIDTH = 342.dp
+
+/** At this font scale or above, the dialog's bottom actions stack into two rows. */
+private const val CATALOG_ACTION_BAR_STACK_FONT_SCALE = 1.3f
 
 @Composable
 private fun ModelCatalogEntryCard(

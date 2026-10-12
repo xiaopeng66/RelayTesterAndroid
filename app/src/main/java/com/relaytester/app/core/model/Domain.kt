@@ -170,6 +170,17 @@ sealed interface BalanceQueryResult {
     ) : BalanceQueryResult
 }
 
+/**
+ * The largest test prompt a supplier profile may carry.
+ *
+ * Bounds the one free-text field of [TestSettings] — every other field on it is a bounded
+ * number. It lives here rather than beside the view model because both ends of the pipe need
+ * it: the writer (a draft being saved) and the reader ([com.relaytester.app.core.storage.SupplierStore]),
+ * which may be handed a configuration an older build saved without any ceiling. Generous by
+ * design; the default prompt is "ping".
+ */
+const val MAX_TEST_PROMPT_CHARS = 16_384
+
 @Immutable
 data class TestSettings(
     val timeoutSeconds: Int = 20,
@@ -234,6 +245,15 @@ enum class TestStatus {
     PENDING,
     SUCCESS,
     FAILED,
+
+    /**
+     * The supplier is marked pull-only, so no request was sent.
+     *
+     * Distinct from [FAILED] because nothing failed: the outcome is a policy decision
+     * made before any socket opened. Folding it into FAILED made a deliberate skip read
+     * as a network error in every count, summary and export that grouped by status.
+     */
+    SKIPPED,
 }
 
 enum class ErrorKind(val label: String) {
@@ -255,6 +275,30 @@ enum class ErrorKind(val label: String) {
 data class TestError(
     val kind: ErrorKind,
     val message: String,
+)
+
+/**
+ * Whether a failure is worth sending the request again.
+ *
+ * Shared by the model-testing retry ([com.relaytester.app.feature.tester.BatchTestRunner]) and
+ * the animation generation, because "transient" has to mean one thing: two lists that drifted
+ * apart would make the same upstream error retryable on one screen and fatal on the other, and
+ * the drift would be invisible until someone compared them.
+ *
+ * The bar is that a second identical request can plausibly succeed. A dropped connection, a
+ * read timeout, a rate limit and a 5xx are all cases where the upstream or the link failed
+ * this time rather than the request being wrong. Excluded on purpose:
+ *  - authentication, quota, permission, missing model and pull-only: the request is the
+ *    problem, so repeating it spends a second request to be refused again;
+ *  - malformed or oversized responses: the answer was received, it just could not be used, so
+ *    an identical request would likely produce the same unusable answer;
+ *  - a refused redirect: that is an attack shape, not a hiccup.
+ */
+fun ErrorKind.isTransient(): Boolean = this in setOf(
+    ErrorKind.NETWORK,
+    ErrorKind.TIMEOUT,
+    ErrorKind.RATE_LIMITED,
+    ErrorKind.UPSTREAM,
 )
 
 @Immutable
@@ -296,6 +340,13 @@ data class TestRunSummary(
     val slowestLatencyMs: Long?,
     val totalTokens: Long,
     val errorCounts: Map<ErrorKind, Int>,
+    /**
+     * Rows no request was sent for (a pull-only supplier).
+     *
+     * Counted apart from [failed]: a skip is not an error, and folding the two together
+     * made a policy decision read as a failed run in the summary.
+     */
+    val skipped: Int = 0,
 )
 
 sealed interface ApiResult<out T> {

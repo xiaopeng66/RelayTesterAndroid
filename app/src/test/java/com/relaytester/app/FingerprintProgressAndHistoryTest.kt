@@ -259,6 +259,8 @@ class FingerprintProgressAndHistoryTest {
             maxTokens: Int,
             timeoutSeconds: Int,
             onProgress: suspend (String) -> Unit,
+        onReasoning: suspend (String) -> Unit,
+            salvageOnDisconnect: Boolean,
         ): ApiResult<String> = ApiResult.Success(answer)
     }
 
@@ -442,6 +444,8 @@ private class SteppedStreamingApi(private val chunks: List<String>) : RelayApi()
         maxTokens: Int,
         timeoutSeconds: Int,
         onProgress: suspend (String) -> Unit,
+    onReasoning: suspend (String) -> Unit,
+        salvageOnDisconnect: Boolean,
     ): ApiResult<String> {
         val accumulated = StringBuilder()
         // The first chunk is delivered before the stream waits, so the very first
@@ -494,6 +498,8 @@ private class ParkedCompletionApi : RelayApi() {
         maxTokens: Int,
         timeoutSeconds: Int,
         onProgress: suspend (String) -> Unit,
+    onReasoning: suspend (String) -> Unit,
+        salvageOnDisconnect: Boolean,
     ): ApiResult<String> {
         kotlinx.coroutines.awaitCancellation()
     }

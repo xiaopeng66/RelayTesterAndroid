@@ -97,11 +97,14 @@ class AndroidHistoryFileSystem(context: Context) : HistoryFileSystem {
  * corrupt file is not an error condition: it is treated as an empty history, which
  * loses nothing that could be reconstructed anyway.
  */
-class FingerprintHistoryStore(
+/**
+ * Open, with [append]/[clear] overridable: the ordering tests hold a write inside the
+ * store to prove a later command cannot overtake an earlier one.
+ */
+open class FingerprintHistoryStore(
     private val files: HistoryFileSystem,
     private val maxEntries: Int = MAX_ENTRIES,
-) {
-    /**
+) {    /**
      * The stored records, newest first.
      *
      * Reads are not cached: the file is tiny, the panel opens it rarely, and a cache
@@ -133,7 +136,7 @@ class FingerprintHistoryStore(
      * must never break the detection that produced it.
      */
     @Synchronized
-    fun append(entries: List<DetectionHistoryEntry>): Boolean {
+    open fun append(entries: List<DetectionHistoryEntry>): Boolean {
         if (entries.isEmpty()) return true
         val merged = (entries + load()).take(maxEntries.coerceAtLeast(1))
         return try {
@@ -146,7 +149,7 @@ class FingerprintHistoryStore(
 
     /** Empties the history; false when the file could not be rewritten. */
     @Synchronized
-    fun clear(): Boolean = try {
+    open fun clear(): Boolean = try {
         files.write(serialize(emptyList()))
         true
     } catch (error: IOException) {

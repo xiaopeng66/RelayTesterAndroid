@@ -129,6 +129,30 @@ class ReleaseRegressionTest {
     }
 
     @Test
+    fun aPromptThisBuildAcceptsSurvivesItsOwnBackupRoundTrip() {
+        // 兼容性边界：本版本允许并会保存的 Prompt 上限是 16_384，但备份导入侧对同一字段的
+        // 上限是 4_096，而且超限是**抛异常**而不是截断——于是「自己导出的备份，自己导不
+        // 回来」，报「备份中的 prompt 超出安全长度」。两端必须用同一个上限。
+        val longPrompt = "p".repeat(8_000)
+        val backup = buildBackup().let { value ->
+            value.copy(
+                suppliers = value.suppliers.map {
+                    it.copy(testSettings = it.testSettings.copy(prompt = longPrompt))
+                },
+            )
+        }
+
+        val plaintext = ConfigurationBackupCodec.exportPlaintext(backup)
+        val parsed = ConfigurationBackupCodec.parse(plaintext)
+
+        assertEquals(
+            "本版本能保存的 Prompt 必须能通过自己的备份导入",
+            longPrompt,
+            parsed.suppliers.single().testSettings.prompt,
+        )
+    }
+
+    @Test
     fun encryptedAndPlaintextBackupsRoundTripAndRejectMismatchedFormat() {
         val backup = buildBackup().let { value ->
             value.copy(

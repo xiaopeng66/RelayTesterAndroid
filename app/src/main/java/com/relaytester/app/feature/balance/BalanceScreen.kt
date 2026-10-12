@@ -12,6 +12,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -107,6 +108,7 @@ import com.relaytester.app.feature.tester.BalanceTemplateDraft
 import com.relaytester.app.feature.tester.BalanceTemplateErrors
 import com.relaytester.app.feature.tester.BalanceTemplateField
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.relaytester.app.feature.tester.BalanceCredentialsDraft
@@ -126,6 +128,13 @@ import kotlinx.coroutines.launch
 private val BALANCE_SUPPLIER_CARD_HEIGHT = 112.dp
 private val BALANCE_RING_SLOT_SIZE = 44.dp
 private val BALANCE_RING_DIAMETER = 36.dp
+
+/**
+ * Below this font-adjusted width (maxWidth / fontScale) the supplier cards drop to one
+ * column — the same floor where the catalog dialog's action bar stacks, for the same
+ * reason: two columns leave a card too narrow to tell its name apart.
+ */
+private val BALANCE_CARD_STACK_WIDTH = 342.dp
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -305,10 +314,16 @@ private fun BalanceHome(
                     onSelectSupplier = onSelectSupplier,
                     onRefreshSupplierBalance = onRefreshSupplierBalance,
                     onEditCredentials = { supplierId ->
-                        // 先切站点、切成功才记 id：与测试页同一处修正——切换被拒或写盘
-                        // 失败时留下 id，之后这个站点变成活动站点时弹窗会自己蹦出来。
-                        onSelectSupplier(supplierId) { activated ->
-                            if (activated) credentialsSupplierId = supplierId
+                        // 当前供应商的凭据本来就挂在本站草稿上：打开弹窗不涉及切站，
+                        // 模型测试运行中也要能查看、编辑和保存（保存只写余额字段，不碰
+                        // 进行中请求已捕获的凭据）。其他供应商仍要先激活，激活被运行锁
+                        // 拒绝时不开弹窗——与测试页同一处修正。
+                        if (supplierId == activeSupplier?.id) {
+                            credentialsSupplierId = supplierId
+                        } else {
+                            onSelectSupplier(supplierId) { activated ->
+                                if (activated) credentialsSupplierId = supplierId
+                            }
                         }
                     },
                     onDismissCredentials = onDismissCredentials,
@@ -411,32 +426,39 @@ private fun BalanceContent(
     onDeleteTemplate: (BalanceQueryTemplate) -> Unit,
     contentPadding: PaddingValues,
 ) {
-    LazyVerticalGrid(
-        columns = GridCells.Fixed(2),
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(
-            start = 16.dp,
-            top = contentPadding.calculateTopPadding() + 12.dp,
-            end = 16.dp,
-            bottom = contentPadding.calculateBottomPadding() + 24.dp,
-        ),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        item(
-            key = "balance_overview",
-            span = { GridItemSpan(maxLineSpan) },
-            contentType = "balance_overview",
+    // 320dp/1.6 字号下两列卡片把名称压成「供应…」，两个站点无法区分。以「按字号缩放
+    // 后的有效宽度」为准，低于高级目录操作栏堆叠的同一阈值（342dp）就降为单列：名称
+    // 整行可读，头部计数也一并换行，不靠截断硬撑。
+    val fontScale = LocalDensity.current.fontScale
+    BoxWithConstraints {
+        val stackSupplierCards = maxWidth / fontScale < BALANCE_CARD_STACK_WIDTH
+        LazyVerticalGrid(
+            columns = if (stackSupplierCards) GridCells.Fixed(1) else GridCells.Fixed(2),
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(
+                start = 16.dp,
+                top = contentPadding.calculateTopPadding() + 12.dp,
+                end = 16.dp,
+                bottom = contentPadding.calculateBottomPadding() + 24.dp,
+            ),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            BalanceOverviewHeader(
-                supplierCount = suppliers.size,
-                isQuerying = isQuerying,
-                enabled = !isSecretsHydrating,
-                progressDone = batchProgressDone,
-                progressTotal = batchProgressTotal,
-                onQueryAll = onQueryAll,
-            )
-        }
+            item(
+                key = "balance_overview",
+                span = { GridItemSpan(maxLineSpan) },
+                contentType = "balance_overview",
+            ) {
+                BalanceOverviewHeader(
+                    supplierCount = suppliers.size,
+                    isQuerying = isQuerying,
+                    enabled = !isSecretsHydrating,
+                    progressDone = batchProgressDone,
+                    progressTotal = batchProgressTotal,
+                    onQueryAll = onQueryAll,
+                    stacked = stackSupplierCards,
+                )
+            }
         items(
             items = suppliers,
             key = { it.id },
@@ -477,6 +499,8 @@ private fun BalanceContent(
                 errorMessage = activeSupplier?.let { errors[it.id] },
                 isQuerying = activeSupplier?.id in queryingSupplierIds,
                 canQuery = activeSupplier != null && selectedTemplate != null && !isSecretsHydrating,
+                // 与上面同一个判据：这张卡只关心**当前供应商**是否在查。用页面级的 isQuerying
+                // 会让「别的供应商正在查」把这张卡的按钮一起锁住——并行能力就白开了。
                 onQuery = onQuery,
             )
         }
@@ -495,6 +519,7 @@ private fun BalanceContent(
                 onDeleteTemplate = onDeleteTemplate,
             )
         }
+        }
     }
 }
 
@@ -506,33 +531,50 @@ private fun BalanceOverviewHeader(
     progressDone: Int,
     progressTotal: Int,
     onQueryAll: () -> Unit,
+    stacked: Boolean,
 ) {
     ElevatedCard(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier.padding(14.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Text("全部供应商余额", style = MaterialTheme.typography.titleMedium)
-                Spacer(Modifier.width(12.dp))
-                Text(
-                    "$supplierCount 个供应商",
-                    modifier = Modifier.widthIn(min = 56.dp),
-                    style = MaterialTheme.typography.labelLarge,
-                    color = MaterialTheme.colorScheme.primary,
-                    textAlign = TextAlign.End,
-                    maxLines = 1,
-                    softWrap = false,
-                    overflow = TextOverflow.Ellipsis,
-                )
+            if (stacked) {
+                // 单列同款降级：计数换行后不再和标题抢一行，320dp/1.6 也能读全。
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text("全部供应商余额", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "$supplierCount 个供应商",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+            } else {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text("全部供应商余额", style = MaterialTheme.typography.titleMedium)
+                    Spacer(Modifier.width(12.dp))
+                    Text(
+                        "$supplierCount 个供应商",
+                        modifier = Modifier.widthIn(min = 56.dp),
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary,
+                        textAlign = TextAlign.End,
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
             Button(
                 onClick = onQueryAll,
-                enabled = supplierCount > 0 && !isQuerying && enabled,
+                // Not gated on isQuerying: a batch may run while single-card refreshes are in
+                // flight for other sites — the view model claims only the free suppliers and
+                // reports when there was nothing for it to do. `enabled` still covers the
+                // bootstrap windows, which is what must refuse.
+                enabled = supplierCount > 0 && enabled,
                 modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
             ) {
                 Icon(Icons.Outlined.Refresh, contentDescription = null)
@@ -855,6 +897,15 @@ private fun BalanceCredentialsDialog(
                     onAccessTokenChange = onAccessTokenChange,
                     onUserIdChange = onUserIdChange,
                 )
+                if (!enabled) {
+                    // 禁用要带原因：查询进行中保存链路被拒，灰掉的输入框只说「不能」，
+                    // 不说「为什么」。查看本身不受限，弹窗仍能打开。
+                    Text(
+                        "余额查询进行中，暂不能修改或保存凭据",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         },
         confirmButton = {

@@ -21,12 +21,14 @@ class FingerprintScreenLabelTest {
         error: String? = null,
         parsed: Int = 0,
         received: Int = 0,
+        retrying: Boolean = false,
     ): ChallengeProgress = ChallengeProgress(
         challenge = FingerprintChallenge("c1", 300, "prompt"),
         state = state,
         parsedNumbers = parsed,
         error = error,
         receivedNumbers = received,
+        retrying = retrying,
     )
 
     @Test
@@ -45,6 +47,27 @@ class FingerprintScreenLabelTest {
 
         assertEquals("未采用", label)
         assertFalse("状态行不得重复有效性提示", label.contains(reason))
+    }
+
+    @Test
+    fun `an automatic re-ask says so in both wordings`() {
+        // 空白回答会带来一次自动重发（见 CHALLENGE_MAX_ATTEMPTS）。第二次等待如果还写
+        // 「接收中…」，读起来就是同一题卡住了——而它其实又花掉了一次请求。
+        assertEquals("正在重试…", stateLabel(entry(ChallengeState.REQUESTING, retrying = true)))
+        assertEquals(
+            "正在重试… 已收到 42 个整数",
+            stateLabel(entry(ChallengeState.REQUESTING, received = 42, retrying = true)),
+        )
+        assertEquals("重试中…", compactStateLabel(entry(ChallengeState.REQUESTING, retrying = true)))
+        assertEquals(
+            "重试中 42",
+            compactStateLabel(entry(ChallengeState.REQUESTING, received = 42, retrying = true)),
+        )
+        // 结题之后就不再有「重试中」：状态自己会说结果。
+        assertEquals(
+            "已接收 300 个有效数字",
+            stateLabel(entry(ChallengeState.RECEIVED, parsed = 300, retrying = true)),
+        )
     }
 
     @Test
@@ -76,6 +99,7 @@ class FingerprintScreenLabelTest {
         val longest = listOf(
             compactStateLabel(entry(ChallengeState.PENDING)),
             compactStateLabel(entry(ChallengeState.REQUESTING, received = 999)),
+            compactStateLabel(entry(ChallengeState.REQUESTING, received = 999, retrying = true)),
             compactStateLabel(entry(ChallengeState.RECEIVED, parsed = 999)),
             compactStateLabel(entry(ChallengeState.REJECTED)),
         ).maxBy { it.length }

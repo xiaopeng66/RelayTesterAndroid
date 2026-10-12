@@ -16,8 +16,11 @@ import com.relaytester.app.core.network.RelayApi
 import com.relaytester.app.core.security.SecretStore
 import com.relaytester.app.core.storage.SupplierStore
 import com.relaytester.app.core.storage.SupplierStoreState
+import com.relaytester.app.feature.tester.CatalogSaveOutcome
 import com.relaytester.app.feature.tester.TesterUiState
 import com.relaytester.app.feature.tester.TesterViewModel
+import com.relaytester.app.feature.tester.catalogSaveResetsDraft
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -25,9 +28,11 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -170,6 +175,238 @@ class TesterPanelRegressionTest {
 
         assertEquals("双击只允许一次查询", 1, api.calls.get())
         assertFalse(subject.balanceUiState.value.isQuerying)
+    }
+
+    @Test
+    fun `a single-card refresh runs beside a batch query without clearing its state`() {
+        // 并行要求：单卡刷新与批量余额查询可以同时在途。批量认领空闲供应商，单卡刷新
+        // 保有自己的占位；先完成的那个只释放自己，不得清空另一个的「查询中」标记。
+        // 用闸门而不是计时：三个请求必须真的同时挂在网上，而不是靠时间窗口猜。
+        //
+        // 刷新的必须是**非活动**站点：活动站点那条路要先过 `credentialTransactionMutex`
+        // 落凭据，而闸门把请求停在网络上时那把锁还握着——批量随后排在锁后，永远到不了网线。
+        // 那是测试自己造出来的顺序，不是并发缺陷（真实场景里活动站点刷新与批量并发时，
+        // 批量确实会先等一次凭据落盘，然后照常发出）。
+        val api = GatedBalanceApi()
+        val subject = viewModel(balanceApi = api)
+        seedBalanceState(subject, suppliers = 3)
+
+        subject.refreshSupplierBalance("supplier-2")
+        runBlocking { withTimeout(5_000) { api.started(1).await() } }
+
+        subject.queryAllBalances()
+
+        runBlocking {
+            withTimeout(5_000) { api.started(3).await() }
+        }
+        assertEquals("三个站点的请求必须同时在途", 3, api.inFlight.get())
+        assertTrue(
+            "单卡与批量必须同时持有占位（当前 ${subject.balanceUiState.value.queryingSupplierIds}）",
+            subject.balanceUiState.value.queryingSupplierIds.size >= 2,
+        )
+
+        api.releaseAll()
+        runBlocking {
+            withTimeout(5_000) {
+                while (subject.balanceUiState.value.isQuerying) delay(10)
+            }
+        }
+
+        val settled = subject.balanceUiState.value
+        assertFalse("全部结束后不得残留查询中状态", settled.isQuerying)
+        assertEquals("每个站点恰好查询一次", 3, api.calls.get())
+        assertEquals("三个站点都应有结果", 3, settled.balanceSnapshots.size)
+    }
+
+    @Test
+    fun `the advanced model search never contacts a testing-disabled supplier`() {
+        // 新要求：禁止测试的供应商不得出现在高级测试的候选里。执行层本来就会跳过它们，
+        // 但检索仍会为它们发一次模型目录请求，而且结果里会出现永远不能选的来源。
+        val api = RecordingModelsApi(listOf("model-a"))
+        val subject = viewModel(relayApi = api)
+        seedRunnableState(subject, secondSupplier = true)
+        setSupplierTestingDisabledForTest(subject, "supplier-2", disabled = true)
+
+        subject.searchAllCatalogModels("model")
+
+        runBlocking { delay(300) }
+
+        assertFalse(
+            "禁止测试的供应商不得被检索（实际请求过：${api.queriedSupplierIds}）",
+            api.queriedSupplierIds.contains("supplier-2"),
+        )
+        assertTrue(
+            "没被禁止的供应商仍应被检索",
+            api.queriedSupplierIds.contains("supplier-1"),
+        )
+        assertTrue(
+            "检索结果里不得出现禁止测试的来源：${subject.uiState.value.catalogSearchResults}",
+            subject.uiState.value.catalogSearchResults.none { it.supplierId == "supplier-2" },
+        )
+    }
+
+    @Test
+    fun `a normal test still starts while an advanced run is in flight`() {
+        // 要求是所有测试可并行：高级测试在它自己的弹窗里跑时，主界面的「开始测试」必须真的
+        // 发出请求，而不是可点却静默无效。两者各有各的作业与结果键。
+        val api = SlowApi(listOf("model-a"), holdMs = 10)
+        val subject = viewModel(api)
+        seedRunnableState(subject)
+        setUnifiedTestingForTest(subject)
+
+        subject.startTest()
+        runBlocking { delay(400) }
+
+        assertEquals("高级测试在跑时普通测试也必须发出请求", 1, api.calls.get())
+        assertTrue(subject.uiState.value.results.isNotEmpty())
+    }
+
+    @Test
+    fun `editing configuration is still locked while an advanced run is in flight`() {
+        // 反向不能过度放开：高级测试运行期间改供应商配置仍须被拒，否则它读到的是一份
+        // 半改的快照。这里只放开「启动测试」，配置编辑继续锁。
+        val subject = viewModel()
+        seedRunnableState(subject, secondSupplier = true)
+        setUnifiedTestingForTest(subject)
+
+        var reported: Boolean? = null
+        subject.selectSupplier("supplier-2") { reported = it }
+
+        assertEquals("高级测试在跑时切换供应商仍须被拒", false, reported)
+    }
+
+    @Test
+    fun `a batch with nothing left to query answers instead of doing nothing`() {
+        // 唯一供应商正在单卡刷新时，批量按钮仍是可点的（balanceQueryRefused 不含 isQuerying），
+        // 而批量只会认领空闲站点 → 认领集合为空 → 内部直接 return。结果是一次点击既不发请求
+        // 也没有任何提示，读起来就是按钮坏了。要么说清「都在查了／没有可查的」，要么别让点。
+        val api = GatedBalanceApi()
+        val subject = viewModel(balanceApi = api)
+        seedBalanceState(subject, suppliers = 1)
+
+        subject.refreshSupplierBalance("supplier-1")
+        runBlocking { withTimeout(5_000) { api.started(1).await() } }
+
+        subject.clearBalanceMessage()
+        subject.queryAllBalances()
+        runBlocking { delay(200) }
+
+        assertEquals("全部站点都已被占用时不得再发请求", 1, api.calls.get())
+        assertTrue(
+            "空批量必须给出说明，而不是静默无响应：${subject.balanceUiState.value.message}",
+            subject.balanceUiState.value.message != null,
+        )
+
+        api.releaseAll()
+        runBlocking { delay(200) }
+    }
+
+    @Test
+    fun `a refresh in flight for one supplier does not refuse another supplier's refresh`() {
+        // 并行要求的第一半在 ViewModel 里（按供应商占位），这一条钉住 UI 侧的同一个判据：
+        // 界面若按**页面级** isQuerying 禁用，A 在查时 B 就点不动，ViewModel 的并行能力白开。
+        val api = GatedBalanceApi()
+        val subject = viewModel(balanceApi = api)
+        seedBalanceState(subject, suppliers = 2)
+
+        subject.refreshSupplierBalance("supplier-1")
+        runBlocking { withTimeout(5_000) { api.started(1).await() } }
+
+        // 第二个供应商必须能发出自己的查询，而不是被第一个占着页面挡回去。
+        subject.refreshSupplierBalance("supplier-2")
+        runBlocking { withTimeout(5_000) { api.started(2).await() } }
+
+        assertEquals("两个供应商的刷新必须同时在途", 2, api.inFlight.get())
+        assertEquals(
+            "两条占位必须同时存在",
+            setOf("supplier-1", "supplier-2"),
+            subject.balanceUiState.value.queryingSupplierIds,
+        )
+
+        api.releaseAll()
+        runBlocking {
+            withTimeout(5_000) { while (subject.balanceUiState.value.isQuerying) delay(10) }
+        }
+        assertFalse("全部结束后不得残留查询中状态", subject.balanceUiState.value.isQuerying)
+    }
+
+    @Test
+    fun `a model search with nothing selectable answers inside the dialog`() {
+        // 全部供应商都被设为「禁止测试」时，检索没有对象。拒绝必须落在**弹窗渲染的那条状态**
+        // （catalogSearchMessage）上，而不是页面级 message——页面 snackbar 住在活动窗口里、
+        // 被弹窗盖住，用户点「检索」看到的是「什么也没发生」。同一条规则此前已用在拉取路径上。
+        val api = RecordingModelsApi(listOf("model-a"))
+        val subject = viewModel(relayApi = api)
+        seedRunnableState(subject, secondSupplier = true)
+        setSupplierTestingDisabledForTest(subject, "supplier-1", disabled = true)
+        setSupplierTestingDisabledForTest(subject, "supplier-2", disabled = true)
+
+        subject.searchAllCatalogModels("model")
+        runBlocking { delay(200) }
+
+        val state = subject.uiState.value
+        assertTrue(
+            "全禁止时的拒绝必须在弹窗状态里可见：${state.catalogSearchMessage}",
+            state.catalogSearchMessage?.contains("供应商") == true,
+        )
+        assertTrue("必须标红", state.isCatalogSearchError)
+        assertFalse("搜索不应真的发起", state.isCatalogSearching)
+        assertEquals("不得向被禁止的供应商发请求", 0, api.queriedSupplierIds.size)
+    }
+
+    @Test
+    fun `an empty keyword is also answered inside the dialog`() {
+        // 同一类：空关键词的拒绝也写在弹窗状态里，否则同样是「点了没反应」。
+        val subject = viewModel(relayApi = RecordingModelsApi(listOf("model-a")))
+        seedRunnableState(subject, secondSupplier = false)
+
+        subject.searchAllCatalogModels("   ")
+        runBlocking { delay(150) }
+
+        val state = subject.uiState.value
+        assertTrue(
+            "空关键词的拒绝必须在弹窗状态里可见：${state.catalogSearchMessage}",
+            state.catalogSearchMessage?.contains("关键词") == true,
+        )
+        assertTrue(state.isCatalogSearchError)
+    }
+
+    @Test
+    fun `the exported payload states how many rows it holds and whether a filter was on`() {
+        // 导出写的是**全部**结果，不是屏幕筛选后可见的那几行——这本身是对的，但文件里必须能
+        // 看出这件事：用户筛选后导出会拿到比屏幕多得多的行，没有记录就会被当成"导错了"。
+        val subject = viewModel()
+        seedRunnableState(subject)
+        setResultsForTest(
+            subject,
+            listOf(
+                ModelTestResult("model-a", TestStatus.SUCCESS, latencyMs = 5),
+                ModelTestResult("model-b", TestStatus.FAILED, latencyMs = 9),
+            ),
+        )
+        subject.updateResultQuery("model-a")
+
+        val payload = subject.buildExportPayload()
+        assertNotNull("有结果时必须能导出", payload)
+        val root = org.json.JSONObject(payload!!.json)
+        assertEquals("导出的行数是全部结果，不是筛选后的可见行", 2, root.getJSONArray("results").length())
+        assertEquals(
+            "文件要记录导出时的筛选条件，否则「为什么比屏幕多」无从解释",
+            "model-a",
+            root.optString("export_filter"),
+        )
+    }
+
+    @Test
+    fun `an unfiltered export records an empty filter`() {
+        val subject = viewModel()
+        seedRunnableState(subject)
+        setResultsForTest(subject, listOf(ModelTestResult("model-a", TestStatus.SUCCESS, latencyMs = 5)))
+
+        val payload = subject.buildExportPayload()
+        val root = org.json.JSONObject(payload!!.json)
+        assertEquals("没有筛选时该字段为空", "", root.optString("export_filter"))
+        assertEquals(1, root.getJSONArray("results").length())
     }
 
     // ---- Re-running part of a list ---------------------------------------
@@ -332,13 +569,163 @@ class TesterPanelRegressionTest {
         assertTrue(state.isCatalogPickerMessageError)
     }
 
+    // ---- Saving a model-catalog entry reports what happened ---------------
+
+    @Test
+    fun `an unchanged save reports success without touching the store`() {
+        // Two no-ops used to share one misleading line: an unchanged save is a success
+        // (the dialog may close), a vanished target is a failure (it may not).
+        val store = RecordingStore()
+        val subject = viewModel(supplierStore = store)
+        seedEntry(subject, ModelSource("supplier-1", "model-a"))
+
+        subject.updateModelCatalogEntry(ENTRY_ID, "entry", listOf(ModelSource("supplier-1", "model-a")))
+        runBlocking { delay(200) }
+
+        val outcome = subject.uiState.value.catalogSaveOutcome
+        assertNotNull("未改动保存也要有一次可确认的回执", outcome)
+        assertTrue("内容未变＝成功", outcome!!.success)
+        assertTrue("未变化必须单独说明", outcome.unchanged)
+        assertEquals("配置未变化", outcome.message)
+        assertEquals("未变化不得写盘", 0, store.saveCalls.get())
+    }
+
+    @Test
+    fun `a save whose target has been deleted reports failure`() {
+        // The entry was deleted from another window between opening the editor and
+        // saving. The save must not dress itself up as a success and close the dialog.
+        val subject = viewModel()
+        seedEntry(subject, ModelSource("supplier-1", "model-a"))
+
+        subject.updateModelCatalogEntry("entry-gone", "entry", listOf(ModelSource("supplier-1", "model-a")))
+        runBlocking { delay(200) }
+
+        val outcome = subject.uiState.value.catalogSaveOutcome
+        assertNotNull(outcome)
+        assertFalse("目标不存在必须报失败", outcome!!.success)
+        assertFalse(outcome.unchanged)
+        assertEquals("未找到要更新的模型来源", outcome.message)
+    }
+
+    @Test
+    fun `a failed configuration write rolls the entry back and reports failure`() {
+        val store = RecordingStore(fail = true)
+        val subject = viewModel(supplierStore = store)
+        seedEntry(subject, ModelSource("supplier-1", "model-a"))
+
+        subject.updateModelCatalogEntry(ENTRY_ID, "renamed", listOf(ModelSource("supplier-1", "model-a")))
+        runBlocking { delay(300) }
+
+        val state = subject.uiState.value
+        val outcome = state.catalogSaveOutcome
+        assertNotNull("写盘失败也要有回执", outcome)
+        assertFalse("写盘失败必须报失败", outcome!!.success)
+        assertTrue(outcome.message.contains("未能写入"))
+        assertEquals("失败后目录必须回到保存前", 1, state.modelCatalog.size)
+        assertEquals("entry", state.modelCatalog.first().name)
+        assertFalse("保存结束后不得残留保存中", state.isSavingCatalogEntry)
+    }
+
+    @Test
+    fun `a second save click while the first is writing is refused`() {
+        // The write parks inside the store, so the second click lands while
+        // isSavingCatalogEntry is up: without the guard both writes race the same draft.
+        val store = RecordingStore(gate = CompletableDeferred())
+        val subject = viewModel(supplierStore = store)
+        seedEntry(subject, ModelSource("supplier-1", "model-a"))
+
+        subject.updateModelCatalogEntry(ENTRY_ID, "renamed", listOf(ModelSource("supplier-1", "model-a")))
+        runBlocking { delay(200) }
+        assertEquals("第一次保存已进入写盘", 1, store.saveCalls.get())
+        assertTrue(subject.uiState.value.isSavingCatalogEntry)
+
+        subject.updateModelCatalogEntry(ENTRY_ID, "renamed", listOf(ModelSource("supplier-1", "model-a")))
+        runBlocking { delay(100) }
+        assertEquals("保存中的第二次点击不得再写盘", 1, store.saveCalls.get())
+
+        store.gate!!.complete(Unit)
+        runBlocking { delay(200) }
+        val outcome = subject.uiState.value.catalogSaveOutcome
+        assertTrue("放行后这一次保存必须成功落地", outcome!!.success)
+        assertFalse(subject.uiState.value.isSavingCatalogEntry)
+        assertEquals("renamed", subject.uiState.value.modelCatalog.first().name)
+    }
+
+    @Test
+    fun `the dialog resets its draft only for a success that matches the draft`() {
+        // The confirmation carries the draft it saved. A success that answers a session
+        // the user has already moved past (renamed, edited sources, switched rows) must
+        // not wipe the newer draft; a failure never resets anything.
+        val saved = CatalogSaveOutcome(
+            id = 1,
+            entryId = ENTRY_ID,
+            success = true,
+            unchanged = false,
+            savedName = "entry",
+            savedSources = listOf(ModelSource("supplier-1", "model-a")),
+            message = "已更新模型来源配置",
+        )
+        assertTrue(
+            "与保存时一致的会话才允许重置",
+            catalogSaveResetsDraft(saved, ENTRY_ID, "entry", listOf(ModelSource("supplier-1", "model-a"))),
+        )
+        assertFalse(
+            "保存期间又改了名字：晚到的成功不得清掉新草稿",
+            catalogSaveResetsDraft(saved, ENTRY_ID, "renamed", listOf(ModelSource("supplier-1", "model-a"))),
+        )
+        assertFalse(
+            "保存期间又加了来源：晚到的成功不得清掉新草稿",
+            catalogSaveResetsDraft(
+                saved,
+                ENTRY_ID,
+                "entry",
+                listOf(ModelSource("supplier-1", "model-a"), ModelSource("supplier-1", "model-b")),
+            ),
+        )
+        assertFalse(
+            "保存期间切到了另一行：回执不属于这个会话",
+            catalogSaveResetsDraft(saved, "entry-2", "entry", listOf(ModelSource("supplier-1", "model-a"))),
+        )
+        assertFalse(
+            "失败的结果永不重置草稿",
+            catalogSaveResetsDraft(
+                saved.copy(success = false),
+                ENTRY_ID,
+                "entry",
+                listOf(ModelSource("supplier-1", "model-a")),
+            ),
+        )
+    }
+
+    @Test
+    fun `a new entry's confirmation resets the same way`() {
+        // 新增会话的 entryId 是 null，回执的 entryId 也是 null：两边对得上才算同一次保存。
+        val saved = CatalogSaveOutcome(
+            id = 2,
+            entryId = null,
+            success = true,
+            unchanged = false,
+            savedName = "new entry",
+            savedSources = listOf(ModelSource("supplier-1", "model-a")),
+            message = "已添加模型来源配置",
+        )
+        assertTrue(
+            catalogSaveResetsDraft(saved, null, "new entry", listOf(ModelSource("supplier-1", "model-a"))),
+        )
+        assertFalse(
+            "编辑已有条目的会话不得被新增回执重置",
+            catalogSaveResetsDraft(saved, ENTRY_ID, "new entry", listOf(ModelSource("supplier-1", "model-a"))),
+        )
+    }
+
     // ---- Harness ---------------------------------------------------------
 
     private fun viewModel(
         relayApi: RelayApi = ModelsApi(emptyList()),
         balanceApi: BalanceApi = BalanceApi(),
+        supplierStore: SupplierStore = SilentStore(),
     ): TesterViewModel = TesterViewModel(
-        supplierStore = SilentStore(),
+        supplierStore = supplierStore,
         secretStore = object : SecretStore {
             override fun put(value: String): String = "secret-1"
             override fun get(secretId: String): String = "api-key"
@@ -403,6 +790,27 @@ class TesterPanelRegressionTest {
         state.value = state.value.copy(isInitializing = false, results = results)
     }
 
+    /** Flips the pull-only switch on a stored profile, the way the editor would persist it. */
+    private fun setSupplierTestingDisabledForTest(
+        subject: TesterViewModel,
+        supplierId: String,
+        disabled: Boolean,
+    ) {
+        val profilesField = TesterViewModel::class.java.getDeclaredField("profiles")
+        profilesField.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val profiles = profilesField.get(subject) as MutableList<SupplierProfile>
+        val index = profiles.indexOfFirst { it.id == supplierId }
+        if (index >= 0) {
+            profiles[index] = profiles[index].copy(isTestingDisabled = disabled)
+        }
+        val stateField = TesterViewModel::class.java.getDeclaredField("_uiState")
+        stateField.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val state = stateField.get(subject) as MutableStateFlow<TesterUiState>
+        state.value = state.value.copy(suppliers = profiles.toList())
+    }
+
     /** Puts the panel in the state a run leaves it in, which is what the guards read. */
     private fun setRunningForTest(subject: TesterViewModel) {
         val stateField = TesterViewModel::class.java.getDeclaredField("_uiState")
@@ -410,6 +818,18 @@ class TesterPanelRegressionTest {
         @Suppress("UNCHECKED_CAST")
         val state = stateField.get(subject) as MutableStateFlow<TesterUiState>
         state.value = state.value.copy(isRunning = true)
+    }
+
+    /** Puts the panel in the state an advanced source test leaves it in. */
+    private fun setUnifiedTestingForTest(subject: TesterViewModel) {
+        val stateField = TesterViewModel::class.java.getDeclaredField("_uiState")
+        stateField.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val state = stateField.get(subject) as MutableStateFlow<TesterUiState>
+        state.value = state.value.copy(
+            isUnifiedTesting = true,
+            unifiedTestingKeys = setOf("entry\u0000supplier-1\u0000model-x"),
+        )
     }
 
     /**
@@ -539,6 +959,26 @@ class TesterPanelRegressionTest {
         override suspend fun save(state: SupplierStoreState) = Unit
     }
 
+    /**
+     * Counts configuration writes, optionally failing them the way a full disk would,
+     * optionally parking inside the write so a test can observe the in-flight window.
+     */
+    private class RecordingStore(
+        private val fail: Boolean = false,
+        /** Parks a write inside the store until the test releases it. */
+        val gate: CompletableDeferred<Unit>? = null,
+    ) : SupplierStore(null) {
+        val saveCalls = java.util.concurrent.atomic.AtomicInteger(0)
+
+        override suspend fun read() = SupplierStoreState(emptyList(), null)
+
+        override suspend fun save(state: SupplierStoreState) {
+            saveCalls.incrementAndGet()
+            gate?.await()
+            if (fail) error("磁盘写入失败")
+        }
+    }
+
     /** A relay whose model directory is exactly [models]. */
     private class ModelsApi(private val models: List<String>) : RelayApi() {
         override suspend fun fetchModels(
@@ -546,6 +986,20 @@ class TesterPanelRegressionTest {
             apiKey: String,
             timeoutSeconds: Int,
         ): ApiResult<List<String>> = ApiResult.Success(models)
+    }
+
+    /** A directory relay that records which suppliers it was asked about. */
+    private class RecordingModelsApi(private val models: List<String>) : RelayApi() {
+        val queriedSupplierIds = java.util.Collections.synchronizedList(mutableListOf<String>())
+
+        override suspend fun fetchModels(
+            profile: SupplierProfile,
+            apiKey: String,
+            timeoutSeconds: Int,
+        ): ApiResult<List<String>> {
+            queriedSupplierIds += profile.id
+            return ApiResult.Success(models)
+        }
     }
 
     /** A relay that refuses every directory fetch with [reason]. */
@@ -613,6 +1067,70 @@ class TesterPanelRegressionTest {
             peak.updateAndGet { previous -> maxOf(previous, now) }
             delay(holdMs)
             inFlight.decrementAndGet()
+            return BalanceQueryResult.Success(
+                BalanceSnapshot(
+                    supplierId = profile.id,
+                    templateId = template.id,
+                    templateName = template.name,
+                    availableRaw = 1.0,
+                    unitLabel = "USD",
+                    scaleDivisor = 1.0,
+                    checkedAt = 0L,
+                    latencyMs = 1,
+                ),
+            )
+        }
+    }
+
+    /**
+     * A balance endpoint that parks every call until released, so a test can hold several
+     * requests in flight and observe the fan-out deterministically instead of by timing.
+     */
+    private class GatedBalanceApi : BalanceApi() {
+        val calls = java.util.concurrent.atomic.AtomicInteger(0)
+        val inFlight = java.util.concurrent.atomic.AtomicInteger(0)
+        private val gates = java.util.Collections.synchronizedList(mutableListOf<CompletableDeferred<Unit>>())
+
+        /** Resolves when at least [count] requests have arrived and are parked. */
+        fun started(count: Int): CompletableDeferred<Unit> {
+            val signal = CompletableDeferred<Unit>()
+            // A request may already have arrived before this was called (Unconfined runs the
+            // launch eagerly), so the current count is checked first — otherwise the signal
+            // waits for a *new* call that never comes.
+            if (calls.get() >= count) {
+                signal.complete(Unit)
+            } else {
+                pendingSignals += count to signal
+            }
+            return signal
+        }
+
+        private val pendingSignals =
+            java.util.Collections.synchronizedList(mutableListOf<Pair<Int, CompletableDeferred<Unit>>>())
+
+        fun releaseAll() {
+            synchronized(gates) { gates.toList() }.forEach { it.complete(Unit) }
+        }
+
+        override suspend fun query(
+            profile: SupplierProfile,
+            apiKey: String,
+            accessToken: String,
+            userId: String,
+            template: BalanceQueryTemplate,
+        ): BalanceQueryResult {
+            val gate = CompletableDeferred<Unit>()
+            val arrived = calls.incrementAndGet()
+            inFlight.incrementAndGet()
+            gates += gate
+            synchronized(pendingSignals) {
+                pendingSignals.filter { arrived >= it.first }.forEach { it.second.complete(Unit) }
+            }
+            try {
+                gate.await()
+            } finally {
+                inFlight.decrementAndGet()
+            }
             return BalanceQueryResult.Success(
                 BalanceSnapshot(
                     supplierId = profile.id,

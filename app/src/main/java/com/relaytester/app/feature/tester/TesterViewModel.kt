@@ -21,6 +21,7 @@ import com.relaytester.app.core.model.BalanceTemplateHeader
 import com.relaytester.app.core.model.BatchTestConfig
 import com.relaytester.app.core.model.ErrorKind
 import com.relaytester.app.core.model.ModelTestResult
+import com.relaytester.app.core.model.MAX_TEST_PROMPT_CHARS
 import com.relaytester.app.core.model.ModelCatalogEntry
 import com.relaytester.app.core.model.ModelSource
 import com.relaytester.app.core.model.RelayProtocol
@@ -138,7 +139,12 @@ data class SupplierDraft(
         testSettings = TestSettings(
             timeoutSeconds = timeoutSeconds.toIntOr(20).coerceIn(3, 120),
             concurrency = concurrency.toIntOr(2).coerceIn(1, 20),
-            prompt = prompt.trim().ifBlank { "ping" },
+            // Every other field on this object is validated (timeouts, concurrency, maxTokens);
+            // the prompt is the one that is stored verbatim, so it gets the same boundary: a
+            // select-all paste must not be written into the saved configuration and the
+            // encrypted backup. Clamped rather than refused, because the value is persisted
+            // as part of a supplier the user may already have saved.
+            prompt = prompt.trim().ifBlank { "ping" }.take(MAX_TEST_PROMPT_CHARS),
             keyword = keyword.trim(),
             quickFilterTerms = normalizeQuickFilterTerms(quickFilterTerms),
             maxTokens = maxTokens.toIntOr(4).coerceIn(1, 64),
@@ -245,6 +251,39 @@ data class TesterUiState(
      * site delisted the model or the supplier was removed.
      */
     val catalogMissingSources: Set<String> = emptySet(),
+    /**
+     * True while a model-catalog entry save is being persisted. The save button reads
+     * this to refuse a second submit, so one click cannot start two writes racing the
+     * same draft.
+     */
+    val isSavingCatalogEntry: Boolean = false,
+    /**
+     * How the last catalog save ended, published for the dialog that issued it.
+     *
+     * The dialog compares [CatalogSaveOutcome.savedName]/[savedSources] with what its
+     * draft holds now: only a draft that still *is* the saved content gets cleared, so
+     * a late success cannot wipe edits typed after the click, and a failure leaves the
+     * draft — errors included — on screen for another attempt.
+     */
+    val catalogSaveOutcome: CatalogSaveOutcome? = null,
+)
+
+/**
+ * One finished model-catalog save.
+ *
+ * [id] is handed out per save so a dialog can key on "this exact outcome" rather than
+ * on its content: two identical saves must each get their own confirmation.
+ */
+data class CatalogSaveOutcome(
+    val id: Long,
+    val entryId: String?,
+    val success: Boolean,
+    /** True when the save was a no-op because the entry already held this content. */
+    val unchanged: Boolean,
+    /** The exact draft the save carried, for the dialog's belongs-to check. */
+    val savedName: String,
+    val savedSources: List<ModelSource>,
+    val message: String,
 )
 
 @Immutable
@@ -565,6 +604,8 @@ class TesterViewModel(
     private var activeSupplierId: String? = null
     private var balanceTemplates = mutableListOf<BalanceQueryTemplate>()
     private var modelCatalog = mutableListOf<ModelCatalogEntry>()
+    /** Monotonic id for [CatalogSaveOutcome]; two identical saves stay distinguishable. */
+    private var catalogSaveSequence = 0L
     private var testJob: Job? = null
     private var unifiedTestJob: Job? = null
     private val unifiedTestJobs = mutableMapOf<String, Job>()
@@ -582,7 +623,12 @@ class TesterViewModel(
      * writes `isRunning = false` over the newer one's state.
      */
     private val testRunStartMutex = Mutex()
-    private val balanceQueryStartMutex = Mutex()
+    /** One balance request job per supplier; independent suppliers may run together. */
+    private val balanceJobs = mutableMapOf<String, Job>()
+    /** True while the batch fan-out owns the page; independent refreshes still run beside it. */
+    private var balanceBatchRunning = false
+    /** Serializes only the map reservation, never the network request itself. */
+    private val balanceJobsMutex = Mutex()
     /** Lock order: credential transaction -> profile mutation -> configuration write. */
     private val credentialTransactionMutex = Mutex()
     /** Serializes profile replacement and persistence when card refreshes finish together. */
@@ -768,12 +814,21 @@ class TesterViewModel(
         if (runningOrInitializing() || _uiState.value.isCatalogSearching) return
         val terms = parseModelFilterTerms(keyword)
         if (terms.isEmpty()) {
-            showMessage("请输入要检索的模型关键词", isError = true)
+            // 拒绝写在**弹窗渲染的那条状态**上，而不是页面级 message：这个入口住在高级测试
+            // 弹窗里，页面 snackbar 被弹窗自己的窗口盖住，只写那边等于「点了没反应」。拉取
+            // 路径早就遵守这条规则（见 fetchCatalogModels），检索的早退也必须一样。
+            showCatalogSearchMessage("请输入要检索的模型关键词", isError = true)
             return
         }
-        val supplierSnapshot = profiles.toList()
+        // Pull-only suppliers are excluded at the source: their models cannot be added as a
+        // test source, so offering them in the search would only produce rows that fail the
+        // execution-time policy check afterwards.
+        val supplierSnapshot = profiles.filterNot { it.isTestingDisabled }
         if (supplierSnapshot.isEmpty()) {
-            showMessage("请先添加供应商", isError = true)
+            showCatalogSearchMessage(
+                "没有可检索的供应商（禁止测试的供应商不参与）",
+                isError = true,
+            )
             return
         }
         val activeDraft = _uiState.value.draft
@@ -886,6 +941,9 @@ class TesterViewModel(
         sources: List<ModelSource>,
     ) {
         if (runningOrInitializing()) return
+        // One save at a time: a second click while the first is being written must not
+        // start a second write racing the same draft.
+        if (_uiState.value.isSavingCatalogEntry) return
         val cleanName = name.trim()
         val cleanSources = sources
             .map { it.copy(supplierId = it.supplierId.trim(), modelId = it.modelId.trim()) }
@@ -916,25 +974,99 @@ class TesterViewModel(
             return
         }
         viewModelScope.launch {
-            val previous = modelCatalog.toList()
-            val entry = ModelCatalogEntry(entryId ?: UUID.randomUUID().toString(), cleanName, cleanSources)
-            val next = if (entryId == null) {
-                previous + entry
-            } else {
-                previous.map { if (it.id == entryId) entry else it }
+            _uiState.update { it.copy(isSavingCatalogEntry = true, catalogSaveOutcome = null) }
+            try {
+                val previous = modelCatalog.toList()
+                val entry = ModelCatalogEntry(entryId ?: UUID.randomUUID().toString(), cleanName, cleanSources)
+                val next = if (entryId == null) {
+                    previous + entry
+                } else {
+                    previous.map { if (it.id == entryId) entry else it }
+                }
+                if (next == previous) {
+                    // Two different no-ops used to share one misleading message. A save
+                    // that found its target and changed nothing is a *successful* save;
+                    // a save whose target is gone is a failure and must not pretend
+                    // otherwise.
+                    val targetExists = entryId != null && previous.any { it.id == entryId }
+                    if (targetExists) {
+                        publishCatalogSaveOutcome(
+                            entryId = entryId,
+                            success = true,
+                            unchanged = true,
+                            savedName = cleanName,
+                            savedSources = cleanSources,
+                            message = "配置未变化",
+                        )
+                        showMessage("配置未变化")
+                    } else {
+                        publishCatalogSaveOutcome(
+                            entryId = entryId,
+                            success = false,
+                            unchanged = false,
+                            savedName = cleanName,
+                            savedSources = cleanSources,
+                            message = "未找到要更新的模型来源",
+                        )
+                        showMessage("未找到要更新的模型来源", isError = true)
+                    }
+                    return@launch
+                }
+                modelCatalog = next.toMutableList()
+                _uiState.update { it.copy(modelCatalog = next) }
+                if (!saveProfiles()) {
+                    modelCatalog = previous.toMutableList()
+                    _uiState.update { it.copy(modelCatalog = previous) }
+                    // The in-memory rollback keeps the catalogue honest; the outcome (and
+                    // the dialog, which keeps the draft until it sees success) lets the
+                    // user simply press save again.
+                    publishCatalogSaveOutcome(
+                        entryId = entryId,
+                        success = false,
+                        unchanged = false,
+                        savedName = cleanName,
+                        savedSources = cleanSources,
+                        message = "保存模型来源失败：本地配置未能写入，请重试",
+                    )
+                    showMessage("保存模型来源失败：本地配置未能写入，请重试", isError = true)
+                    return@launch
+                }
+                val message = if (entryId == null) "已添加模型来源配置" else "已更新模型来源配置"
+                publishCatalogSaveOutcome(
+                    entryId = entryId,
+                    success = true,
+                    unchanged = false,
+                    savedName = cleanName,
+                    savedSources = cleanSources,
+                    message = message,
+                )
+                showMessage(message)
+            } finally {
+                _uiState.update { it.copy(isSavingCatalogEntry = false) }
             }
-            if (next == previous) {
-                showMessage("未找到要更新的模型来源", isError = true)
-                return@launch
-            }
-            modelCatalog = next.toMutableList()
-            _uiState.update { it.copy(modelCatalog = next) }
-            if (!saveProfiles()) {
-                modelCatalog = previous.toMutableList()
-                _uiState.update { it.copy(modelCatalog = previous) }
-                return@launch
-            }
-            showMessage(if (entryId == null) "已添加模型来源配置" else "已更新模型来源配置")
+        }
+    }
+
+    private fun publishCatalogSaveOutcome(
+        entryId: String?,
+        success: Boolean,
+        unchanged: Boolean,
+        savedName: String,
+        savedSources: List<ModelSource>,
+        message: String,
+    ) {
+        _uiState.update {
+            it.copy(
+                catalogSaveOutcome = CatalogSaveOutcome(
+                    id = ++catalogSaveSequence,
+                    entryId = entryId,
+                    success = success,
+                    unchanged = unchanged,
+                    savedName = savedName,
+                    savedSources = savedSources,
+                    message = message,
+                ),
+            )
         }
     }
 
@@ -1101,8 +1233,12 @@ class TesterViewModel(
         entryId: String,
         sourceFilter: List<ModelSource>? = null,
     ) {
+        // A normal run no longer blocks this: advanced testing owns its own per-source jobs and
+        // its own result keys, and the requirement is that it may run freely beside the other
+        // panels. What must still hold is that the panel is not mid-bootstrap (its cached
+        // profiles and keys would be half-loaded) and that no catalog fetch is rewriting the
+        // picker state underneath the click.
         if (
-            _uiState.value.isRunning ||
             _uiState.value.isInitializing ||
             _uiState.value.isSecretsHydrating ||
             _configurationBackupUiState.value.isBusy ||
@@ -1132,24 +1268,59 @@ class TesterViewModel(
             showMessage("请先添加至少一个模型来源", isError = true)
             return
         }
+        // 仅拉取的来源在这里就被判为跳过，而不是排进进行中再去返回失败：它从不联网，
+        // 让它占一个进行中的名额（以及一条 FAILED）会让「进行中」和失败计数都撒谎。
+        val skippedTargets = targets.filter { target ->
+            profiles.firstOrNull { it.id == target.supplierId }?.isTestingDisabled == true
+        }
+        val skippedKeys = skippedTargets.mapTo(mutableSetOf()) {
+            unifiedResultKey(it.entryId, it.supplierId, it.sourceModel)
+        }
+        targets = targets.filterNot { it.supplierId in skippedTargets.map { s -> s.supplierId } }
         val activeKeys = _uiState.value.unifiedTestingKeys
         targets = targets.filter {
             unifiedResultKey(entryId, it.supplierId, it.sourceModel) !in activeKeys
         }
-        if (targets.isEmpty()) return
+        val skippedResults = skippedTargets.map { target ->
+            target.copy(
+                result = ModelTestResult(
+                    model = target.sourceModel,
+                    status = TestStatus.SKIPPED,
+                    error = TestError(
+                        ErrorKind.TESTING_DISABLED,
+                        "该供应商已禁止测试，仅允许拉取模型",
+                    ),
+                ),
+            )
+        }
+        if (targets.isEmpty()) {
+            // 全部来源都仅拉取：没有要发的请求，把跳过结果落盘并说明整体入口为何没跑。
+            _uiState.update { state ->
+                val preserved = state.unifiedResults.filterNot {
+                    unifiedResultKey(it.entryId, it.supplierId, it.sourceModel) in skippedKeys
+                }
+                state.copy(
+                    unifiedResults = preserved + skippedResults,
+                    message = "所选来源均为仅拉取，未发送任何请求",
+                    isMessageError = false,
+                )
+            }
+            return
+        }
         val jobId = UUID.randomUUID().toString()
         val targetKeys = targets.mapTo(mutableSetOf()) {
             unifiedResultKey(it.entryId, it.supplierId, it.sourceModel)
         }
         val previousResults = _uiState.value.unifiedResults
         val preservedResults = previousResults.filterNot {
-            unifiedResultKey(it.entryId, it.supplierId, it.sourceModel) in targetKeys
+            unifiedResultKey(it.entryId, it.supplierId, it.sourceModel) in targetKeys ||
+                unifiedResultKey(it.entryId, it.supplierId, it.sourceModel) in skippedKeys
         }
         _uiState.update {
             it.copy(
                 isUnifiedTesting = true,
                 unifiedTestingKeys = it.unifiedTestingKeys + targetKeys,
-                unifiedResults = preservedResults + targets.map { target ->
+                unifiedResults = preservedResults + skippedResults + targets.map { target ->
                     target.copy(
                         result = previousResults.firstOrNull {
                             it.entryId == target.entryId &&
@@ -1172,9 +1343,11 @@ class TesterViewModel(
                             val result = semaphore.withPermit {
                                 val profile = profiles.first { it.id == target.supplierId }
                                 if (profile.isTestingDisabled) {
+                                    // 上面的过滤已经把它们剔除；这里只是兜底，语义仍是
+                                    // 「跳过」而不是网络失败。
                                     return@withPermit ModelTestResult(
                                         model = target.sourceModel,
-                                        status = TestStatus.FAILED,
+                                        status = TestStatus.SKIPPED,
                                         error = com.relaytester.app.core.model.TestError(
                                             com.relaytester.app.core.model.ErrorKind.TESTING_DISABLED,
                                             "该供应商已禁止测试，仅允许拉取模型",
@@ -1752,7 +1925,8 @@ class TesterViewModel(
         viewModelScope.launch {
             val template = persistBalanceTemplate() ?: return@launch
             if (queryAfterSave) {
-                queryBalanceInternal(template)
+                val supplierId = activeSupplierId ?: return@launch
+                startBalanceJob(supplierId) { queryBalanceInternal(template) }
             }
         }
     }
@@ -1805,10 +1979,14 @@ class TesterViewModel(
     }
 
     fun queryBalance() {
-        if (balanceOperationBlocked()) return
-        if (!balanceQueryStartMutex.tryLock()) return
-        val job = viewModelScope.launch { queryBalanceInternal() }
-        releaseWhenSettled(balanceQueryStartMutex, job)
+        // Only the credential/initialisation windows block; a query already running for this
+        // supplier is deduplicated by the per-supplier balance job reservation.
+        if (balanceQueryRefused()) return
+        val supplierId = activeSupplierId ?: return
+        startBalanceJob(supplierId) {
+            if (persistDraft() == null || persistBalanceCredentials() == null) return@startBalanceJob
+            queryBalanceInternal()
+        }
     }
 
     /** Queries exactly the requested supplier without switching the active draft. */
@@ -1818,28 +1996,80 @@ class TesterViewModel(
             state.isInitializing ||
             state.isSecretsHydrating ||
             _configurationBackupUiState.value.isBusy ||
-            id in state.queryingSupplierIds ||
-            (state.isQuerying && state.batchProgressTotal > 1)
+            profiles.none { it.id == id }
         ) return
-        if (profiles.none { it.id == id }) return
-        if (!balanceQueryStartMutex.tryLock()) return
-        val job = viewModelScope.launch {
+        startBalanceJob(id) {
             val profile = if (id == activeSupplierId) {
-                if (persistDraft() == null || persistBalanceCredentials() == null) return@launch
+                if (persistDraft() == null || persistBalanceCredentials() == null) {
+                    return@startBalanceJob
+                }
                 profiles.firstOrNull { it.id == id }
             } else {
                 profiles.firstOrNull { it.id == id }
-            } ?: return@launch
+            } ?: return@startBalanceJob
             queryBalanceForSupplierInternal(profile)
         }
-        releaseWhenSettled(balanceQueryStartMutex, job)
     }
 
     fun queryAllBalances() {
-        if (balanceOperationBlocked()) return
-        if (!balanceQueryStartMutex.tryLock()) return
-        val job = viewModelScope.launch { queryAllBalancesInternal() }
-        releaseWhenSettled(balanceQueryStartMutex, job)
+        if (balanceQueryRefused()) return
+        viewModelScope.launch {
+            val batchJob = coroutineContext[Job]!!
+            // Claim only the suppliers that are free: a card refresh already running for one
+            // site keeps its own placeholder and its own result, and the batch leaves it alone.
+            val claimed = balanceJobsMutex.withLock {
+                if (balanceBatchRunning) {
+                    null
+                } else {
+                    balanceBatchRunning = true
+                    profiles.map { it.id }.filter { it !in balanceJobs }.also { ids ->
+                        ids.forEach { id -> balanceJobs[id] = batchJob }
+                    }
+                }
+            } ?: return@launch
+            if (claimed.isEmpty()) {
+                // Every site is already owned by another query (a card refresh holds the
+                // placeholder), or none is configured. The tap did no work; staying silent reads
+                // as a broken button, so say which of the two it is.
+                showBalanceMessage(
+                    if (profiles.isEmpty()) "没有可查询的供应商" else "所有供应商都在查询中，请稍候",
+                    isError = false,
+                )
+                balanceJobsMutex.withLock { balanceBatchRunning = false }
+                return@launch
+            }
+            try {
+                queryAllBalancesInternal(claimed.toSet())
+            } finally {
+                balanceJobsMutex.withLock {
+                    claimed.forEach { id ->
+                        if (balanceJobs[id] === batchJob) balanceJobs.remove(id)
+                    }
+                    balanceBatchRunning = false
+                }
+            }
+        }
+    }
+
+    private fun startBalanceJob(supplierId: String, block: suspend () -> Unit) {
+        viewModelScope.launch {
+            val reserved = balanceJobsMutex.withLock {
+                if (supplierId in balanceJobs) {
+                    false
+                } else {
+                    balanceJobs[supplierId] = coroutineContext[Job]!!
+                    true
+                }
+            }
+            if (!reserved) return@launch
+            try {
+                block()
+            } finally {
+                balanceJobsMutex.withLock {
+                    if (balanceJobs[supplierId] === coroutineContext[Job]) balanceJobs.remove(supplierId)
+                }
+            }
+        }
     }
 
     fun saveCurrentSupplier(onSaved: () -> Unit = {}) {
@@ -2383,7 +2613,7 @@ class TesterViewModel(
         }
 
     fun startTest() {
-        if (runningOrInitializing()) return
+        if (testStartRefused()) return
         if (runInFlight()) return
         if (!testRunStartMutex.tryLock()) return
         val job = viewModelScope.launch {
@@ -2452,7 +2682,7 @@ class TesterViewModel(
     }
 
     fun retryFailed() {
-        if (runningOrInitializing()) return
+        if (testStartRefused()) return
         if (runInFlight()) return
         if (!testRunStartMutex.tryLock()) return
         val job = viewModelScope.launch {
@@ -2470,7 +2700,7 @@ class TesterViewModel(
     }
 
     fun retestAll() {
-        if (runningOrInitializing()) return
+        if (testStartRefused()) return
         if (runInFlight()) return
         if (!testRunStartMutex.tryLock()) return
         val job = viewModelScope.launch {
@@ -2582,7 +2812,10 @@ class TesterViewModel(
                         when (it.status) {
                             TestStatus.SUCCESS -> 0
                             TestStatus.FAILED -> 1
-                            TestStatus.PENDING -> 2
+                            // A skip has no latency to rank, so it sits after the rows
+                            // that actually ran but before the ones still waiting.
+                            TestStatus.SKIPPED -> 2
+                            TestStatus.PENDING -> 3
                         }
                     }.thenBy { it.latencyMs ?: Long.MAX_VALUE }
                 },
@@ -2600,12 +2833,22 @@ class TesterViewModel(
             .put("base_url", profile.baseUrl)
             .put("protocol", profile.protocol.name)
             .put("generated_at", System.currentTimeMillis())
+            // The rows below are the *whole* result set, not the rows the screen is showing —
+            // filters are a way of reading, not a decision about what gets exported. Recording
+            // the filter that happened to be typed makes the file self-describing: an export
+            // taken while "model-a" was in the query box still holds every row, and this field
+            // is how anyone looking at it later knows why that is not a mistake.
+            .put("export_filter", state.resultQuery.trim())
             .put(
                 "summary",
                 JSONObject()
                     .put("total", summary?.total ?: state.results.size)
                     .put("ok", summary?.succeeded ?: state.results.count { it.status == TestStatus.SUCCESS })
                     .put("failed", summary?.failed ?: state.results.count { it.status == TestStatus.FAILED })
+                    .put(
+                        "skipped",
+                        summary?.skipped ?: state.results.count { it.status == TestStatus.SKIPPED },
+                    )
                     .put("avg_latency_ms", summary?.averageLatencyMs)
                     .put("total_tokens", summary?.totalTokens ?: 0),
             )
@@ -2688,20 +2931,33 @@ class TesterViewModel(
         return template
     }
 
+    /** Marks or clears one supplier's in-flight placeholder; other suppliers are untouched. */
+    private fun updateBalanceQueryState(supplierId: String, remove: Boolean = false) {
+        _balanceUiState.update { state ->
+            val ids = if (remove) {
+                state.queryingSupplierIds - supplierId
+            } else {
+                state.queryingSupplierIds + supplierId
+            }
+            state.copy(queryingSupplierIds = ids, isQuerying = ids.isNotEmpty())
+        }
+    }
+
     private suspend fun queryBalanceInternal(preferredTemplate: BalanceQueryTemplate? = null) {
+        var ownedSupplierId: String? = null
         try {
             val request = prepareBalanceRequest(preferredTemplate) ?: return
             val supplierId = request.profile.id
+            ownedSupplierId = supplierId
             _balanceUiState.update {
                 it.copy(
-                    isQuerying = true,
-                    queryingSupplierIds = setOf(supplierId),
                     batchProgressDone = 0,
                     batchProgressTotal = 1,
                     balanceErrors = it.balanceErrors - supplierId,
                     message = null,
                 )
             }
+            updateBalanceQueryState(supplierId)
             when (
                 val result = withContext(Dispatchers.IO) {
                     balanceApi.query(
@@ -2718,8 +2974,6 @@ class TesterViewModel(
                         it.copy(
                             balanceSnapshots = it.balanceSnapshots + (supplierId to result.snapshot),
                             balanceErrors = it.balanceErrors - supplierId,
-                            isQuerying = false,
-                            queryingSupplierIds = emptySet(),
                             batchProgressDone = 1,
                             message = "余额已更新",
                             isMessageError = false,
@@ -2732,8 +2986,6 @@ class TesterViewModel(
                     _balanceUiState.update {
                         it.copy(
                             balanceErrors = it.balanceErrors + (supplierId to result.message),
-                            isQuerying = false,
-                            queryingSupplierIds = emptySet(),
                             batchProgressDone = 1,
                             message = result.message,
                             isMessageError = true,
@@ -2747,8 +2999,6 @@ class TesterViewModel(
             _balanceUiState.update { state ->
                 val selectedId = activeSupplierId
                 state.copy(
-                    isQuerying = false,
-                    queryingSupplierIds = emptySet(),
                     balanceErrors = if (selectedId == null) {
                         state.balanceErrors
                     } else {
@@ -2760,6 +3010,8 @@ class TesterViewModel(
                     isMessageError = true,
                 )
             }
+        } finally {
+            ownedSupplierId?.let { updateBalanceQueryState(it, remove = true) }
         }
     }
 
@@ -2852,23 +3104,22 @@ class TesterViewModel(
      * Refreshes every configured supplier in parallel. Each supplier carries its
      * own persisted credentials, so one failure can never affect another site.
      */
-    private suspend fun queryAllBalancesInternal() {
+    private suspend fun queryAllBalancesInternal(claimedSupplierIds: Set<String>) {
         // Include a user's unsaved active-site values before taking the batch
         // snapshot. Other suppliers are always read from their own persisted
         // Keystore records and can never borrow these credentials.
         if (persistDraft() == null || persistBalanceCredentials() == null) return
-        val targets = profiles.toList()
+        val targets = profiles.filter { it.id in claimedSupplierIds }
         if (targets.isEmpty()) return
 
         _balanceUiState.update {
             it.copy(
-                isQuerying = true,
-                queryingSupplierIds = emptySet(),
                 batchProgressDone = 0,
                 batchProgressTotal = targets.size,
                 message = null,
             )
         }
+        targets.forEach { updateBalanceQueryState(it.id) }
 
         try {
             val succeeded = coroutineScope {
@@ -2879,10 +3130,7 @@ class TesterViewModel(
                 targets.map { profile ->
                     async {
                         _balanceUiState.update {
-                            it.copy(
-                                queryingSupplierIds = it.queryingSupplierIds + profile.id,
-                                balanceErrors = it.balanceErrors - profile.id,
-                            )
+                            it.copy(balanceErrors = it.balanceErrors - profile.id)
                         }
                         val preparation = try {
                             prepareBalanceRequestFor(profile)
@@ -2942,8 +3190,6 @@ class TesterViewModel(
             val failed = targets.size - succeeded
             _balanceUiState.update {
                 it.copy(
-                    isQuerying = false,
-                    queryingSupplierIds = emptySet(),
                     batchProgressDone = targets.size,
                     message = if (failed == 0) {
                         "已更新 $succeeded 个供应商"
@@ -2961,13 +3207,13 @@ class TesterViewModel(
         } catch (_: Throwable) {
             _balanceUiState.update {
                 it.copy(
-                    isQuerying = false,
-                    queryingSupplierIds = emptySet(),
                     batchProgressDone = targets.size,
                     message = "批量余额查询失败",
                     isMessageError = true,
                 )
             }
+        } finally {
+            targets.forEach { updateBalanceQueryState(it.id, remove = true) }
         }
     }
 
@@ -3766,12 +4012,13 @@ class TesterViewModel(
             }
             results
         }
-        // A pull-only supplier never issues a test request: publish the blocked
-        // outcome for every target so the list explains why nothing was sent.
+        // A pull-only supplier never issues a test request: publish the skipped
+        // outcome for every target so the list explains why nothing was sent. It is a
+        // skip, not a failure — a policy decision reached before any socket opened.
         if (request.profile.isTestingDisabled) {
             val blocked = initialResults.map { result ->
                 result.copy(
-                    status = TestStatus.FAILED,
+                    status = TestStatus.SKIPPED,
                     error = TestError(
                         ErrorKind.TESTING_DISABLED,
                         "该供应商已禁止测试，仅允许拉取模型",
@@ -3784,7 +4031,7 @@ class TesterViewModel(
                     results = blocked,
                     summary = blocked.toDisabledSummary(),
                     message = "该供应商已禁止测试，仅允许拉取模型",
-                    isMessageError = true,
+                    isMessageError = false,
                 )
             }
             return
@@ -3888,17 +4135,35 @@ class TesterViewModel(
         _uiState.update { it.copy(message = message, isMessageError = isError) }
     }
 
+    /**
+     * Reports a refusal on the state the advanced-test dialog renders.
+     *
+     * That dialog is its own window: a page-level [message] is drawn behind it and the user
+     * sees nothing happen. Every refusal produced while it is open — a missing keyword, no
+     * selectable supplier, a failed fetch — belongs on [TesterUiState.catalogSearchMessage]
+     * (which the search block renders, red when [TesterUiState.isCatalogSearchError]) rather
+     * than on the page's snackbar.
+     */
+    private fun showCatalogSearchMessage(message: String, isError: Boolean) {
+        _uiState.update {
+            it.copy(catalogSearchMessage = message, isCatalogSearchError = isError)
+        }
+    }
+
     /** Summarizes a run that never left the device because the supplier is pull-only. */
     private fun List<ModelTestResult>.toDisabledSummary(): TestRunSummary = TestRunSummary(
         total = size,
         succeeded = 0,
-        failed = size,
+        // Nothing failed: these rows were skipped by policy, and counting them under
+        // `failed` made the summary and the export read as a run full of errors.
+        failed = 0,
+        skipped = size,
         elapsedMs = 0L,
         averageLatencyMs = null,
         fastestLatencyMs = null,
         slowestLatencyMs = null,
         totalTokens = 0L,
-        errorCounts = mapOf(ErrorKind.TESTING_DISABLED to size),
+        errorCounts = emptyMap(),
     )
 
     private fun runningOrInitializing(): Boolean =
@@ -3906,6 +4171,35 @@ class TesterViewModel(
             _uiState.value.isUnifiedTesting ||
             _uiState.value.isInitializing ||
             _uiState.value.isSecretsHydrating ||
+            _configurationBackupUiState.value.isBusy
+
+    /**
+     * The start guard for a normal model run.
+     *
+     * Deliberately narrower than [runningOrInitializing]: an advanced (unified) source test
+     * running in its own dialog must not make 开始测试 silently do nothing — the two own
+     * separate jobs, result keys and cancellation, and the requirement is that they may run
+     * side by side. Only the bootstrap states (profiles/keys half-loaded) and a configuration
+     * import in flight still refuse, because those would make the run read a half-built
+     * snapshot. Configuration *editing* stays locked while a run is in flight, which is what
+     * [runningOrInitializing] keeps doing at its own call sites.
+     */
+    private fun testStartRefused(): Boolean =
+        _uiState.value.isRunning ||
+            _uiState.value.isInitializing ||
+            _uiState.value.isSecretsHydrating ||
+            _configurationBackupUiState.value.isBusy
+
+    /**
+     * The guards that a balance start shares with credential editing.
+     *
+     * `isQuerying` is deliberately absent: a query already running is deduplicated per
+     * supplier by the balance job reservation, so a global busy flag here would serialise
+     * independent suppliers the requirement says may run together.
+     */
+    private fun balanceQueryRefused(): Boolean =
+        _balanceUiState.value.isInitializing ||
+            _balanceUiState.value.isSecretsHydrating ||
             _configurationBackupUiState.value.isBusy
 
     private fun balanceOperationBlocked(): Boolean =

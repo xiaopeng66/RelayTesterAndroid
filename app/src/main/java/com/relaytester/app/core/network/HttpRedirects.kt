@@ -45,22 +45,44 @@ internal fun sameOriginRedirect(base: HttpUrl, location: String): HttpUrl? =
  *
  * Redirects are turned off so [executeSameOrigin] can enforce the origin policy itself;
  * OkHttp's default would silently re-send `Authorization`/`x-api-key` to any host a 3xx
- * names, and would downgrade https to http if asked. All four timeouts are set because
- * scaling only the call timeout leaves OkHttp's 10-second default read window in force.
+ * names, and would downgrade https to http if asked. Connect/read/write are all set because
+ * scaling only one of them leaves OkHttp's 10-second default in force for the others.
+ *
+ * [callSeconds] bounds the whole call and is therefore a **different kind** of limit from
+ * the other three: it counts the upstream's thinking time too, not just dead air. For a
+ * streaming completion that is the wrong watchdog — measured on a real thinking model, the
+ * upstream sat silent for 30–58 s before its response headers and then needed 850 s in total
+ * to produce the document, all of it healthy (bytes kept arriving). A whole-call bound of
+ * 605 s killed that request mid-thought, which is exactly the "思考到一半就失败" report.
+ * So callers pass a whole-call bound only where the total is genuinely known-bounded, and
+ * rely on `readSeconds` (a per-read window that any arriving byte resets) to notice a link
+ * that has actually gone silent. Pass [NO_CALL_TIMEOUT] to leave the call unbounded.
  */
 internal fun OkHttpClient.forSameOriginRequests(
     connectSeconds: Long,
     readSeconds: Long,
     writeSeconds: Long,
-    callSeconds: Long,
+    callSeconds: Long = NO_CALL_TIMEOUT,
 ): OkHttpClient = newBuilder()
     .followRedirects(false)
     .followSslRedirects(false)
     .connectTimeout(connectSeconds, TimeUnit.SECONDS)
     .readTimeout(readSeconds, TimeUnit.SECONDS)
     .writeTimeout(writeSeconds, TimeUnit.SECONDS)
-    .callTimeout(callSeconds, TimeUnit.SECONDS)
+    .apply {
+        // Zero is OkHttp's own encoding for "no whole-call timeout"; the other three
+        // timeouts still apply, so this is not "no limits" — it is "no bound on the total".
+        callTimeout(if (callSeconds == NO_CALL_TIMEOUT) 0L else callSeconds, TimeUnit.SECONDS)
+    }
     .build()
+
+/**
+ * [forSameOriginRequests]'s encoding for "do not bound the whole call".
+ *
+ * OkHttp reads a zero call timeout as unbounded, and its builder takes a primitive `long`,
+ * so a marker is clearer at the call site than a bare `0L` that looks like a bug.
+ */
+internal const val NO_CALL_TIMEOUT = 0L
 
 /**
  * Follows same-origin redirects only, refusing everything else.

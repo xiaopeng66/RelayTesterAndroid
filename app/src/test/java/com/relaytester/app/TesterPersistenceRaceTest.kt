@@ -20,6 +20,7 @@ import com.relaytester.app.core.security.SecretRead
 import com.relaytester.app.core.security.SecretStore
 import com.relaytester.app.core.storage.SupplierStore
 import com.relaytester.app.core.storage.SupplierStoreState
+import com.relaytester.app.core.model.MAX_TEST_PROMPT_CHARS
 import com.relaytester.app.feature.tester.SettingField
 import com.relaytester.app.feature.tester.TesterViewModel
 import java.util.concurrent.ConcurrentHashMap
@@ -168,6 +169,49 @@ class TesterPersistenceRaceTest {
             assertEquals("fixture-old-api", h.secrets.get(requireNotNull(durable.apiKeySecretId)))
             assertEquals(listOf("model-fresh"), durable.models)
             assertEquals(durable, h.vm.uiState.value.suppliers.single())
+        }
+    }
+
+    @Test
+    fun `an over-long test prompt is clamped before it reaches durable storage`() = runTest {
+        // 使用边界：测试 Prompt 会被写进落盘配置与加密备份，却是该设置对象里唯一没有上限的
+        // 字段——同组的超时/并发/maxTokens 全部有 coerceIn。一次「全选粘贴」就能把几 MB 文本
+        // 固化进配置。这里钉住：保存时必须被夹到上限，而不是原样落盘。
+        withHarness { h ->
+            // 必须先等启动读落地：`updateDraft` 在 `runningOrInitializing()` 期间会**静默拒绝**
+            // 编辑（有意的守卫），而本夹具的 VM 起步就是 isInitializing——不等就编辑，改动
+            // 进不了 draft，落盘的自然是默认值 "ping"，测试就会读到 4 个字符。
+            awaitReal { h.vm.uiState.first { !it.isInitializing } }
+
+            h.vm.updateSetting(SettingField.PROMPT, "p".repeat(MAX_TEST_PROMPT_CHARS + 5_000))
+            h.vm.saveCurrentSupplier()
+            runCurrent()
+            awaitReal { h.store.state.suppliers.isNotEmpty() }
+
+            assertEquals(
+                "超长 Prompt 必须被夹到上限后再落盘",
+                MAX_TEST_PROMPT_CHARS,
+                h.store.state.suppliers.single().testSettings.prompt.length,
+            )
+        }
+    }
+
+    @Test
+    fun `a prompt within the limit is stored verbatim`() = runTest {
+        withHarness { h ->
+            // 同前一条：编辑前必须先离开 isInitializing，否则 updateDraft 会静默丢弃这次编辑。
+            awaitReal { h.vm.uiState.first { !it.isInitializing } }
+            val prompt = "p".repeat(MAX_TEST_PROMPT_CHARS)
+            h.vm.updateSetting(SettingField.PROMPT, prompt)
+            h.vm.saveCurrentSupplier()
+            runCurrent()
+            awaitReal { h.store.state.suppliers.isNotEmpty() }
+
+            assertEquals(
+                "上限内的 Prompt 不得被改动",
+                prompt,
+                h.store.state.suppliers.single().testSettings.prompt,
+            )
         }
     }
 

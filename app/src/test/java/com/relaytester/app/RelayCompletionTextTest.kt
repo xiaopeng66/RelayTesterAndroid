@@ -86,4 +86,65 @@ class RelayCompletionTextTest {
         )
         assertEquals(numbers, RelayCompletionText.extract(body, RelayProtocol.CHAT_COMPLETIONS))
     }
+
+    @Test
+    fun `an explicit null reasoning field yields nothing, not the text null`() {
+        // 很多中转对非思考模型的每一帧都带 "reasoning_content": null。optString 对显式
+        // JSON null 返回四个字符 "null"，于是思考框被一行行 null 刷屏 —— 用户看到的就是
+        // 「思考输出 null」。空缺、显式 null 和非字符串都必须得到空串。
+        val explicitNull = JSONObject(
+            """{"choices":[{"delta":{"content":"","reasoning_content":null}}]}""",
+        )
+        assertEquals("", RelayCompletionText.extractStreamReasoning(explicitNull.toString(), RelayProtocol.CHAT_COMPLETIONS))
+
+        val nullReasoning = JSONObject(
+            """{"choices":[{"delta":{"content":"","reasoning":null}}]}""",
+        )
+        assertEquals("", RelayCompletionText.extractStreamReasoning(nullReasoning.toString(), RelayProtocol.CHAT_COMPLETIONS))
+
+        val missing = JSONObject("""{"choices":[{"delta":{"content":""}}]}""")
+        assertEquals("", RelayCompletionText.extractStreamReasoning(missing.toString(), RelayProtocol.CHAT_COMPLETIONS))
+    }
+
+    @Test
+    fun `reasoning is read from both field spellings`() {
+        val deepseek = JSONObject(
+            """{"choices":[{"delta":{"reasoning_content":"第一段思考。"}}]}""",
+        )
+        assertEquals("第一段思考。", RelayCompletionText.extractStreamReasoning(deepseek.toString(), RelayProtocol.CHAT_COMPLETIONS))
+
+        val renamed = JSONObject(
+            """{"choices":[{"delta":{"reasoning":"第二段思考。"}}]}""",
+        )
+        assertEquals("第二段思考。", RelayCompletionText.extractStreamReasoning(renamed.toString(), RelayProtocol.CHAT_COMPLETIONS))
+    }
+
+    @Test
+    fun `think blocks are stripped from a whole answer`() {
+        // 没有 reasoning 字段的部署把思考包在 <think> 标签里放进 content。整段提取时
+        // 这些块必须消失（缓冲路径没有思考通道可去），否则思考文本会被当答案计分。
+        assertEquals(
+            "正文",
+            RelayCompletionText.stripThinkBlocks("<think>想了一会。</think>正文"),
+        )
+        assertEquals(
+            "前后",
+            RelayCompletionText.stripThinkBlocks("前<think>秘密</think>后"),
+        )
+        // 流被掐断时 </think> 可能永远不来：未闭合的尾巴整段去掉。
+        assertEquals("开头", RelayCompletionText.stripThinkBlocks("开头<think>没写完"))
+        // 没有 think 块的回答原样返回。
+        assertEquals("<html></html>", RelayCompletionText.stripThinkBlocks("<html></html>"))
+    }
+
+    @Test
+    fun `a chat content carrying think blocks extracts the text outside them`() {
+        val body = JSONObject(
+            """{"choices":[{"message":{"content":"<think>想了很久。</think><html><body>x</body></html>"}}]}""",
+        )
+        assertEquals(
+            "<html><body>x</body></html>",
+            RelayCompletionText.extract(body, RelayProtocol.CHAT_COMPLETIONS),
+        )
+    }
 }

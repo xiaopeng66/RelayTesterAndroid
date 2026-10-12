@@ -10,6 +10,7 @@ import com.relaytester.app.core.model.BalanceQueryMode
 import com.relaytester.app.core.model.BalanceQueryTemplate
 import com.relaytester.app.core.model.BalanceSnapshot
 import com.relaytester.app.core.model.BalanceTemplateHeader
+import com.relaytester.app.core.model.MAX_TEST_PROMPT_CHARS
 import com.relaytester.app.core.model.ModelCatalogEntry
 import com.relaytester.app.core.model.ModelSource
 import com.relaytester.app.core.model.RelayProtocol
@@ -305,7 +306,13 @@ open class SupplierStore(private val context: Context?) {
             testSettings = TestSettings(
                 timeoutSeconds = settings.optInt("timeoutSeconds", 20).coerceIn(3, 120),
                 concurrency = settings.optInt("concurrency", 2).coerceIn(1, 20),
-                prompt = settings.optString("prompt", "ping").ifBlank { "ping" },
+                // Clamped on read as well as on write: a configuration saved by an earlier
+                // build has no ceiling, and the user would otherwise keep carrying its
+                // oversized prompt until they happened to edit that supplier. Every other
+                // field beside this one is already bounded here for the same reason.
+                prompt = settings.optString("prompt", "ping")
+                    .ifBlank { "ping" }
+                    .take(MAX_TEST_PROMPT_CHARS),
                 keyword = settings.optString("keyword", ""),
                 quickFilterTerms = readQuickFilterTerms(settings.optJSONArray("quickFilterTerms")),
                 maxTokens = settings.optInt("maxTokens", 4).coerceIn(1, 64),

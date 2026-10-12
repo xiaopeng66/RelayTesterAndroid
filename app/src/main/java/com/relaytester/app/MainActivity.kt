@@ -74,6 +74,9 @@ private fun RelayTesterApp() {
         val destination = AppDestination.entries.firstOrNull { it.name == destinationName }
             ?: AppDestination.MODEL_TEST
         val appUpdateState by appUpdateViewModel.uiState.collectAsStateWithLifecycle()
+        // 指纹页的状态也在这里收：动画测试的入口挂在模型测试页上，但要读的就是这份状态。
+        // 一次 collect 同时供两个页面用，避免同一份 StateFlow 被订阅两次。
+        val fingerprintState by fingerprintViewModel.uiState.collectAsStateWithLifecycle()
         val updateSnackbarHostState = remember { SnackbarHostState() }
         // The launch check: on every launch while the switch is on (the view model floors only
         // a second start of the same process). Keyed on nothing, so it runs once per activity,
@@ -114,6 +117,28 @@ private fun RelayTesterApp() {
                     fingerprintViewModel.prefill(testerViewModel.uiState.value.activeSupplierId, model)
                     destinationName = AppDestination.FINGERPRINT.name
                 },
+                // 动画测试的入口在模型测试页，但它的状态机、沙箱与请求路径都住在指纹
+                // ViewModel 里（预览最初就落地在那里）。这里只把同一份状态借给这一页，
+                // 不新建状态机、也不用它自己的供应商选择——那会把两张卡片的选中状态
+                // 绑在一起，在一边选供应商会清掉另一边正在看的结果。
+                animationState = fingerprintState.animation,
+                animationSuppliers = fingerprintState.suppliers,
+                onAnimationSupplierChange = fingerprintViewModel::selectAnimationSupplier,
+                onAnimationModelToggle = fingerprintViewModel::toggleAnimationModel,
+                onStartAnimationSelected = fingerprintViewModel::startSelectedAnimationTests,
+                onOpenAnimationSession = fingerprintViewModel::selectAnimationSession,
+                onRemoveAnimationSession = fingerprintViewModel::removeAnimationSession,
+                onAnimationPromptChange = fingerprintViewModel::updateAnimationPrompt,
+                onRestoreAnimationPrompt = fingerprintViewModel::restoreDefaultAnimationPrompt,
+                onRegenerateAnimation = fingerprintViewModel::startAnimationGeneration,
+                onCancelAnimation = fingerprintViewModel::cancelAnimationGeneration,
+                onReplayAnimation = fingerprintViewModel::replayAnimation,
+                onAnimationViewChange = fingerprintViewModel::showAnimationView,
+                onAnimationRenderFailure = fingerprintViewModel::reportAnimationRenderFailure,
+                onAnimationSnapshot = fingerprintViewModel::saveAnimationSnapshot,
+                onAnimationReasoningHold = fingerprintViewModel::holdAnimationReasoning,
+                onOpenAnimation = fingerprintViewModel::openAnimationPanel,
+                onCloseAnimation = fingerprintViewModel::closeAnimationPanel,
             )
 
             AppDestination.BALANCE -> BalanceScreen(

@@ -1,6 +1,7 @@
 package com.relaytester.app.feature.fingerprint
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -22,6 +23,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -36,8 +38,6 @@ import androidx.compose.material.icons.outlined.ExpandMore
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Badge
-import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Button
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
@@ -71,8 +71,12 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
@@ -90,6 +94,7 @@ import com.relaytester.app.core.fingerprint.DetectionHistoryEntry
 import com.relaytester.app.core.fingerprint.FingerprintCandidate
 import com.relaytester.app.core.fingerprint.FingerprintHistoryStore
 import com.relaytester.app.core.fingerprint.minimumNumbersFor
+import com.relaytester.app.ui.components.PullOnlyMarker
 import com.relaytester.app.ui.components.QuietIconButton
 import com.relaytester.app.ui.components.RelayAppHeader
 import com.relaytester.app.ui.components.UpdateDownloadRow
@@ -265,40 +270,10 @@ private fun FingerprintContent(
                             onFilterChange = onFilterChange,
                             onToggleModel = onToggleModel,
                             onClearSelection = onClearSelection,
+                            parallel = state.useParallel,
+                            onParallelChange = onParallelChange,
                             enabled = !state.isRunning,
                         )
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    "并行发送三题",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    // 名字挂在开关上，标题就不再单独播报一遍，否则读屏会把
-                                    // 同一句话念两次（标题一次、开关一次）。
-                                    modifier = Modifier.clearAndSetSemantics {},
-                                )
-                            }
-                            // 只有开关本身可切换：整行可点会带来两件用户不想要的事——点标题也
-                            // 翻状态，以及在一整行上铺一层高光（看着像选中效果）。整行合并语义
-                            // 试过不成立（开关自己就是合并节点，仍旧单独留在无障碍树里），所以
-                            // 名字挂在开关上：不这样读屏只会念「开关，已开启」。
-                            //
-                            // 按下时的水波纹整个盖在圆钮上，就是用户说的「圆疙瘩上的虚影」，
-                            // 而且按下态与选中态长得一样，看着像已经选中。这里把涟漪关掉：
-                            // LocalRippleConfiguration 置 null 会让 M3 的开关直接不挂涟漪节点
-                            // （DelegatingThemeAwareRippleNode 读到 null 就 removeRipple），
-                            // 状态仍由滑块位置与轨道颜色如实表达，点击照常切换。
-                            CompositionLocalProvider(LocalRippleConfiguration provides null) {
-                                Switch(
-                                    checked = state.useParallel,
-                                    onCheckedChange = onParallelChange,
-                                    enabled = !state.isRunning,
-                                    modifier = Modifier.semantics { contentDescription = "并行发送三题" },
-                                )
-                            }
-                        }
                     } else {
                         Text(
                             "把三道题目发给目标模型，再把回答粘回对应输入框。",
@@ -555,7 +530,11 @@ private fun ReferenceBankCard(
     onOpenUpdates: () -> Unit,
 ) {
     val context = LocalContext.current
-    val busy = state.isCheckingBankUpdate || state.isInstallingBank || state.isRunning
+    // 这份 busy 必须与 ViewModel 的 bankUpdateBusy() 逐项对齐，最后一项 isLoading 不能少：
+    // 启动读期间 isLoading = true，ViewModel 会拒绝包操作，而按钮若按更窄的条件判定就是
+    // 「可点却永远没反应」——正是用户读成「按钮坏了」的那种形态。这里多算一项，按钮在
+    // 那段时间正确变灰。
+    val busy = state.isCheckingBankUpdate || state.isInstallingBank || state.isRunning || state.isLoading
     // 删除检测包是本卡片唯一的破坏性动作，此前点一下就执行——同页「清空历史」、别处的
     // 删除供应商/模板/模型来源全都有确认，只有它没有。删掉之后检测功能要重新下载才能
     // 用，一次误触的代价是整包重下，所以补上同一套确认。
@@ -927,6 +906,10 @@ private fun SupportedModelsDialog(models: List<BankModelInfo>, onDismiss: () -> 
 /**
  * The panel's two pickers, styled the same way on purpose: a filled blue chip is the
  * selected one, so "which mode" and "which supplier" read at a glance.
+ *
+ * [pullOnly] draws the same red bar the 模型测试 supplier cards use, before the name. The
+ * chip used to spell it out as "· 仅拉取" after the name, which cost width on a row that
+ * scrolls sideways and said in words what the cards already say with a mark.
  */
 @Composable
 private fun SelectionChip(
@@ -934,6 +917,7 @@ private fun SelectionChip(
     label: String,
     onClick: () -> Unit,
     enabled: Boolean,
+    pullOnly: Boolean = false,
 ) {
     FilterChip(
         selected = selected,
@@ -944,12 +928,18 @@ private fun SelectionChip(
             selectedLabelColor = MaterialTheme.colorScheme.onPrimary,
         ),
         label = {
-            Text(
-                label,
-                maxLines = 1,
-                softWrap = false,
-                overflow = TextOverflow.Ellipsis,
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                if (pullOnly) PullOnlyMarker()
+                Text(
+                    label,
+                    maxLines = 1,
+                    softWrap = false,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         },
     )
 }
@@ -983,7 +973,11 @@ private fun SupplierPicker(
                 state.suppliers.forEach { supplier ->
                     SelectionChip(
                         selected = state.selectedSupplierId == supplier.id,
+                        // A pull-only supplier cannot start a round, so the chip is marked
+                        // rather than looking like every other one until 开始检测 refuses.
+                        // The mark is the red bar, matching the 模型测试 cards.
                         label = supplier.name,
+                        pullOnly = supplier.pullOnly,
                         onClick = { onSupplierChange(supplier.id) },
                         enabled = !state.isRunning,
                     )
@@ -994,75 +988,91 @@ private fun SupplierPicker(
 }
 
 /**
- * Model filter, its list dialog and the selection summary.
+ * The catalogue button and the parallel switch, one row.
  *
- * The text field is a search key over the supplier's catalogue, not a model name; the
- * catalogue itself lives behind the list button, where ticking rows chooses what to
- * detect, in tick order. Keeping the list off the panel is what keeps the run button and
- * the challenge cards on screen. When the keyword matches nothing — including a supplier
- * whose models were never pulled — the typed name is offered as a model of its own, so
- * such a model stays reachable.
+ * 这一行只有「打开模型列表」一个入口，筛选输入搬进了弹窗：列表在弹窗里，输入就挨着它
+ * 要过滤的那些行。以前输入框留在页面这一层，于是屏幕上同时存在两个筛选词——弹窗里那
+ * 个盖在页面那个上面，用户在前者里输入时，后者还在悄悄筛，看到的永远是两份过滤的交集。
+ * 合成一个状态之后，「我筛的是什么」只有一个答案。
+ *
+ * 药丸按钮显示的是勾选摘要（已选 N 个模型）而不是筛选词：它现在的职责是「把列表打开」，
+ * 而页面上真正需要一眼看到的是「即将检测哪几个」。摘要那行文字仍然在下面列全名字。
+ *
+ * 并行发送三题 shares the row rather than owning one: it is a property of the run this
+ * button configures, and on its own line it pushed the challenge cards further down.
  */
 @Composable
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 private fun ModelPicker(
     state: FingerprintUiState,
     onFilterChange: (String) -> Unit,
     onToggleModel: (String) -> Unit,
     onClearSelection: () -> Unit,
+    parallel: Boolean,
+    onParallelChange: (Boolean) -> Unit,
     enabled: Boolean,
 ) {
-    val matches = filterModels(state.models, state.modelFilter)
-    val unmatched = unmatchedKeyword(state.models, state.modelFilter)
     var listOpen by rememberSaveable { mutableStateOf(false) }
+    val selectedCount = state.selectedModels.size
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text("模型", style = MaterialTheme.typography.labelLarge)
 
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            // 贴底对齐，不是居中：OutlinedTextField 的布局盒比它画出来的框高 8 dp
-            // （带浮动标签时顶端要预留标签的位置），按布局盒居中会让按钮看着偏高
-            // ——实测按钮圆心比输入框可见边框的圆心高 9.5 px。两个都贴底，圆钮再
-            // 让出半个高度差，就与输入框的可见边框同心。
-            verticalAlignment = Alignment.Bottom,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            // 居中对齐：按钮与开关的可见中心落在同一条线上。
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            OutlinedTextField(
-                value = state.modelFilter,
-                onValueChange = onFilterChange,
-                modifier = Modifier.weight(1f),
+            OutlinedButton(
+                onClick = { listOpen = true },
                 enabled = enabled,
-                singleLine = true,
-                label = { Text("筛选模型") },
-                // 没有 placeholder：聚焦时它会被挤成两行，而字段名已经说明这里是筛选用。
-                leadingIcon = { Icon(Icons.Outlined.Search, contentDescription = null) },
-                trailingIcon = {
-                    if (state.modelFilter.isNotEmpty()) {
-                        IconButton(onClick = { onFilterChange("") }, enabled = enabled) {
-                            Icon(Icons.Outlined.Close, contentDescription = "清空筛选")
-                        }
-                    }
-                },
-            )
-            BadgedBox(
-                badge = {
-                    if (state.selectedModels.isNotEmpty()) {
-                        Badge { Text("${state.selectedModels.size}") }
-                    }
-                },
-                modifier = Modifier.padding(bottom = MODEL_LIST_BUTTON_INSET),
+                shape = androidx.compose.foundation.shape.RoundedCornerShape(percent = 50),
+                contentPadding = PaddingValues(horizontal = 16.dp),
+                modifier = Modifier
+                    .weight(1f)
+                    .heightIn(min = MODEL_ROW_HEIGHT),
             ) {
-                OutlinedIconButton(
-                    onClick = { listOpen = true },
+                Icon(
+                    Icons.AutoMirrored.Outlined.List,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    if (selectedCount == 0) "选择模型" else "已选 $selectedCount 个模型",
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 1,
+                    softWrap = false,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+
+            // 开关旁边补一句看得见的文字。只有一个孤零零的开关时，「并行」这个词只存在于
+            // 无障碍描述里——看得见的用户看不到它开的到底是什么。
+            Text(
+                "三题并行",
+                style = MaterialTheme.typography.bodyMedium,
+                // 名字挂在开关上，这行字就不再单独播报一遍，否则读屏会把同一句话念两次。
+                modifier = Modifier.clearAndSetSemantics {},
+            )
+
+            // 只有开关本身可切换：整行可点会带来两件用户不想要的事——点标题也翻状态，
+            // 以及在一整行上铺一层高光（看着像选中效果）。整行合并语义试过不成立（开关
+            // 自己就是合并节点，仍旧单独留在无障碍树里），所以名字挂在开关上：不这样
+            // 读屏只会念「开关，已开启」。
+            //
+            // 按下时的水波纹整个盖在圆钮上，就是用户说的「圆疙瘩上的虚影」，而且按下态
+            // 与选中态长得一样，看着像已经选中。这里把涟漪关掉：LocalRippleConfiguration
+            // 置 null 会让 M3 的开关直接不挂涟漪节点（DelegatingThemeAwareRippleNode 读
+            // 到 null 就 removeRipple），状态仍由滑块位置与轨道颜色如实表达，点击照常切换。
+            CompositionLocalProvider(LocalRippleConfiguration provides null) {
+                Switch(
+                    checked = parallel,
+                    onCheckedChange = onParallelChange,
                     enabled = enabled,
-                    modifier = Modifier.size(52.dp),
-                ) {
-                    Icon(
-                        Icons.AutoMirrored.Outlined.List,
-                        contentDescription = "选择模型",
-                        modifier = Modifier.size(22.dp),
-                    )
-                }
+                    modifier = Modifier.semantics { contentDescription = "并行发送三题" },
+                )
             }
         }
 
@@ -1083,11 +1093,12 @@ private fun ModelPicker(
 
     if (listOpen) {
         ModelListDialog(
-            matches = matches,
-            unmatched = unmatched,
+            models = state.models,
             catalogueEmpty = state.models.isEmpty(),
             selectedModels = state.selectedModels,
+            filter = state.modelFilter,
             enabled = enabled,
+            onFilterChange = onFilterChange,
             onToggleModel = onToggleModel,
             onClearSelection = onClearSelection,
             onDismiss = { listOpen = false },
@@ -1096,23 +1107,40 @@ private fun ModelPicker(
 }
 
 /**
- * The catalogue as a dialog, one row per model plus the typed fallback.
+ * The catalogue as a dialog: the filter field, one row per model, and the typed fallback.
  *
- * The filter field above keeps working while this is open, so typing narrows the list
- * here rather than behind the dialog. "清空" lives here rather than on the panel because
- * this is the only place a tick can be undone.
+ * The filter lives here, next to the rows it narrows, and it is the panel's own
+ * [FingerprintUiState.modelFilter] rather than a second dialog-local word. Two filter fields
+ * existed for a while — one on the page, one in here — and the page's kept narrowing the list
+ * behind the modal: `matches` arrived pre-filtered and the dialog filtered it again, so the
+ * rows on screen were the intersection of two keywords the user could only see one of. The
+ * visible symptom was a list narrowed by a word with no field anywhere to clear it, and a
+ * fallback row offering to test a name the user could no longer read. One field, one answer
+ * to "what am I filtering by".
+ *
+ * The field is shown even when the catalogue is empty. That case is exactly when a hand-typed
+ * model name is the only way forward, and the old version printed 「可直接输入模型名」 while
+ * rendering no field to type into — advice the dialog itself made impossible to follow.
+ * "清空" stays here rather than on the panel because this is the only place a tick can be undone.
  */
 @Composable
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 private fun ModelListDialog(
-    matches: List<String>,
-    unmatched: String?,
+    models: List<String>,
     catalogueEmpty: Boolean,
     selectedModels: List<String>,
+    filter: String,
     enabled: Boolean,
+    onFilterChange: (String) -> Unit,
     onToggleModel: (String) -> Unit,
     onClearSelection: () -> Unit,
     onDismiss: () -> Unit,
 ) {
+    // 过滤与兜底行都只算这一处：以前页面级和弹窗级各算一次，同一个名字可能同时出现两处，
+    // 而两处的关键词还不一样。
+    val filtered = filterModels(models, filter)
+    val unmatched = unmatchedKeyword(models, filter)
+
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("选择模型") },
@@ -1124,25 +1152,51 @@ private fun ModelListDialog(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                } else {
-                    Column(
+                }
+                OutlinedTextField(
+                    value = filter,
+                    onValueChange = onFilterChange,
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = enabled,
+                    singleLine = true,
+                    label = { Text("筛选模型") },
+                    leadingIcon = { Icon(Icons.Outlined.Search, contentDescription = null) },
+                    trailingIcon = {
+                        if (filter.isNotEmpty()) {
+                            IconButton(onClick = { onFilterChange("") }, enabled = enabled) {
+                                Icon(Icons.Outlined.Close, contentDescription = "清空筛选")
+                            }
+                        }
+                    },
+                )
+                if (!catalogueEmpty || unmatched != null) {
+                    if (filtered.isEmpty() && unmatched == null) {
+                        Text(
+                            "没有匹配的模型",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    LazyColumn(
                         modifier = Modifier
                             .fillMaxWidth()
                             // 一屏五行；其余在这个框里滚动，弹窗本身不会再长高。
-                            .heightIn(max = MODEL_ROW_HEIGHT * VISIBLE_MODEL_ROWS)
-                            .verticalScroll(rememberScrollState()),
+                            .heightIn(max = MODEL_ROW_HEIGHT * VISIBLE_MODEL_ROWS),
                     ) {
                         unmatched?.let { keyword ->
-                            ModelRow(
-                                label = keyword,
-                                supporting = "不在列表，直接检测",
-                                order = selectedModels.indexOf(keyword).takeIf { it >= 0 }?.plus(1),
-                                selected = keyword in selectedModels,
-                                enabled = enabled,
-                                onToggle = { onToggleModel(keyword) },
-                            )
+                            item(key = "unmatched:$keyword", contentType = "unmatched") {
+                                ModelRow(
+                                    label = keyword,
+                                    supporting = "不在列表，直接检测",
+                                    order = selectedModels.indexOf(keyword).takeIf { it >= 0 }?.plus(1),
+                                    selected = keyword in selectedModels,
+                                    enabled = enabled,
+                                    onToggle = { onToggleModel(keyword) },
+                                )
+                            }
                         }
-                        matches.forEach { model ->
+                        // 去重只防目录里重名行让 LazyColumn 的 key 撞车；顺序不变。
+                        items(filtered.distinct(), key = { it }, contentType = { "model" }) { model ->
                             ModelRow(
                                 label = model,
                                 supporting = null,
@@ -1428,20 +1482,6 @@ private val CHALLENGE_CELL_MIN_HEIGHT = 104.dp
  */
 private val CHALLENGE_RETRY_TOUCH_HEIGHT = 48.dp
 
-/**
- * How far the model-list button is lifted off the text field's bottom edge.
- *
- * An outlined text field's layout box is 8 dp taller than the box it draws: with a
- * floating label the top 8 dp are kept clear of the border (device measurement at
- * 420 dpi: layout box 64 dp, drawn border 56 dp, both ending on the same bottom edge).
- * Centring a 52 dp button against that whole layout box therefore floats its circle
- * 4 dp above the border's centre — the "button sits a bit high" this fixes.
- *
- * Bottom-aligning the two boxes removes the label reserve; this constant then centres
- * the 52 dp circle inside the 56 dp container slot: (56 - 52) / 2.
- */
-private val MODEL_LIST_BUTTON_INSET = 2.dp
-
 /** Past this the dialog scrolls instead of growing past the screen. */
 private val MODELS_DIALOG_MAX_HEIGHT = 380.dp
 
@@ -1612,25 +1652,38 @@ private fun ChallengeBlock(
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             if (model != null && status != null) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        "$ordinal",
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = FontWeight.Bold,
-                    )
-                    Text(
-                        model,
-                        modifier = Modifier.weight(1f),
-                        style = MaterialTheme.typography.labelLarge,
-                        maxLines = 1,
-                        softWrap = false,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    ModelStatusChip(status)
+                // 长模型名 + 按钮 + 状态胶囊在 320dp / 大字号下挤不进一行：名与按钮留
+                // 在首行（阅读顺序就是「哪个模型的什么动作」），状态被推到第二行，三个
+                // 元素都不截断，也不靠缩字号腾地方。
+                val fontScale = LocalDensity.current.fontScale
+                BoxWithConstraints {
+                    val stackStatus = maxWidth < CHALLENGE_HEADER_STACK_WIDTH ||
+                        fontScale >= CHALLENGE_HEADER_STACK_FONT_SCALE
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                "$ordinal",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.Bold,
+                            )
+                            Text(
+                                model,
+                                modifier = Modifier.weight(1f),
+                                style = MaterialTheme.typography.labelLarge,
+                                maxLines = 1,
+                                softWrap = false,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            if (!stackStatus) ModelStatusChip(status)
+                        }
+                        if (stackStatus) {
+                            ModelStatusChip(status)
+                        }
+                    }
                 }
             }
             // 三格等高：失败格多一行错误文本和重试按钮时，同组另外两格跟着一起长，
@@ -1655,10 +1708,15 @@ private fun ChallengeBlock(
     }
 }
 
+/** Below this width (or at these font scales) the status chip drops to its own line. */
+private val CHALLENGE_HEADER_STACK_WIDTH = 300.dp
+
+/** At this font scale or above the challenge header stacks, same as the width rule. */
+private const val CHALLENGE_HEADER_STACK_FONT_SCALE = 1.3f
+
 /** Which model this is and how far its round has got, as the block's own one-word badge. */
 @Composable
-private fun ModelStatusChip(status: ModelDetectionStatus) {
-    val text = when (status) {
+private fun ModelStatusChip(status: ModelDetectionStatus) {    val text = when (status) {
         ModelDetectionStatus.DONE -> "已出结果"
         ModelDetectionStatus.FAILED -> "失败"
         ModelDetectionStatus.RUNNING -> "正在检测"
@@ -1921,12 +1979,18 @@ private fun ManualChallengeCard(
  */
 internal fun stateLabel(entry: ChallengeProgress): String = when (entry.state) {
     ChallengeState.PENDING -> "等待发送"
-    ChallengeState.REQUESTING ->
-        if (entry.receivedNumbers > 0) {
-            "正在接收… 已收到 ${entry.receivedNumbers} 个整数"
-        } else {
-            "正在接收…"
-        }
+    ChallengeState.REQUESTING -> when {
+        // 重发是第二次请求，不是「从头再收一次」：状态词自己要说出来，不然它和第一次卡住
+        // 长得一模一样。数字到了照常带上——重试仍然是重试。
+        entry.retrying ->
+            if (entry.receivedNumbers > 0) {
+                "正在重试… 已收到 ${entry.receivedNumbers} 个整数"
+            } else {
+                "正在重试…"
+            }
+        entry.receivedNumbers > 0 -> "正在接收… 已收到 ${entry.receivedNumbers} 个整数"
+        else -> "正在接收…"
+    }
     ChallengeState.RECEIVED -> "已接收 ${entry.parsedNumbers} 个有效数字"
     ChallengeState.REJECTED -> "未采用"
 }
@@ -1941,8 +2005,13 @@ internal fun stateLabel(entry: ChallengeProgress): String = when (entry.state) {
  */
 internal fun compactStateLabel(entry: ChallengeProgress): String = when (entry.state) {
     ChallengeState.PENDING -> "等待发送"
-    ChallengeState.REQUESTING ->
-        if (entry.receivedNumbers > 0) "接收中 ${entry.receivedNumbers}" else "接收中…"
+    ChallengeState.REQUESTING -> when {
+        // 和长版同一个理由：一次自动重发的等待必须自称重发，否则读起来就是同一题卡住了。
+        entry.retrying ->
+            if (entry.receivedNumbers > 0) "重试中 ${entry.receivedNumbers}" else "重试中…"
+        entry.receivedNumbers > 0 -> "接收中 ${entry.receivedNumbers}"
+        else -> "接收中…"
+    }
     ChallengeState.RECEIVED -> "已接收 ${entry.parsedNumbers}"
     ChallengeState.REJECTED -> "未采用"
 }
@@ -2009,40 +2078,42 @@ private fun EvaluationCard(
             modifier = Modifier.fillMaxWidth().padding(14.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            Text("最接近的候选", style = MaterialTheme.typography.labelMedium)
-            Text(
-                displayName ?: "暂不可评分",
-                style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.SemiBold),
-                maxLines = 1,
-                softWrap = false,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                Column {
-                    Text("有效回答", style = MaterialTheme.typography.labelSmall)
-                    // 少于 3 条就没有置信度（红）；全部采用（绿）与部分采用（青）分开，
-                    // 与挑战行、状态词共用同一套语义色。
-                    val usableColor = when {
-                        usableAnswers < 3 -> MaterialTheme.colorScheme.error
-                        usableAnswers == submittedAnswers -> Color(0xFF15803D)
-                        else -> MaterialTheme.colorScheme.tertiary
-                    }
+            // 置信度从三列小字里搬出来，画成圆环放在右边原本空着的地方（用户要求）：左边
+            // 是候选名与有效回答/家族两列，右边的环自己带百分数，一眼读出「有多接近」。
+            // 没有置信度（未标定/样本不足）时不画环——空环或 0% 环都会被读成「置信为零」。
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("最接近的候选", style = MaterialTheme.typography.labelMedium)
                     Text(
-                        "$usableAnswers/$submittedAnswers",
-                        style = MaterialTheme.typography.titleSmall,
-                        color = usableColor,
+                        displayName ?: "暂不可评分",
+                        style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.SemiBold),
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis,
                     )
-                }
-                Column {
-                    Text("家族", style = MaterialTheme.typography.labelSmall)
-                    Text(familyName, style = MaterialTheme.typography.titleSmall)
-                }
-                probability?.let {
-                    Column {
-                        Text("置信", style = MaterialTheme.typography.labelSmall)
-                        Text("${(it * 100).toInt()}%", style = MaterialTheme.typography.titleSmall)
+                    Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                        Column {
+                            Text("有效回答", style = MaterialTheme.typography.labelSmall)
+                            // 少于 3 条就没有置信度（红）；全部采用（绿）与部分采用（青）分开，
+                            // 与挑战行、状态词共用同一套语义色。
+                            val usableColor = when {
+                                usableAnswers < 3 -> MaterialTheme.colorScheme.error
+                                usableAnswers == submittedAnswers -> Color(0xFF15803D)
+                                else -> MaterialTheme.colorScheme.tertiary
+                            }
+                            Text(
+                                "$usableAnswers/$submittedAnswers",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = usableColor,
+                            )
+                        }
+                        Column {
+                            Text("家族", style = MaterialTheme.typography.labelSmall)
+                            Text(familyName, style = MaterialTheme.typography.titleSmall)
+                        }
                     }
                 }
+                probability?.let { ConfidenceRing(probability = it) }
             }
             if (!calibrated) {
                 Text(
@@ -2062,6 +2133,58 @@ private fun EvaluationCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+    }
+}
+
+/** 置信度圆环的边长与描边：64dp 与卡片上半部（候选名 + 两列小字）同高，环心放得下三位数。 */
+private val CONFIDENCE_RING_SIZE = 64.dp
+private val CONFIDENCE_RING_STROKE = 6.dp
+
+/**
+ * 置信度圆环：环是占比，环心是百分数。
+ *
+ * 从 12 点钟方向顺时针走满 confidence 一圈；底轨用 outlineVariant（在卡片的
+ * secondaryContainer 上刚好读得出「没走满的那段」），进度用主色。无障碍名是「置信 n%」
+ * ——环心的文字只写了数字，读屏单独听「99%」不知道它是什么的百分比。
+ */
+@Composable
+private fun ConfidenceRing(probability: Double, modifier: Modifier = Modifier) {
+    val percent = (probability * 100).toInt()
+    val trackColor = MaterialTheme.colorScheme.outlineVariant
+    val progressColor = MaterialTheme.colorScheme.primary
+    Box(
+        modifier = modifier
+            .size(CONFIDENCE_RING_SIZE)
+            .semantics { contentDescription = "置信 $percent%" },
+        contentAlignment = Alignment.Center,
+    ) {
+        Canvas(Modifier.fillMaxSize()) {
+            val stroke = Stroke(width = CONFIDENCE_RING_STROKE.toPx(), cap = StrokeCap.Round)
+            val inset = CONFIDENCE_RING_STROKE.toPx() / 2f
+            val ringSize = Size(size.width - inset * 2f, size.height - inset * 2f)
+            drawArc(
+                color = trackColor,
+                startAngle = 0f,
+                sweepAngle = 360f,
+                useCenter = false,
+                topLeft = Offset(inset, inset),
+                size = ringSize,
+                style = stroke,
+            )
+            drawArc(
+                color = progressColor,
+                startAngle = -90f,
+                sweepAngle = (probability * 360.0).toFloat().coerceIn(0f, 360f),
+                useCenter = false,
+                topLeft = Offset(inset, inset),
+                size = ringSize,
+                style = stroke,
+            )
+        }
+        Text(
+            "$percent%",
+            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
+        )
     }
 }
 

@@ -8,6 +8,20 @@
     -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
+    <!--
+      The animation preview can hand a generated page to a browser. Since Android 11 an app
+      cannot see other installed apps without saying what it looks for, and `resolveActivity`
+      would answer null even on a device with three browsers — turning "open in browser" into a
+      false "没有找到可以打开网页的应用". This declares only the one intent the app actually
+      resolves: viewing an HTML document.
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:mimeType="text/html" />
+        </intent>
+    </queries>
+
     <application
         android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -43,6 +57,22 @@
             <meta-data
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/update_file_paths" />
+        </provider>
+
+        <!--
+          A second, separate provider for the animation preview's "在浏览器中打开" action. It
+          gets its own authority and its own paths file so the two shares cannot reach each
+          other's directories: the installer provider exposes only the downloaded APK, and this
+          one only the generated page a browser is asked to open.
+        -->
+        <provider
+            android:name=".core.update.PreviewProvider"
+            android:authorities="${applicationId}.previews"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/preview_file_paths" />
         </provider>
     </application>
 </manifest>

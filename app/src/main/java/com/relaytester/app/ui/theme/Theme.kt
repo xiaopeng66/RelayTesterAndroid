@@ -1,9 +1,16 @@
 package com.relaytester.app.ui.theme
 
+import androidx.compose.foundation.IndicationNodeFactory
+import androidx.compose.foundation.LocalIndication
+import androidx.compose.foundation.interaction.InteractionSource
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.LocalRippleConfiguration
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.foundation.isSystemInDarkTheme
 
@@ -55,14 +62,45 @@ private val DarkScheme = darkColorScheme(
     outline = Color(0xFF8D99AA),
 )
 
+/**
+ * 什么都不画的 Indication：按下不留痕迹。
+ *
+ * 实现为 [androidx.compose.foundation.IndicationNodeFactory]（新版库要求的写法，旧接口在
+ * 本版已经是编译错误），返回一个不做任何事情的 Modifier.Node——涟漪是挂在节点上的一条绘制
+ * 指令，不挂节点就是没有涟漪。
+ */
+private object NoPressGhostIndication : IndicationNodeFactory {
+    override fun create(interactionSource: InteractionSource) = NoPressGhostNode()
+
+    // IndicationNodeFactory 的契约：实例按引用比较（无状态、可缓存）——不用默认的
+    // equals 才能让 Modifier 组合树把「同一个指示」当作同一个实例去重。
+    override fun equals(other: Any?): Boolean = other === this
+    override fun hashCode(): Int = System.identityHashCode(this)
+}
+
+private class NoPressGhostNode : Modifier.Node()
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun RelayTesterTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
     content: @Composable () -> Unit,
 ) {
-    MaterialTheme(
-        colorScheme = if (darkTheme) DarkScheme else LightScheme,
-        typography = RelayTesterTypography,
-        content = content,
-    )
+    // 按下按钮不再留「虚影」。Material 的按钮在按下时画两层东西：涟漪与状态层，抬指后
+    // 那层半透明色还要留一会儿——用户把它读成「这个按钮被选中了」，可它不代表任何状态。
+    // 两个开关一起关：
+    //  * LocalRippleConfiguration = null：M3 组件不挂涟漪节点（Switch 与滑块此前为同一个
+    //    观感各自关过一次，这里是把同一个开关放大到全应用）；
+    //  * LocalIndication = NoPressGhostIndication：自绘的 clickable 也拿不到默认涟漪。
+    // 动作本身照常：选中态由颜色、描边、文字如实表达，点按也照旧触发。
+    CompositionLocalProvider(
+        LocalRippleConfiguration provides null,
+        LocalIndication provides NoPressGhostIndication,
+    ) {
+        MaterialTheme(
+            colorScheme = if (darkTheme) DarkScheme else LightScheme,
+            typography = RelayTesterTypography,
+            content = content,
+        )
+    }
 }

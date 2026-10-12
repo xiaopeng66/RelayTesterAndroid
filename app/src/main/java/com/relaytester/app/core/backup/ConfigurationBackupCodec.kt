@@ -2,6 +2,7 @@ package com.relaytester.app.core.backup
 
 import com.relaytester.app.core.model.BalanceHttpMethod
 import com.relaytester.app.core.model.BalanceQueryMode
+import com.relaytester.app.core.model.MAX_TEST_PROMPT_CHARS
 import com.relaytester.app.core.model.BalanceQueryTemplate
 import com.relaytester.app.core.model.BalanceTemplateHeader
 import com.relaytester.app.core.model.ModelCatalogEntry
@@ -456,7 +457,13 @@ object ConfigurationBackupCodec {
             testSettings = TestSettings(
                 timeoutSeconds = settings.optInt("timeoutSeconds", 20).coerceIn(3, 120),
                 concurrency = settings.optInt("concurrency", 2).coerceIn(1, 20),
-                prompt = settings.optionalBoundedString("prompt", 4_096).orEmpty().ifBlank { "ping" },
+                // Same ceiling the app enforces when it saves a supplier: this field's bound has
+                // to be one number, or a backup this build exports is refused by its own import
+                // ("备份中的 prompt 超出安全长度") and the user loses a configuration that was
+                // legal everywhere else.
+                prompt = settings.optionalBoundedString("prompt", MAX_TEST_PROMPT_CHARS)
+                    .orEmpty()
+                    .ifBlank { "ping" },
                 keyword = settings.optionalBoundedString("keyword", 512).orEmpty(),
                 quickFilterTerms = quickFilterTerms,
                 maxTokens = settings.optInt("maxTokens", 4).coerceIn(1, 64),

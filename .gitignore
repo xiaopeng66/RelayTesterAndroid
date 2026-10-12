@@ -30,3 +30,6 @@ __pycache__/
 ## Distribution artifacts are published as release assets, never committed
 *.apk
 *.aab
+
+## 本地临时物（探测脚本、截图、验证产物）
+/tmp/

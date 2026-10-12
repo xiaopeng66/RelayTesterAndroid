@@ -3,6 +3,9 @@ package com.relaytester.app
 import com.relaytester.app.core.fingerprint.BankManifestParser
 import com.relaytester.app.core.fingerprint.BankSource
 import com.relaytester.app.core.fingerprint.BankUpdateClient
+import com.relaytester.app.core.fingerprint.DetectionHistoryEntry
+import com.relaytester.app.core.fingerprint.FingerprintHistoryStore
+import com.relaytester.app.core.fingerprint.HistoryFileSystem
 import com.relaytester.app.core.fingerprint.sha256Hex
 import com.relaytester.app.core.fingerprint.FingerprintBank
 import com.relaytester.app.core.fingerprint.minimumNumbersFor
@@ -24,6 +27,7 @@ import com.relaytester.app.feature.fingerprint.ChallengeState
 import com.relaytester.app.feature.fingerprint.DetectionMode
 import com.relaytester.app.feature.fingerprint.FingerprintViewModel
 import com.relaytester.app.feature.fingerprint.ModelDetectionStatus
+import com.relaytester.app.feature.fingerprint.compactStateLabel
 import com.relaytester.app.feature.fingerprint.formatBankBuiltAt
 import java.io.File
 import java.io.IOException
@@ -129,6 +133,8 @@ class FingerprintViewModelTest {
         /** Follows the test scheduler's virtual time; see [virtualClock]. */
         clock: () -> Long = { virtualClock() },
         bankCheckIntervalMillis: Long = UpdatePreferencesState.APP_CHECK_INTERVAL_MILLIS,
+        /** Set by the retry-isolation tests that assert on written history rows. */
+        historyStore: FingerprintHistoryStore? = null,
     ): FingerprintViewModel = FingerprintViewModel(
         supplierStore = store,
         secretStore = object : SecretStore {
@@ -141,6 +147,7 @@ class FingerprintViewModelTest {
         bankUpdateClient = BankUpdateClient(fetcher = bankFetcher),
         updatePreferences = updatePreferences,
         appVersionCode = appVersionCode,
+        historyStore = historyStore,
         skipRestore = skipRestore,
         ioDispatcher = ioDispatcher,
         clock = clock,
@@ -158,10 +165,12 @@ class FingerprintViewModelTest {
         bankFetcher: FakeHttpFetcher = FakeHttpFetcher(),
         /** The main test dispatcher keeps the check deterministic; IO would not. */
         ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+        historyStore: FingerprintHistoryStore? = null,
     ): FingerprintViewModel = apiViewModel(
         api = api,
         bankFetcher = bankFetcher,
         ioDispatcher = ioDispatcher,
+        historyStore = historyStore,
     ).apply {
         selectSupplier("sup-1")
         // Ticked one at a time, exactly as the checkboxes do; the tick order is what
@@ -187,6 +196,8 @@ class FingerprintViewModelTest {
         bankFetcher: FakeHttpFetcher = FakeHttpFetcher(),
         appVersionCode: Long = 10_400L,
         updatePreferences: MemoryUpdatePreferences = MemoryUpdatePreferences(),
+        /** Set by the retry-isolation tests that assert on written history rows. */
+        historyStore: FingerprintHistoryStore? = null,
     ): FingerprintViewModel = apiViewModel(
         api = api,
         store = store,
@@ -196,15 +207,27 @@ class FingerprintViewModelTest {
         bankFetcher = bankFetcher,
         appVersionCode = appVersionCode,
         updatePreferences = updatePreferences,
+        historyStore = historyStore,
     ).apply {
         models.forEach { toggleModelSelection(it) }
         selectMode(DetectionMode.API)
     }
 
-    /** Waits for the batch list to leave its interim states, or fails on a stall. */
+    /**
+     * Waits for the batch list to leave its interim states, or fails on a stall.
+     *
+     * The launch is not synchronous with the call that starts it: [runApiDetection]
+     * publishes the rows from inside the round's coroutine, so a bare poll can look at
+     * an empty list, see nothing PENDING or RUNNING, and return while the round it is
+     * supposed to be waiting for has not even started. Waiting for the panel to go busy
+     * first closes that window — only then does "no row is waiting" mean the round ended.
+     */
     private fun awaitBatchSettled(subject: FingerprintViewModel) {
         runBlocking {
             withTimeout(BATCH_SETTLE_TIMEOUT_MS) {
+                while (!subject.uiState.value.isRunning && subject.uiState.value.batchResults.isEmpty()) {
+                    delay(10)
+                }
                 while (subject.uiState.value.batchResults.any {
                         it.status == ModelDetectionStatus.PENDING ||
                             it.status == ModelDetectionStatus.RUNNING
@@ -421,6 +444,150 @@ class FingerprintViewModelTest {
         assertEquals("失败后重试只重问这一题", callsBeforeRetry + 1, api.calls.get())
         assertEquals("重试的是同一道题", before, subject.uiState.value.progress[0].challenge.id)
         assertEquals("重试后仍要给出这轮的结论", 1, subject.uiState.value.batchResults.size)
+    }
+
+    @Test
+    fun `a blank answer is asked again instead of ending the challenge`() {
+        // 真实供应商实测：同一道题四次里有一次 HTTP 200、整段流、正文 0 字符（模型把整个
+        // 8192 的预算花在思考通道里，finish_reason: length），而同一请求其余三次都拿到了
+        // 正文。空白是上游自己的硬币，不是这次请求的属性，所以这一题必须自动再问一次——
+        // 这条测试钉的就是「空白不是终局」。
+        val api = BlankAskThenAnswerApi(answers = listOf(numbersAnswer()))
+        val subject = readyApiViewModel(api)
+
+        subject.runApiDetection()
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { subject.awaitIdle() } }
+
+        val state = subject.uiState.value
+        assertEquals("三题 + 那次自动重发", 4, api.calls.get())
+        assertTrue(
+            "重发之后不该有任何一题停在失败上：${state.progress.map { it.state }}",
+            state.progress.all { it.state == ChallengeState.RECEIVED },
+        )
+    }
+
+    @Test
+    fun `a model that only thinks is reported as such after both asks`() {
+        // 两次都空白、两次的思考通道都有内容：重发没救回来。报错要说清是「模型只想不写」，
+        // 用户据此决定稍后再试还是换模型，而不是以为应用坏了。
+        val api = BlankAskThenAnswerApi(
+            answers = listOf(numbersAnswer()),
+            blankAsks = setOf(0, 1),
+            blankReasoning = "让我先规划一下：逐项取值、不要规律……",
+        )
+        val subject = readyApiViewModelFor(SingleSupplierStore(testSupplier()), api).apply {
+            updateParallel(false)
+        }
+
+        subject.runApiDetection()
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { subject.awaitIdle() } }
+
+        val entry = subject.uiState.value.progress[0]
+        assertEquals("空白那题问了两次，另外两题各一次", 4, api.calls.get())
+        assertEquals(ChallengeState.REJECTED, entry.state)
+        val error = entry.error.orEmpty()
+        assertTrue("要说清模型只输出了思考：$error", error.contains("思考"))
+        assertTrue("也要说清已经自动重发过：$error", error.contains("自动重试 1 次"))
+        assertTrue(
+            "其余两题不受影响",
+            subject.uiState.value.progress.drop(1).all { it.state == ChallengeState.RECEIVED },
+        )
+    }
+
+    @Test
+    fun `a silent blank keeps the upstream wording after both asks`() {
+        // 思考通道也没有内容的空白：不能反过来谎称「模型只想不写」，只能说上游没给正文，
+        // 并且同样要说清自动重发已经跑过。
+        val api = BlankAskThenAnswerApi(answers = listOf(numbersAnswer()), blankAsks = setOf(0, 1))
+        val subject = readyApiViewModelFor(SingleSupplierStore(testSupplier()), api).apply {
+            updateParallel(false)
+        }
+
+        subject.runApiDetection()
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { subject.awaitIdle() } }
+
+        val error = subject.uiState.value.progress[0].error.orEmpty()
+        assertTrue("保持上游原话：$error", error.contains("没有可用的文本内容"))
+        assertFalse("没有思考就不得声称模型只想不写：$error", error.contains("思考"))
+        assertTrue("自动重发的事实必须在：$error", error.contains("自动重试 1 次"))
+        assertEquals(4, api.calls.get())
+    }
+
+    @Test
+    fun `only a blank answer is worth re-asking`() {
+        // 502 这类失败重发同样的请求只会再被拒一次，自动重发的入口必须精确等于空白；
+        // 认宽了，一次坏上游就会把每一题都变成两次请求。
+        val api = BlankAskThenAnswerApi(
+            answers = listOf(numbersAnswer()),
+            blankAsks = setOf(0, 1, 2),
+            failure = TestError(ErrorKind.UPSTREAM, "上游返回 HTTP 502"),
+        )
+        val subject = readyApiViewModel(api)
+
+        subject.runApiDetection()
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { subject.awaitIdle() } }
+
+        assertEquals("三题各问一次，没有重发", 3, api.calls.get())
+        assertTrue(
+            "每一题都保留上游的原话",
+            subject.uiState.value.progress.all { it.error == "上游返回 HTTP 502" },
+        )
+    }
+
+    @Test
+    fun `the automatic re-ask announces itself while it runs`() {
+        val api = ParkedReaskApi(listOf(numbersAnswer()))
+        val subject = readyApiViewModelFor(SingleSupplierStore(testSupplier()), api).apply {
+            updateParallel(false)
+        }
+        val prompt0 = subject.uiState.value.progress[0].challenge.prompt
+
+        subject.runApiDetection()
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.reaskParked.await() } }
+
+        val mid = subject.uiState.value
+        assertTrue("整轮仍在跑", mid.isRunning)
+        assertEquals("空白不是终局：这一题还在被问", ChallengeState.REQUESTING, mid.progress[0].state)
+        assertTrue("第二次等待必须自称重试", mid.progress[0].retrying)
+        assertEquals("重试中…", compactStateLabel(mid.progress[0]))
+        assertNull("重试期间不挂上一次的空手失败", mid.progress[0].error)
+        assertEquals("重发问的还是同一道题", listOf(prompt0, prompt0), api.prompts.take(2))
+
+        api.release()
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { subject.awaitIdle() } }
+
+        assertEquals("三题 + 一次重发", 4, api.calls.get())
+        val settled = subject.uiState.value.progress[0]
+        assertEquals(ChallengeState.RECEIVED, settled.state)
+        assertFalse("结题后不再自称重试", settled.retrying)
+    }
+
+    @Test
+    fun `cancelling while the automatic re-ask is in flight sends nothing more`() {
+        // 重发是一次真实请求，取消它必须和取消首问一样干净：不再补发、不把「已接收」写回
+        // 一张已经没人看的卡，也不给缓存留一个占着槽位的结果。这一条钉的是 1.7.19 新增的
+        // 那道 `current()` 守卫——它挡在重发决定之前。
+        val api = ParkedReaskApi(listOf(numbersAnswer()))
+        val subject = readyApiViewModelFor(SingleSupplierStore(testSupplier()), api).apply {
+            updateParallel(false)
+        }
+
+        subject.runApiDetection()
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.reaskParked.await() } }
+        assertEquals("首问空白 + 一次重发已经在飞", 2, api.calls.get())
+
+        subject.cancelRun()
+        api.release()
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { subject.awaitIdle() } }
+
+        assertEquals("取消之后不得再有第三次请求", 2, api.calls.get())
+        assertFalse("整轮已经停下", subject.uiState.value.isRunning)
+        assertEquals(
+            "被取消的一题退回等待发送，而不是写回结果",
+            ChallengeState.PENDING,
+            subject.uiState.value.progress[0].state,
+        )
+        assertNull("取消后不留错误话术", subject.uiState.value.progress[0].error)
     }
 
     @Test
@@ -940,6 +1107,64 @@ class FingerprintViewModelTest {
     }
 
     @Test
+    fun `a finished round can be started again`() {
+        // [runInFlight] now asks whether the handle exists at all, so it reports "busy" for
+        // as long as the finished round's handle is still in place. That must not wedge the
+        // panel: 再点一次开始 has to go out again once the round really ended.
+        val api = FakeCompletionApi(goldenCase().answers)
+        val subject = readyApiViewModel(api, models = listOf("test-model"))
+
+        subject.runApiDetection()
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { subject.awaitIdle() } }
+        val afterFirst = api.calls.get()
+
+        subject.runApiDetection()
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { subject.awaitIdle() } }
+
+        assertEquals(
+            "跑完的一轮不能把面板锁死（再点开始没有发出任何请求）",
+            afterFirst + 3,
+            api.calls.get(),
+        )
+    }
+
+    @Test
+    fun `a cancelled round can be started again`() {
+        // 用户报告：检测中点取消以后，再点开始没有任何反应。取消只是把这一轮停掉，
+        // 不是把面板锁死——取消清理结束之后必须能立刻重开一轮。
+        val api = GatedCompletionApi(goldenCase().answers)
+        val subject = readyApiViewModel(api, parallel = false, models = listOf("m-1"))
+
+        subject.runApiDetection()
+        runBlocking { api.started.await() }
+        // 第一轮只发出第一题就停在这里，取消后它剩下的两题不会再上线。
+        assertEquals("取消前应该只有一题在线上", 1, api.models.size)
+
+        subject.cancelRun()
+        // 让被取消的 job 连同它的清理真正跑完，这才是「用户又点了一次」的时刻。
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { subject.awaitIdle() } }
+
+        assertFalse(subject.uiState.value.isRunning)
+
+        // 再点一次开始：这一轮自己的三题都必须重新发出。计数用「这一轮自己的题数」，
+        // 而不是「比上次多一题」——一轮本来就是三题。
+        subject.runApiDetection()
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { subject.awaitIdle() } }
+
+        assertEquals(
+            "取消后必须还能重新开始检测（再点开始没有发出任何请求）",
+            1 + subject.uiState.value.progress.size,
+            api.models.size,
+        )
+        assertTrue(
+            "重开的一轮必须真的跑完，而不是停在 RUNNING",
+            subject.uiState.value.batchResults.none {
+                it.status == ModelDetectionStatus.RUNNING || it.status == ModelDetectionStatus.PENDING
+            },
+        )
+    }
+
+    @Test
     fun `switching supplier drops the previous supplier's ticked models`() {
         val subject = apiViewModel(FakeCompletionApi(goldenCase().answers)).apply {
             selectSupplier("sup-1")
@@ -1278,6 +1503,59 @@ class FingerprintViewModelTest {
         assertNull(state.activeModel)
         assertTrue("必须把原因告诉用户", state.isMessageError)
         assertEquals("配置读取失败", state.message)
+    }
+
+    @Test
+    fun `a pull-only supplier is refused before any request is sent`() {
+        // 禁止测试：只拉模型，不发测试请求 is a promise about this app's behaviour. The 模型测试
+        // page enforced it and the fingerprint page did not, so a user who set it precisely
+        // because the station is expensive still had a three-question round spent on its key.
+        // The assertion is on the fake's call count: the switch has to be honoured *before*
+        // the socket, not explained afterwards.
+        val api = FakeCompletionApi(goldenCase().answers)
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier().copy(isTestingDisabled = true)),
+            api,
+        )
+        runBlocking { subject.awaitIdle() }
+
+        subject.runApiDetection()
+        runBlocking { subject.awaitIdle() }
+
+        assertEquals("仅拉取供应商不得发出任何请求", 0, api.calls.get())
+        val state = subject.uiState.value
+        assertFalse("拒绝后不能停在运行中", state.isRunning)
+        assertTrue("必须说明是用户自己的设置拦下了它", state.isMessageError)
+        assertTrue(
+            "理由要点明是仅拉取：${state.message}",
+            state.message?.contains("仅拉取") == true,
+        )
+    }
+
+    @Test
+    fun `a pull-only supplier is reported as such in the panel list`() {
+        // The refusal above must not be a surprise: the chip carries the red pull-only
+        // marker before the user picks it, so the setting is visible where it applies
+        // rather than only where it bites. This flag is what the chip draws that mark from.
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier().copy(isTestingDisabled = true)),
+            FakeCompletionApi(goldenCase().answers),
+        )
+        runBlocking { subject.awaitIdle() }
+
+        val option = subject.uiState.value.suppliers.single()
+        assertTrue("列表必须带上仅拉取标记", option.pullOnly)
+    }
+
+    @Test
+    fun `a normal supplier is not marked pull-only`() {
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+        )
+        runBlocking { subject.awaitIdle() }
+
+        assertFalse(subject.uiState.value.suppliers.single().pullOnly)
     }
 
     @Test
@@ -2413,6 +2691,317 @@ class FingerprintViewModelTest {
         assertFalse(subject.uiState.value.isCheckingBankUpdate)
         subject.cancelRun()
     }
+
+    @Test
+    fun `a package action during the startup read refuses without claiming the package is updating`() {
+        // 启动读期间 isLoading = true：ViewModel 会拒绝包操作（快照还没就绪），这是对的；
+        // 但它不得谎报「检测包正在更新」——首屏自己写着「正在加载」，再弹一条错误是误导。
+        // 真正要守的是另一半：卡片上的按钮必须按同一条件变灰，不能可点却无反应
+        // （FingerprintScreen 的 busy 里补上了 isLoading，见那里的说明）。
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFiles = MemoryBankFileSystem(installed = bankWithBuiltAt(patchStamp)),
+        )
+        setLoadingForTest(subject, loading = true)
+        subject.clearMessage()
+
+        subject.removeInstalledPackage()
+        runBlocking { subject.awaitIdle() }
+
+        assertFalse("启动读期间不得把包操作执行下去", subject.uiState.value.isInstallingBank)
+        assertFalse(
+            "启动读期间不得谎报检测包正在更新：${subject.uiState.value.message}",
+            subject.uiState.value.message?.contains("更新") == true,
+        )
+    }
+
+    @Test
+    fun `a package action during a real install says why`() {
+        // 反向：真正在换包时必须出声说明，否则用户以为按钮坏了。用 isInstallingBank 模拟
+        // 「正在更新」这个真实忙碌窗口。
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            FakeCompletionApi(goldenCase().answers),
+            bankFiles = MemoryBankFileSystem(installed = bankWithBuiltAt(patchStamp)),
+        )
+        setInstallingForTest(subject, installing = true)
+        subject.clearMessage()
+
+        subject.removeInstalledPackage()
+
+        assertTrue(
+            "换包期间被拒绝必须说明原因：${subject.uiState.value.message}",
+            subject.uiState.value.message?.contains("更新") == true,
+        )
+    }
+
+    /** Forces the startup-read flag, the window where the package actions are refused. */
+    private fun setLoadingForTest(subject: FingerprintViewModel, loading: Boolean) {
+        setUiStateFlagForTest(subject) { it.copy(isLoading = loading) }
+    }
+
+    private fun setInstallingForTest(subject: FingerprintViewModel, installing: Boolean) {
+        setUiStateFlagForTest(subject) { it.copy(isInstallingBank = installing) }
+    }
+
+    private fun setUiStateFlagForTest(
+        subject: FingerprintViewModel,
+        transform: (com.relaytester.app.feature.fingerprint.FingerprintUiState) ->
+            com.relaytester.app.feature.fingerprint.FingerprintUiState,
+    ) {
+        val field = FingerprintViewModel::class.java.getDeclaredField("_uiState")
+        field.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val state = field.get(subject) as kotlinx.coroutines.flow.MutableStateFlow<
+            com.relaytester.app.feature.fingerprint.FingerprintUiState
+            >
+        state.value = transform(state.value)
+    }
+
+    // ---- R02：单题重试与轮次的隔离 ------------------------------------------
+    //
+    // 每条用例同一个骨架：主轮跑完且第一题失败 → 重试挂起在假 API 上 → 执行一个
+    // 会使轮次上下文失效的动作 → 放行旧请求 → 断言旧请求什么都没写回。挂起点是
+    // CompletableDeferred，不是 sleep，所以调度是确定的。
+
+    /** 主轮跑完、第一题已失败、重试已挂起。返回 (viewModel, fakeApi)。 */
+    private fun parkedRetryState(api: RelayApi): FingerprintViewModel {
+        // The store-backed harness is the one the other parked-retry cases use: it holds a
+        // real supplier and key, so the round actually dispatches and settles into the
+        // FAILED row this scenario needs before the retry is aimed at it.
+        val subject = readyApiViewModelFor(SingleSupplierStore(testSupplier()), api).apply {
+            updateParallel(false)
+        }
+        subject.runApiDetection()
+        awaitBatchSettled(subject)
+        return subject
+    }
+
+    @Test
+    fun `a retry answered after the challenges are regenerated writes nothing`() {
+        val api = ParkedRetryApi(goldenCase().answers)
+        val subject = parkedRetryState(api)
+        assertTrue("第一题应当可重试", subject.uiState.value.retryableModels.containsKey(0))
+
+        subject.retryChallenge(0)
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.retryParked.await() } }
+
+        subject.regenerateChallenges()
+        api.release()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertTrue("重新出题后旧结果不得回来", state.batchResults.isEmpty())
+        assertTrue("旧答案不得回到任何模型格", state.modelSlots.isEmpty())
+        assertTrue(state.retryableModels.isEmpty())
+        assertTrue(state.queuedRetries.isEmpty())
+        state.progress.forEach { entry ->
+            assertEquals("新题目不得被旧答案占据", ChallengeState.PENDING, entry.state)
+            assertEquals("新题目不得带上旧答案", "", entry.answer)
+        }
+    }
+
+    @Test
+    fun `a retry answered after a supplier switch writes nothing`() {
+        val api = ParkedRetryApi(goldenCase().answers)
+        val subject = parkedRetryState(api)
+        subject.retryChallenge(0)
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.retryParked.await() } }
+
+        subject.selectSupplier("sup-1")
+        api.release()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertTrue("切站后旧结果不得回来", state.batchResults.isEmpty())
+        assertTrue("旧答案不得回到任何模型格", state.modelSlots.isEmpty())
+        assertTrue(state.queuedRetries.isEmpty())
+    }
+
+    @Test
+    fun `a retry answered after a mode switch writes nothing`() {
+        val api = ParkedRetryApi(goldenCase().answers)
+        val subject = parkedRetryState(api)
+        subject.retryChallenge(0)
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.retryParked.await() } }
+
+        subject.selectMode(DetectionMode.MANUAL)
+        api.release()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertTrue("切模式后旧结果不得回来", state.batchResults.isEmpty())
+        assertTrue("旧答案不得回到任何模型格", state.modelSlots.isEmpty())
+        assertTrue(state.queuedRetries.isEmpty())
+    }
+
+    @Test
+    fun `a retry answered after the model selection changes writes nothing`() {
+        val api = ParkedRetryApi(goldenCase().answers)
+        val subject = parkedRetryState(api)
+        subject.retryChallenge(0)
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.retryParked.await() } }
+
+        subject.toggleModelSelection("test-model")
+        api.release()
+        runBlocking { subject.awaitIdle() }
+
+        val state = subject.uiState.value
+        assertTrue("改勾选后旧结果不得回来", state.batchResults.isEmpty())
+        assertTrue("旧答案不得回到任何模型格", state.modelSlots.isEmpty())
+        assertTrue(state.queuedRetries.isEmpty())
+    }
+
+    @Test
+    fun `a retry answered after a new round started writes nothing into it`() {
+        val api = ParkedRetryApi(goldenCase().answers)
+        val history = FingerprintHistoryStore(MemoryHistoryFiles())
+        val subject = readyApiViewModelFor(
+            SingleSupplierStore(testSupplier()),
+            api,
+            historyStore = history,
+        ).apply { updateParallel(false) }
+        subject.runApiDetection()
+        awaitBatchSettled(subject)
+
+        subject.retryChallenge(0)
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.retryParked.await() } }
+
+        // 新主轮在旧重试仍在飞时开始：先作废旧重试，再跑自己的三题。
+        subject.runApiDetection()
+        awaitBatchSettled(subject)
+        api.release()
+        runBlocking { subject.awaitIdle() }
+
+        val golden = goldenCase().answers
+        val slots = subject.uiState.value.modelSlots["test-model"].orEmpty()
+        assertEquals("新轮三格必须齐", 3, slots.size)
+        // 新轮第 1 题的答案是 calls[4]（golden[1]）；旧重试的答案是 golden[0]，
+        // 若旧请求写回了新轮，这里会变成 golden[0]。
+        assertEquals("新轮的结果不得被旧重试覆盖", golden[1], slots[0].answer)
+        assertEquals(ChallengeState.RECEIVED, slots[0].state)
+        // 主轮记过两次历史；旧重试不得再记第三条。
+        runBlocking {
+            withTimeout(BATCH_SETTLE_TIMEOUT_MS) {
+                while (subject.uiState.value.history.size < 2) delay(10)
+            }
+        }
+        assertEquals("历史只记主轮，不记已作废的重试", 2, subject.uiState.value.history.size)
+    }
+
+    @Test
+    fun `an old retry's cleanup must not delete a same-key retry of the new round`() {
+        val cleanupGate = CompletableDeferred<Unit>()
+        val api = ReplacingRetryApi(goldenCase().answers, cancellationGate = cleanupGate)
+        val subject = parkedRetryState(api)
+
+        subject.retryChallenge(0)
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.retryParked.await() } }
+        // 取消使旧重试失效；取消的清理被 cleanupGate 拄住，模拟"旧 Job 还没走完回调"。
+        // 放行 API 闸门：旧重试的 await 抛 CancellationException，走进被拄住的清理，
+        // 逐题发送的串行互斥锁也随之释放。
+        subject.cancelRun()
+        api.release()
+        // 等旧 Job 真的走完清理（cleanupGate 一放就完成），否则新一轮会被 runInFlight 挡住：
+        // 取消后仍攥着 runJob 句柄是刻意设计，正是为了不让新人踩到垂死的旧轮。
+        cleanupGate.complete(Unit)
+
+        // 新一轮跑到第一题失败：同键重试只有在这之后才登记得上（没有结果时点击只是换题）。
+        subject.runApiDetection()
+        awaitBatchSettled(subject)
+        subject.retryChallenge(0)
+        runBlocking { withTimeout(BATCH_SETTLE_TIMEOUT_MS) { api.retryTwoParked.await() } }
+
+        // 旧 Job 的完成回调此刻已经落地过：若它无条件清掉了同键登记，这一格现在就
+        // 不在 retryJobs 里，下面这次点击会发出额外的请求。格子在缓存里已是
+        // REQUESTING，可重试列表本来就是空的，所以显式点名，单独钉住去重守卫。
+        subject.retryChallenge(0, listOf("test-model"))
+        assertEquals("同键重试在飞时不得再发请求", 8, api.calls.get())
+        api.releaseSecond()
+        runBlocking { subject.awaitIdle() }
+        assertEquals(
+            "新一轮重试必须能正常补题",
+            ChallengeState.RECEIVED,
+            subject.uiState.value.modelSlots["test-model"]?.get(0)?.state,
+        )
+    }
+
+    // ---- R06: history commands run in the order they were issued ---------
+
+    @Test
+    fun `a clear issued after a parked append cannot overtake it`() {
+        val appendGate = CompletableDeferred<Unit>()
+        val history = GatedAppendHistoryStore(MemoryHistoryFiles(), appendGate)
+        val subject = readyApiViewModel(FakeCompletionApi(goldenCase().answers), historyStore = history)
+        subject.runApiDetection()
+        awaitBatchSettled(subject)
+        // 追加已进入存储并拄在门上：此刻发起的清空必须排队，而不是抢先进入 IO。
+        runBlocking { history.appendStarted.await() }
+
+        subject.clearHistory()
+        runBlocking { delay(100) }
+        assertEquals("清空必须排在未完成的追加之后", 0, history.clearCalls.get())
+
+        appendGate.complete(Unit)
+        runBlocking { subject.awaitIdle() }
+        assertEquals("清空必须恰好执行一次", 1, history.clearCalls.get())
+        assertTrue("磁盘上不得留下清空前的旧记录", history.load().isEmpty())
+        assertTrue("界面上不得留下清空前的旧记录", subject.uiState.value.history.isEmpty())
+    }
+
+    @Test
+    fun `a new append after a clear is the only record left`() {
+        val history = GatedAppendHistoryStore(MemoryHistoryFiles())
+        val subject = readyApiViewModel(FakeCompletionApi(goldenCase().answers), historyStore = history)
+        subject.runApiDetection()
+        awaitBatchSettled(subject)
+        runBlocking { subject.awaitIdle() }
+        assertEquals(1, history.load().size)
+
+        subject.clearHistory()
+        runBlocking { subject.awaitIdle() }
+        assertTrue("清空应生效", history.load().isEmpty())
+
+        subject.runApiDetection()
+        awaitBatchSettled(subject)
+        runBlocking { subject.awaitIdle() }
+        assertEquals("清空后的新检测必须保留", 1, history.load().size)
+        assertEquals("界面与磁盘看到同一份历史", 1, subject.uiState.value.history.size)
+    }
+
+    @Test
+    fun `consecutive clears all run and leave nothing behind`() {
+        val history = GatedAppendHistoryStore(MemoryHistoryFiles())
+        val subject = readyApiViewModel(FakeCompletionApi(goldenCase().answers), historyStore = history)
+        subject.runApiDetection()
+        awaitBatchSettled(subject)
+        runBlocking { subject.awaitIdle() }
+
+        subject.clearHistory()
+        subject.clearHistory()
+        runBlocking { subject.awaitIdle() }
+
+        assertEquals("两次清空都要执行", 2, history.clearCalls.get())
+        assertTrue(history.load().isEmpty())
+    }
+
+    @Test
+    fun `a clear that cannot write reports the failure`() {
+        val subject = apiViewModel(
+            FakeCompletionApi(goldenCase().answers),
+            historyStore = FingerprintHistoryStore(FailingHistoryFiles()),
+        )
+
+        subject.clearHistory()
+        runBlocking { subject.awaitIdle() }
+
+        assertTrue(
+            "写盘失败要给出明确反馈",
+            subject.uiState.value.message?.contains("历史记录清空失败") == true,
+        )
+        assertTrue(subject.uiState.value.isMessageError)
+    }
 }
 
 private class EmptyStore : SupplierStore(null) {
@@ -2535,7 +3124,112 @@ private class FakeCompletionApi(
         maxTokens: Int,
         timeoutSeconds: Int,
         onProgress: suspend (String) -> Unit,
+    onReasoning: suspend (String) -> Unit,
+        salvageOnDisconnect: Boolean,
     ): ApiResult<String> = completeText(profile, apiKey, model, prompt, maxTokens, timeoutSeconds)
+}
+
+/**
+ * A long in-range number list that clears the validity floor (max(80, ⌈count×0.55⌉)).
+ *
+ * Synthetic on purpose: these cases are about which ask gets repeated and what the panel
+ * says, not about which model ranks first, so the answer only has to be scoreable.
+ */
+private fun numbersAnswer(count: Int = 320): String = (1..count).joinToString(", ")
+
+/**
+ * Answers normally, except for chosen ask indexes, which come back with no answer text.
+ *
+ * Keyed by ask order rather than by question: with the parallel switch on, the three
+ * questions are asked concurrently, so "which question got the blank" is not fixed — "the
+ * first ask came back blank" is. A blank can also report reasoning, which is the shape the
+ * real supplier produced: HTTP 200, the whole token budget spent in the reasoning channel,
+ * zero characters of content.
+ *
+ * The hold is the same one [FakeCompletionApi] carries: without a suspension point the
+ * unconfined main dispatcher runs each ask to completion before the next one starts, and a
+ * parallel round would be indistinguishable from a sequential one.
+ */
+private class BlankAskThenAnswerApi(
+    private val answers: List<String>,
+    private val blankAsks: Set<Int> = setOf(0),
+    /** What the blank asks put on the reasoning channel; empty is the silent blank. */
+    private val blankReasoning: String = "",
+    private val failure: TestError = TestError(
+        ErrorKind.INVALID_RESPONSE,
+        "上游返回 HTTP 200 但没有可用的文本内容",
+    ),
+    private val holdMs: Long = 20,
+) : RelayApi() {
+    val calls = AtomicInteger(0)
+
+    override suspend fun completeTextStreaming(
+        profile: SupplierProfile,
+        apiKey: String,
+        model: String,
+        prompt: String,
+        maxTokens: Int,
+        timeoutSeconds: Int,
+        onProgress: suspend (String) -> Unit,
+        onReasoning: suspend (String) -> Unit,
+        salvageOnDisconnect: Boolean,
+    ): ApiResult<String> {
+        // Taken on entry, so a parallel round still hands each ask its own index.
+        val index = calls.getAndIncrement()
+        withContext(Dispatchers.Default) { delay(holdMs) }
+        if (index in blankAsks) {
+            if (blankReasoning.isNotEmpty()) onReasoning(blankReasoning)
+            return ApiResult.Failure(failure)
+        }
+        return ApiResult.Success(answers[index % answers.size])
+    }
+}
+
+/**
+ * Parks the automatic re-ask, so the panel can be read while it is in flight.
+ *
+ * The first ask comes back blank; the ask that follows — the re-ask of the very same
+ * question — parks. That is the only moment 「重试中…」 is on screen, and the moment a
+ * re-ask that failed to announce itself would read exactly like the first attempt still
+ * receiving.
+ */
+private class ParkedReaskApi(private val answers: List<String>) : RelayApi() {
+    val calls = AtomicInteger(0)
+    val prompts = Collections.synchronizedList(mutableListOf<String>())
+
+    /** Completed once the re-ask is parked inside the relay. */
+    val reaskParked = CompletableDeferred<Unit>()
+    private val gate = CompletableDeferred<Unit>()
+
+    fun release() {
+        gate.complete(Unit)
+    }
+
+    override suspend fun completeTextStreaming(
+        profile: SupplierProfile,
+        apiKey: String,
+        model: String,
+        prompt: String,
+        maxTokens: Int,
+        timeoutSeconds: Int,
+        onProgress: suspend (String) -> Unit,
+        onReasoning: suspend (String) -> Unit,
+        salvageOnDisconnect: Boolean,
+    ): ApiResult<String> {
+        val index = calls.getAndIncrement()
+        prompts += prompt
+        return when (index) {
+            0 -> ApiResult.Failure(
+                TestError(ErrorKind.INVALID_RESPONSE, "上游返回 HTTP 200 但没有可用的文本内容"),
+            )
+            1 -> {
+                reaskParked.complete(Unit)
+                gate.await()
+                ApiResult.Success(answers[index % answers.size])
+            }
+            else -> ApiResult.Success(answers[index % answers.size])
+        }
+    }
 }
 
 /**
@@ -2561,6 +3255,8 @@ private class StreamingCompletionApi(
         maxTokens: Int,
         timeoutSeconds: Int,
         onProgress: suspend (String) -> Unit,
+    onReasoning: suspend (String) -> Unit,
+        salvageOnDisconnect: Boolean,
     ): ApiResult<String> {
         val accumulated = StringBuilder()
         for (chunk in chunks) {
@@ -2622,6 +3318,8 @@ private class GatedCompletionApi(
         maxTokens: Int,
         timeoutSeconds: Int,
         onProgress: suspend (String) -> Unit,
+    onReasoning: suspend (String) -> Unit,
+        salvageOnDisconnect: Boolean,
     ): ApiResult<String> = completeText(profile, apiKey, model, prompt, maxTokens, timeoutSeconds)
 }
 
@@ -2674,7 +3372,128 @@ private class ParkedRetryApi(
         maxTokens: Int,
         timeoutSeconds: Int,
         onProgress: suspend (String) -> Unit,
+    onReasoning: suspend (String) -> Unit,
+        salvageOnDisconnect: Boolean,
     ): ApiResult<String> = completeText(profile, apiKey, model, prompt, maxTokens, timeoutSeconds)
+}
+
+/**
+ * Like [ParkedRetryApi], plus two things the cleanup-isolation case needs: the retry's
+ * cancellation cleanup can be held open (the way a connection being released holds it),
+ * and the second round's same-key retry parks on its own gate.
+ *
+ * The call plan is fixed, so the indices are spelled out: round one is calls 0–2 (call 0
+ * fails), its retry is call 3, round two is calls 4–6 (call 4 fails), and round two's
+ * retry is call 7.
+ */
+private class ReplacingRetryApi(
+    private val answers: List<String>,
+    private val cancellationGate: CompletableDeferred<Unit>? = null,
+) : RelayApi() {
+    /** Completed once the first retry (call 3) is parked. */
+    val retryParked = CompletableDeferred<Unit>()
+
+    /** Completed once the second round's retry (call 7) is parked. */
+    val retryTwoParked = CompletableDeferred<Unit>()
+    private val gate = CompletableDeferred<Unit>()
+
+    /** The second round's retry holds here, so it is still on the wire at the dedup click. */
+    private val secondGate = CompletableDeferred<Unit>()
+    val calls = AtomicInteger(0)
+
+    fun release() {
+        gate.complete(Unit)
+    }
+
+    fun releaseSecond() {
+        secondGate.complete(Unit)
+    }
+
+    override suspend fun completeText(
+        profile: SupplierProfile,
+        apiKey: String,
+        model: String,
+        prompt: String,
+        maxTokens: Int,
+        timeoutSeconds: Int,
+    ): ApiResult<String> {
+        return when (val position = calls.getAndIncrement()) {
+            0, 4 -> ApiResult.Failure(TestError(ErrorKind.UPSTREAM, "上游返回 HTTP 502"))
+            3 -> {
+                retryParked.complete(Unit)
+                try {
+                    gate.await()
+                } catch (error: CancellationException) {
+                    cancellationGate?.let { cleanup -> withContext(NonCancellable) { cleanup.await() } }
+                    throw error
+                }
+                ApiResult.Success(answers[0])
+            }
+            7 -> {
+                retryTwoParked.complete(Unit)
+                secondGate.await()
+                ApiResult.Success(answers[0])
+            }
+            else -> ApiResult.Success(answers[position % answers.size])
+        }
+    }
+
+    override suspend fun completeTextStreaming(
+        profile: SupplierProfile,
+        apiKey: String,
+        model: String,
+        prompt: String,
+        maxTokens: Int,
+        timeoutSeconds: Int,
+        onProgress: suspend (String) -> Unit,
+    onReasoning: suspend (String) -> Unit,
+        salvageOnDisconnect: Boolean,
+    ): ApiResult<String> = completeText(profile, apiKey, model, prompt, maxTokens, timeoutSeconds)
+}
+
+/** In-memory stand-in for the history file, so written rows can be counted. */
+private class MemoryHistoryFiles(var content: String? = null) : HistoryFileSystem {
+    override fun read(): String? = content
+
+    override fun write(text: String) {
+        content = text
+    }
+}
+
+/** A filesystem whose writes always fail, the way a full disk would. */
+private class FailingHistoryFiles : HistoryFileSystem {
+    override fun read(): String? = null
+
+    override fun write(text: String) {
+        throw IOException("磁盘已满")
+    }
+}
+
+/**
+ * A history store the ordering tests can observe and hold: append signals its arrival
+ * and then parks until released, and clear counts its calls. With no gate it is just a
+ * counting pass-through.
+ */
+private class GatedAppendHistoryStore(
+    files: HistoryFileSystem,
+    private val appendGate: CompletableDeferred<Unit>? = null,
+) : FingerprintHistoryStore(files) {
+    /** Completed once an append has entered the store, before it parks. */
+    val appendStarted = CompletableDeferred<Unit>()
+    val clearCalls = AtomicInteger(0)
+
+    override fun append(entries: List<DetectionHistoryEntry>): Boolean {
+        appendStarted.complete(Unit)
+        // 存储本身是同步 API（真实实现走阻塞文件 IO），所以要拄住它也只能阻塞等待；
+        // 测试在专用线程上跑，主线程上的测试协程不会被这里挡住。
+        appendGate?.let { gate -> runBlocking { gate.await() } }
+        return super.append(entries)
+    }
+
+    override fun clear(): Boolean {
+        clearCalls.incrementAndGet()
+        return super.clear()
+    }
 }
 
 /**
@@ -2734,6 +3553,8 @@ private class FirstSlotFailsThenParksApi(
         maxTokens: Int,
         timeoutSeconds: Int,
         onProgress: suspend (String) -> Unit,
+    onReasoning: suspend (String) -> Unit,
+        salvageOnDisconnect: Boolean,
     ): ApiResult<String> = completeText(profile, apiKey, model, prompt, maxTokens, timeoutSeconds)
 }
 
@@ -2789,6 +3610,8 @@ private class FirstFailsThenParksApi(
         maxTokens: Int,
         timeoutSeconds: Int,
         onProgress: suspend (String) -> Unit,
+    onReasoning: suspend (String) -> Unit,
+        salvageOnDisconnect: Boolean,
     ): ApiResult<String> = completeText(profile, apiKey, model, prompt, maxTokens, timeoutSeconds)
 }
 
@@ -2814,6 +3637,8 @@ private class ThrowingCompletionApi(private val boom: Throwable) : RelayApi() {
         maxTokens: Int,
         timeoutSeconds: Int,
         onProgress: suspend (String) -> Unit,
+    onReasoning: suspend (String) -> Unit,
+        salvageOnDisconnect: Boolean,
     ): ApiResult<String> = throw boom
 }
 

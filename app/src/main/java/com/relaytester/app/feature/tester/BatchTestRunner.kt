@@ -1,10 +1,10 @@
 package com.relaytester.app.feature.tester
 
 import com.relaytester.app.core.model.BatchTestConfig
-import com.relaytester.app.core.model.ErrorKind
 import com.relaytester.app.core.model.ModelTestResult
 import com.relaytester.app.core.model.TestRunSummary
 import com.relaytester.app.core.model.TestStatus
+import com.relaytester.app.core.model.isTransient
 import com.relaytester.app.core.network.RelayApi
 import kotlin.math.max
 import kotlin.random.Random
@@ -88,16 +88,14 @@ class BatchTestRunner(private val relayApi: RelayApi) {
         }
     }
 
-    private fun ModelTestResult.shouldRetry(): Boolean = error?.kind in setOf(
-        ErrorKind.NETWORK,
-        ErrorKind.TIMEOUT,
-        ErrorKind.RATE_LIMITED,
-        ErrorKind.UPSTREAM,
-    )
+    private fun ModelTestResult.shouldRetry(): Boolean = error?.kind?.isTransient() == true
 
     private fun List<ModelTestResult>.toSummary(elapsedMs: Long): TestRunSummary {
         val succeeded = count { it.status == TestStatus.SUCCESS }
         val failed = count { it.status == TestStatus.FAILED }
+        // A skipped row produced no verdict and no network traffic; counting it as a
+        // failure put a pull-only row into the error breakdown and the export.
+        val skipped = count { it.status == TestStatus.SKIPPED }
         val latencies = filter { it.status == TestStatus.SUCCESS }
             .mapNotNull { it.latencyMs }
         return TestRunSummary(
@@ -115,6 +113,7 @@ class BatchTestRunner(private val relayApi: RelayApi) {
                 .mapNotNull { it.error?.kind }
                 .groupingBy { it }
                 .eachCount(),
+            skipped = skipped,
         )
     }
 

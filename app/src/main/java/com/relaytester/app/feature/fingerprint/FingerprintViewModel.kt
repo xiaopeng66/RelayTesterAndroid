@@ -30,7 +30,10 @@ import com.relaytester.app.core.fingerprint.NumberFeatures
 import com.relaytester.app.core.fingerprint.minimumNumbersFor
 import com.relaytester.app.core.model.ApiResult
 import com.relaytester.app.core.model.ErrorKind
+import com.relaytester.app.core.model.isTransient
+import com.relaytester.app.core.network.NO_ANSWER_TEXT_MESSAGE
 import com.relaytester.app.core.network.RelayApi
+import com.relaytester.app.core.network.isMissingAnswerText
 import com.relaytester.app.core.security.KeystoreSecretStore
 import com.relaytester.app.core.security.SecretStore
 import com.relaytester.app.core.storage.SupplierStore
@@ -78,6 +81,19 @@ data class ChallengeProgress(
      * for the first seconds of a request.
      */
     val receivedNumbers: Int = 0,
+    /**
+     * True from the second attempt on: this entry is an automatic re-ask, not a first send.
+     *
+     * 一次空白回答什么都结不了，于是同一题被再问一次（见 [CHALLENGE_MAX_ATTEMPTS]）。格子里的
+     * 状态词靠它把「接收中…」换成「重试中…」：没有这一位，第二次等待和同一题卡住长得一模一样，
+     * 而它其实要再花一次请求。第一次尝试永远是 false，结题时两个写入者都用新条目覆盖它，所以
+     * 不需要自己清除。
+     *
+     * 批量里已经结题的行读的是自己的槽位缓存，那一行同样看不见活着的整数计数（见
+     * [FingerprintUiState.modelSlots]），这一位按同一条规则只出现在「正在被问的那个模型」的
+     * 卡上。
+     */
+    val retrying: Boolean = false,
 )
 
 /** Which answer source the panel is driving. */
@@ -278,6 +294,13 @@ data class FingerprintUiState(
      * and a dialog that opens empty and fills in a moment later reads as broken.
      */
     val history: List<DetectionHistoryEntry> = emptyList(),
+    /**
+     * The animation panel's state, entirely separate from the round above.
+     *
+     * A failed or ugly animation never touches answers, the retry list, the analysis or the
+     * history; the two lifecycles only share the supplier a card was opened for.
+     */
+    val animation: AnimationUiState = AnimationUiState(),
 ) {
     /** True when the pending round covers several models, so its output reads as a list. */
     val isBatch: Boolean get() = selectedModels.size > 1
@@ -287,6 +310,15 @@ data class FingerprintUiState(
 data class SupplierOption(
     val id: String,
     val name: String,
+    /**
+     * True when the supplier is marked 仅拉取模型.
+     *
+     * Carried into the list so the pickers can say so *before* the user picks it: the flag
+     * now refuses a fingerprint round and an animation request, and a supplier that looks
+     * ordinary until the button rejects it would read as a bug rather than as the setting
+     * the user himself turned on.
+     */
+    val pullOnly: Boolean = false,
 )
 
 /**
@@ -333,6 +365,15 @@ class FingerprintViewModel(
      * six hours; production uses the same window as the app's own channel.
      */
     private val bankCheckIntervalMillis: Long = UpdatePreferencesState.APP_CHECK_INTERVAL_MILLIS,
+    /**
+     * The wait before an automatic animation retry.
+     *
+     * Injected for the same reason [clock] and [ioDispatcher] are: the real wait is seconds of
+     * wall time, and a test that had to sit through it — or that deadlocked against a virtual
+     * clock nobody advances — would either be slow or hang. Tests pass an immediate no-op, and
+     * the cancel-during-retry case passes one it can hold open.
+     */
+    private val animationRetryDelay: suspend (Long) -> Unit = { delay(it) },
 ) : ViewModel() {
     private val relayApi: RelayApi by lazy { relayApiFactory() }
 
@@ -392,6 +433,37 @@ class FingerprintViewModel(
      * round, on the other hand, waits for these.
      */
     private val retryJobs = mutableMapOf<Pair<String, Int>, Job>()
+
+    /**
+     * The round the retries and cached answers belong to, bumped on every context
+     * replacement.
+     *
+     * A retry captures this number when it is queued. Every write it makes afterwards —
+     * slot placeholders, cached answers, re-scores, history rows — happens only while the
+     * number still matches, so a request that returns after 重新出题、切供应商、切模式、
+     * 改勾选、新主轮或取消 can no longer claim a place in the round now on screen.
+     * Cancelling the Job alone cannot give this guarantee: a cancelled request's cleanup
+     * still runs, and a *completed* request the panel never cancelled does not even stop.
+     */
+    private var roundEpoch = 0
+
+    /**
+     * Invalidates the current round identity and stops every retry still in flight.
+     *
+     * Callers follow with whatever cleanup the replacement needs (answers, credentials,
+     * rows). The queued-retry marks are cleared here because their owners just lost the
+     * gate they were waiting on; the completion callbacks observe their own entry already
+     * gone and leave the flag alone.
+     */
+    private fun invalidateRound() {
+        roundEpoch++
+        val jobs = retryJobs.values.toList()
+        retryJobs.clear()
+        jobs.forEach { it.cancel() }
+        if (_uiState.value.queuedRetries.isNotEmpty()) {
+            _uiState.update { it.copy(queuedRetries = emptySet()) }
+        }
+    }
 
     /**
      * The one-at-a-time gate the panel uses when it is set to 逐题发送.
@@ -551,8 +623,14 @@ class FingerprintViewModel(
      * just cancelled may still be running its cleanup (a request releasing its connection,
      * a NonCancellable block). Starting anything in that window would overlap two rounds
      * and let the dying one write over the new one's state.
+     *
+     * The handle is cleared by the job itself when it finishes (see [runApiDetection]), so this
+     * reads null once the round — cancelled or not — has actually ended. Without that, the
+     * handle stayed non-null forever and `isCompleted == false` could never become true
+     * again, which left the panel permanently unable to start another round: the reported
+     * 「取消以后无法再次开始」.
      */
-    private fun runInFlight(): Boolean = _uiState.value.isRunning || runJob?.isCompleted == false
+    private fun runInFlight(): Boolean = _uiState.value.isRunning || runJob != null
 
     /**
      * The supplier and key the last round used, so one question can be re-asked.
@@ -572,7 +650,7 @@ class FingerprintViewModel(
     /** A check, a download or a rollback; one at a time, tracked so tests can join it. */
     private var bankUpdateJob: Job? = null
 
-    /** A history read or write, tracked so tests can join it. */
+    /** The tail of the history command chain, tracked so tests can join it. */
     private var historyJob: Job? = null
 
     /** The switch write, tracked so a test can tell "flipped" from "flipped and stored". */
@@ -610,6 +688,17 @@ class FingerprintViewModel(
         bankUpdateJob?.join()
         historyJob?.join()
         preferenceJob?.join()
+        // The animation generations are requests of their own, started from a card rather
+        // than from the round: a test that closed a panel mid-flight would otherwise finish
+        // while those requests were still on the wire. 批量测试 means several can run at
+        // once, so every one of them is joined. Snapshot first: a joined job removes itself
+        // from the map (same rule as retryJobs below). 只 join 未完成的作业——已完成却还在
+        // map 里的残渣会让 join 立即返回、下一轮快照又捞到它，循环变成空转烧 CPU。
+        while (true) {
+            val pending = animationJobs.values.filter { it.isCompleted == false }
+            if (pending.isEmpty()) break
+            pending.forEach { it.join() }
+        }
         // A single-question retry outlives the round that spawned the failed model, so the
         // round's join alone would let a test finish while a re-ask it triggered is still in
         // flight. Snapshot first: a joined job removes itself from the map.
@@ -699,7 +788,7 @@ class FingerprintViewModel(
                     loadError = null,
                     autoCheckBank = updateState.autoCheckBank,
                     suppliers = storeState.suppliers.map { item ->
-                        SupplierOption(item.id, item.name)
+                        SupplierOption(item.id, item.name, item.isTestingDisabled)
                     },
                     selectedSupplierId = supplierId,
                     models = supplier?.models.orEmpty(),
@@ -816,6 +905,14 @@ class FingerprintViewModel(
             read.onSuccess { (bank, storeState) ->
                 loadedBank = bank.loaded
                 knownSuppliers = storeState.suppliers
+                // A refresh that lands on a different supplier replaces the round's
+                // context exactly like 切供应商 does: the old round's credentials and
+                // questions cannot describe what is on screen now. The check runs
+                // outside `_uiState.update` — the invalidation cancels jobs and bumps a
+                // counter, and an update lambda may be retried under contention.
+                val changed = candidateSupplierId(_uiState.value.selectedSupplierId, storeState) !=
+                    _uiState.value.selectedSupplierId
+                if (changed) dropRoundContext()
                 _uiState.update { state ->
                     val supplierId = candidateSupplierId(state.selectedSupplierId, storeState)
                     val changed = supplierId != state.selectedSupplierId
@@ -824,7 +921,9 @@ class FingerprintViewModel(
                         // transient startup failure would strand the panel for good.
                         isLoading = false,
                         loadError = null,
-                        suppliers = storeState.suppliers.map { item -> SupplierOption(item.id, item.name) },
+                        suppliers = storeState.suppliers.map { item ->
+                            SupplierOption(item.id, item.name, item.isTestingDisabled)
+                        },
                         selectedSupplierId = supplierId,
                         models = storeState.suppliers.firstOrNull { it.id == supplierId }?.models.orEmpty(),
                         // A refresh must never silently drop the user's ticks: the picker
@@ -939,9 +1038,11 @@ class FingerprintViewModel(
      * Called wherever the result rows are cleared, and wherever the supplier or the model
      * selection changes: with no rows on screen there is no round to finish, and a stale
      * credential would let a later retry spend a request against a configuration the user
-     * has already moved away from.
+     * has already moved away from. The invalidation runs first — an in-flight retry that
+     * returns during this cleanup must find its round already gone.
      */
     private fun dropRoundContext() {
+        invalidateRound()
         setRoundAnswers(emptyMap())
         roundCredentials = null
     }
@@ -978,27 +1079,51 @@ class FingerprintViewModel(
             replaceChallenge(index)
             return
         }
-        if (!state.isRunning && runJob?.isCompleted == false) return
+        // A retry may run *beside* a live round — its model has already settled, so re-asking
+        // it must not wait for the round to finish. The one thing it must not do is slip in
+        // while a round that is no longer publishing `isRunning` still has work on the wire:
+        // that window is the round's startup, before the flag is set, and starting there would
+        // put two rounds' requests on the same credentials.
+        //
+        // This deliberately reads the handle rather than [runInFlight]: that predicate also
+        // treats a *running* round as a block, which would stop every retry the panel is
+        // designed to allow beside it. The handle is safe to read now because it clears
+        // itself when the round ends (see [runApiDetection]), so the cancelled-round case that
+        // used to lock retries out for good no longer leaves a stale handle behind.
+        if (!state.isRunning && runJob != null) return
         val failed = (models ?: state.retryableModels[index].orEmpty())
             .filter { candidate -> state.batchResults.any { it.model == candidate } }
         if (failed.isEmpty()) return
+        // A fingerprint round owns its own state and may overlap animation sessions.
         if (refuseWhileBankJobRuns()) return
         if (bankOrReport() == null) return
 
         val template = state.progress.map { it.challenge }
         val challenge = template[index]
+        // The round identity is fixed when the retry is queued. Everything the request
+        // writes later — placeholders, cache entries, the re-score, history — is checked
+        // against this number, so a context replacement (重新出题、切站、切模式、改勾选、
+        // 新主轮、取消、目录刷新换供应商) invalidates the request wherever it is.
+        val epoch = roundEpoch
         val fresh = failed.filter { (it to index) !in retryJobs }
         if (fresh.isEmpty()) return
         for (model in fresh) {
             val job = viewModelScope.launch {
-                retrySlot(index, model, challenge, template, credentials)
+                retrySlot(index, model, challenge, template, credentials, epoch)
             }
             retryJobs[model to index] = job
             job.invokeOnCompletion {
-                retryJobs.remove(model to index)
-                // A job cancelled while it was still waiting for the gate never reaches the
-                // clearing inside retrySlot, and a stale 排队中 would outlive its request.
-                markRetryQueued(model, index, queued = false)
+                // Only the job that still owns its registration may remove it: after a
+                // context replacement cleared the map, a same-key retry may already be
+                // registered, and this callback must not delete the newcomer's entry or
+                // clear its queued mark.
+                if (retryJobs[model to index] === job) {
+                    retryJobs.remove(model to index)
+                    // A job cancelled while it was still waiting for the gate never
+                    // reaches the clearing inside retrySlot, and a stale 排队中 would
+                    // outlive its request.
+                    markRetryQueued(model, index, queued = false)
+                }
             }
         }
     }
@@ -1022,7 +1147,11 @@ class FingerprintViewModel(
         challenge: FingerprintChallenge,
         template: List<FingerprintChallenge>,
         credentials: Pair<com.relaytester.app.core.model.SupplierProfile, String>,
+        epoch: Int,
     ) {
+        // The round was replaced between queueing and dispatch: the slot this retry was
+        // aimed at no longer exists, so it writes nothing at all.
+        if (epoch != roundEpoch) return
         // A REQUESTING slot in the cache withdraws the retry entry for as long as this
         // re-ask runs, so the button cannot be double-fired into two parallel requests.
         cacheAnswer(model, index, template, ChallengeProgress(challenge, state = ChallengeState.REQUESTING))
@@ -1038,8 +1167,14 @@ class FingerprintViewModel(
                 model = model,
                 challenge = challenge,
                 slots = template,
+                stillCurrent = { epoch == roundEpoch },
             )
         }
+        // The context was replaced while the request was out — a late answer from a round
+        // the panel already left. It owns nothing now: no progress, no cache entry, no
+        // re-score, no history. Dropping the value (instead of only the writes) is what
+        // keeps an invalidated retry from re-opening the rows it used to belong to.
+        if (epoch != roundEpoch) return
         // The other slots keep that model's own answers; a model whose round never got
         // that far is filled with the placeholder slots the retry is about to score, so
         // the re-scoring never mixes two editors' answers.
@@ -1082,6 +1217,7 @@ class FingerprintViewModel(
         // this both launches survive, both spend upstream requests, and `cancelRun` can
         // only reach the newer one.
         if (runInFlight()) return
+        // A fingerprint round owns its own state and may overlap animation sessions.
         if (refuseWhileBankJobRuns()) return
         val state = _uiState.value
         val supplierId = state.selectedSupplierId
@@ -1102,7 +1238,7 @@ class FingerprintViewModel(
         // Nothing to score with, so the requests would be spent for nothing.
         if (bankOrReport() == null) return
 
-        runJob = viewModelScope.launch {
+        val job = viewModelScope.launch {
             try {
                 runRounds(supplierId, models, challenges)
             } catch (error: CancellationException) {
@@ -1120,6 +1256,17 @@ class FingerprintViewModel(
                 showMessage(reason, isError = true)
             }
         }
+        runJob = job
+        // Released when the round really ends — completed, failed or cancelled — because
+        // [runInFlight] reads this handle as the panel's lock. Registering it here instead of
+        // clearing it inside the coroutine body matters: `runJob = launch {}` assigns the
+        // handle only after the body has already started, so a `finally` in the body could
+        // read a stale (or not yet assigned) handle and skip the clear, leaving the panel
+        // locked forever — which is the reported 「取消以后无法再次开始」.
+        //
+        // The identity check keeps a round that was replaced by a newer one from unlocking
+        // the newer one's slot.
+        job.invokeOnCompletion { if (runJob === job) runJob = null }
     }
 
     private suspend fun runRounds(
@@ -1127,6 +1274,10 @@ class FingerprintViewModel(
         models: List<String>,
         challenges: List<FingerprintChallenge>,
     ) {
+        // A new round replaces the context the old single-question retries belong to:
+        // their answers would land in this round's cache, rows and history. Invalidate
+        // first, then park (the gate wait below runs under a fresh identity).
+        invalidateRound()
         val prepared = withContext(ioDispatcher) {
             val supplier = suppliers().firstOrNull { it.id == supplierId }
             if (supplier == null) {
@@ -1143,6 +1294,11 @@ class FingerprintViewModel(
             return
         }
         val (supplier, apiKey) = prepared
+        // 禁止测试：只拉模型，不发测试请求。 Checked against the supplier just read from the
+        // store rather than the cached list the panel renders, for the reason in
+        // [refuseIfPullOnly]. Before `isRunning = true` so a refusal leaves the panel idle
+        // rather than looking busy.
+        if (refuseIfPullOnly(supplier)) return
         if (apiKey.isBlank()) {
             showMessage("该供应商没有可用的 API Key", isError = true)
             return
@@ -1249,6 +1405,26 @@ class FingerprintViewModel(
     }
 
     /**
+     * Chains a history write onto the previous one, in the order the calls were made.
+     *
+     * append and clear each used to launch their own job and overwrite [historyJob]:
+     * two writes then hit the store's IO in whichever order the file lock granted them,
+     * so a clear could land before the append the user issued first and the emptied
+     * list grew the row right back — on disk as well as on screen, since the UI refresh
+     * rode the same unordered write. Enqueueing happens here, at call time on the main
+     * thread, so the order is fixed before any IO dispatcher gets a vote. Joining the
+     * tail also gives [awaitIdle] every earlier operation for free: a job does not start
+     * (let alone finish) until its predecessor has.
+     */
+    private fun enqueueHistoryOperation(block: suspend () -> Unit): Job {
+        val previous = historyJob
+        return viewModelScope.launch {
+            previous?.join()
+            block()
+        }
+    }
+
+    /**
      * Files the model's current row in the history.
      *
      * Written off the UI thread: it is a small file, but the caller is a coroutine that
@@ -1270,7 +1446,7 @@ class FingerprintViewModel(
             submittedAnswers = row.submittedAnswers,
             error = row.error,
         )
-        historyJob = viewModelScope.launch {
+        historyJob = enqueueHistoryOperation {
             withContext(ioDispatcher) {
                 runCatching { store.append(listOf(entry)) }
                     .onSuccess { written ->
@@ -1285,7 +1461,7 @@ class FingerprintViewModel(
     /** Empties the history after the user confirms it. */
     fun clearHistory() {
         val store = historyStore ?: return
-        historyJob = viewModelScope.launch {
+        historyJob = enqueueHistoryOperation {
             val cleared = withContext(ioDispatcher) { runCatching { store.clear() }.getOrDefault(false) }
             if (cleared) {
                 _uiState.update { it.copy(history = emptyList()) }
@@ -1304,6 +1480,963 @@ class FingerprintViewModel(
     private fun roundFailureReason(results: List<ChallengeProgress>): String =
         results.firstNotNullOfOrNull { entry -> entry.error?.takeIf { it.isNotBlank() } }
             ?: "没有可用于检测的回答"
+
+    // ---- Animation test (R10) --------------------------------------------
+    //
+    // A separate feature that shares nothing with the round above except the card it was
+    // opened from: its own state, its own job, its own request identity. Every write below
+    // is guarded by the session and request ids, because cancelling the job cannot stop a
+    // callback that is already past its last suspension point.
+
+    /** Identifies the open panel; bumped on every open so a reopened panel is a new one. */
+    private var animationSessionSequence = 0L
+
+    /** Identifies the in-flight generation; bumped on every submit and every invalidation. */
+    private var animationRequestSequence = 0L
+
+    /**
+     * The generation in flight per session.
+     *
+     * 批量测试（同供应商多选）和「一个供应商在测、再开另一个供应商的测试」都要求几个请求
+     * 并行，所以作业按会话各挂各的；归属校验按会话自己的 requestId 走，互不串写。作业
+     * 结束时由 invokeOnCompletion 自行摘除，map 里不留完成态的残渣。
+     */
+    private val animationJobs = mutableMapOf<Long, Job>()
+
+    /**
+     * The last draft, kept for the life of the view model.
+     *
+     * The requirement is "kept for this page session": a rotation recreates the composable
+     * but not the view model, so holding it here is what makes the draft survive a rotate
+     * and a close/reopen without writing it to disk or into the detection history.
+     */
+    private var animationDraft = DEFAULT_ANIMATION_PROMPT
+
+    /**
+     * Opens the card on its list view.
+     *
+     * Deliberately does nothing else: opening is not creating a test. The card's pickers
+     * choose a supplier and model, and [startAnimationTest] is what makes a session.
+     *
+     * 选中的记录在这里一并清掉，入口因此永远落在「选模型 + 测试记录」那一层：卡片是两层
+     * 弹窗，如果上次看到一半的记录还选着，点入口就会直接弹进那条记录的详情，而用户想点的
+     * 是列表——尤其是他刚生成完、正想再开一条的时候。
+     */
+    fun openAnimationPanel() {
+        // 目录要现读一次，不能等指纹页那次：入口在模型测试页，用户完全可能一次都没进过
+        // 指纹页就点进来（「先拉模型，再直接生成动画」是最顺的一条路）。那时 knownSuppliers
+        // 还是空的，卡片会显示「还没有可用的供应商」，而供应商列表就在它背后那一页上——
+        // 弹窗里说没有、背后明明有，是这一处最糟的形态。
+        refreshCatalogue()
+        _uiState.update {
+            it.copy(
+                animation = it.animation.copy(panelOpen = true, selectedSessionId = null),
+            )
+        }
+    }
+
+    /**
+     * Hides the card, leaving every test exactly as it is.
+     *
+     * Closing is not cancelling: a generation keeps running so the user can get on with
+     * something else, and the entry button marks that it is still going. Cancelling is
+     * [cancelAnimationGeneration], and discarding a record is [removeAnimationSession].
+     */
+    fun closeAnimationPanel() {
+        _uiState.update { it.copy(animation = it.animation.copy(panelOpen = false)) }
+    }
+
+    /**
+     * Opens the card on a test for one supplier and model, sending nothing yet.
+     *
+     * The one-call form of "open, then start": it exists because the fingerprint card used
+     * to open a panel already bound to its own supplier and model, and that entry point
+     * still has to mean the same thing while the card's own pickers are the new way in.
+     */
+    fun openAnimationTest(supplierId: String, model: String) {
+        openAnimationPanel()
+        startAnimationTest(supplierId, model, autoStart = false)
+    }
+
+    /**
+     * Chooses the supplier the card's next animation test runs against.
+     *
+     * Its own field, not the detection panel's: the animation card and the three-question
+     * panel are separate screens that happen to share a view model, and driving one from
+     * the other's selection would reset ticked models and clear results on the other tab.
+     */
+    fun selectAnimationSupplier(supplierId: String) {
+        val models = knownSuppliers.firstOrNull { it.id == supplierId }?.models.orEmpty()
+        _uiState.update {
+            it.copy(
+                animation = it.animation.copy(
+                    supplierId = supplierId,
+                    model = null,
+                    models = models,
+                    // 批量勾选只在本供应商目录里有效：换供应商即整体作废，勾选永远指向
+                    // 当前目录里真实存在的模型。
+                    selectedModels = emptyList(),
+                ),
+            )
+        }
+    }
+
+    /** Shows one record's detail view; null returns to the list. */
+    fun selectAnimationSession(sessionId: Long?) {
+        _uiState.update { state ->
+            if (sessionId != null && state.animation.sessions.none { it.sessionId == sessionId }) {
+                state
+            } else {
+                state.copy(animation = state.animation.copy(selectedSessionId = sessionId))
+            }
+        }
+    }
+
+    /**
+     * Creates a session for one supplier and model, selects it and (by default) starts it.
+     *
+     * Reuses an existing record for the same supplier and model when there is one: pressing
+     * 开始生成 again is a re-run of that test, not a second row saying the same thing.
+     */
+    fun startAnimationTest(
+        supplierId: String,
+        model: String,
+        autoStart: Boolean = true,
+    ) {
+        val supplierName = resolveAnimationSupplierName(supplierId)
+        if (supplierName == null) {
+            showMessage("该供应商已不存在，无法进行动画测试", isError = true)
+            return
+        }
+        if (model.isBlank()) {
+            showMessage("请先选择一个模型", isError = true)
+            return
+        }
+        val existing = _uiState.value.animation.sessions
+            .firstOrNull { it.supplierId == supplierId && it.model == model }
+        if (existing != null) {
+            selectAnimationSession(existing.sessionId)
+        } else {
+            animationSessionSequence++
+            val created = AnimationSession(
+                sessionId = animationSessionSequence,
+                createdAt = clock(),
+                supplierId = supplierId,
+                supplierName = supplierName,
+                model = model,
+                draftPrompt = animationDraft,
+            )
+            _uiState.update { state ->
+                state.copy(
+                    animation = state.animation.copy(
+                        selectedSessionId = created.sessionId,
+                        sessions = trimAnimationSessions(
+                            listOf(created) + state.animation.sessions,
+                            keep = created.sessionId,
+                        ),
+                    ),
+                )
+            }
+        }
+        if (autoStart) startAnimationGeneration()
+    }
+
+    /**
+     * Discards the selected test and closes the card.
+     *
+     * The single-call form the fingerprint card's 关闭 used to be, where closing meant
+     * dropping what the card was showing. The card's own 关闭 is [closeAnimationPanel],
+     * which keeps the test running — this is the explicit "throw it away" path.
+     */
+    fun closeAnimationTest() {
+        _uiState.value.animation.selectedSessionId?.let { removeAnimationSession(it) }
+        closeAnimationPanel()
+    }
+
+    /**
+     * Drops one record, cancelling it first if it is the one generating.
+     *
+     * The request id is invalidated rather than only the job cancelled, so a callback
+     * already on its way cannot write into a record that no longer exists.
+     */
+    fun removeAnimationSession(sessionId: Long) {
+        val target = _uiState.value.animation.sessions.firstOrNull { it.sessionId == sessionId }
+        if (target?.phase == AnimationPhase.GENERATING) {
+            cancelAnimationJob(sessionId)
+        }
+        _uiState.update { state ->
+            val animation = state.animation
+            val remaining = animation.sessions.filterNot { it.sessionId == sessionId }
+            if (remaining.size == animation.sessions.size) {
+                state
+            } else {
+                state.copy(
+                    animation = animation.copy(
+                        sessions = remaining,
+                        selectedSessionId = animation.selectedSessionId
+                            .takeIf { id -> remaining.any { it.sessionId == id } },
+                    ),
+                )
+            }
+        }
+    }
+
+    /** The display name for a supplier id, from the list the pickers are drawn from. */
+    private fun resolveAnimationSupplierName(supplierId: String): String? =
+        knownSuppliers.firstOrNull { it.id == supplierId }?.name
+            ?: _uiState.value.suppliers.firstOrNull { it.id == supplierId }?.name
+
+    /**
+     * Applies [transform] to one session in the list, leaving the rest untouched.
+     *
+     * Every write into a session goes through here. Building an [AnimationUiState] from a
+     * single captured session — the shape this replaced — would silently drop the other
+     * records the moment a second test existed, so the list is only ever rebuilt as a
+     * whole in one place.
+     */
+    private fun updateAnimationSession(
+        sessionId: Long,
+        transform: (AnimationSession) -> AnimationSession,
+    ): Boolean {
+        var applied = false
+        _uiState.update { state ->
+            val animation = state.animation
+            if (animation.sessions.none { it.sessionId == sessionId }) return@update state
+            applied = true
+            state.copy(
+                animation = animation.copy(
+                    sessions = animation.sessions.map { session ->
+                        if (session.sessionId == sessionId) transform(session) else session
+                    },
+                ),
+            )
+        }
+        return applied
+    }
+
+    /**
+     * Applies [transform] to the session the card is showing.
+     *
+     * The card's own actions (draft, view, cancel) act on what the user is looking at, and
+     * a card with nothing selected has nothing to act on.
+     */
+    private fun updateSelectedAnimationSession(
+        transform: (AnimationSession) -> AnimationSession,
+    ): Boolean {
+        val selected = _uiState.value.animation.selectedSessionId ?: return false
+        return updateAnimationSession(selected, transform)
+    }
+
+    /** The editable prompt. Only the draft moves; a request already sent is unaffected. */
+    fun updateAnimationPrompt(value: String) {
+        animationDraft = value
+        updateSelectedAnimationSession { it.copy(draftPrompt = value) }
+    }
+
+    /** Restores the default prompt. Resets the draft only: no request, no preview change. */
+    fun restoreDefaultAnimationPrompt() {
+        updateAnimationPrompt(DEFAULT_ANIMATION_PROMPT)
+    }
+
+    /** Switches between the rendered preview and its source text. */
+    fun showAnimationView(view: AnimationView) {
+        updateSelectedAnimationSession { it.copy(view = view) }
+    }
+
+    /**
+     * Records whether the reader has scrolled the reasoning box back from the newest line.
+     *
+     * The panel owns the gesture and this only carries the decision to the one place that can
+     * act on it: the growth path. While held, the reasoning window must stop trimming, because
+     * a `takeLast` window slides as it grows and slides the text out from under a fixed scroll
+     * offset. See [AnimationSession.reasoningHeld].
+     *
+     * Releasing trims at once rather than waiting for the next fragment: the reader is back at
+     * the newest line, so the box should already be bounded again — and the next fragment may
+     * be minutes away on a slow chain, which is exactly when an unbounded box would be noticed.
+     */
+    fun holdAnimationReasoning(held: Boolean) {
+        updateSelectedAnimationSession { session ->
+            if (session.reasoningHeld == held) {
+                session
+            } else {
+                session.copy(
+                    reasoningHeld = held,
+                    reasoningText = if (held) {
+                        session.reasoningText
+                    } else {
+                        session.reasoningText?.takeLast(ANIMATION_STREAM_TAIL_CHARS)
+                    },
+                )
+            }
+        }
+    }
+
+    /**
+     * Reloads the stored HTML without calling the model.
+     *
+     * The whole point of "重新播放" is that it is free: it only re-runs a document that is
+     * already on screen, so it must never touch the request path or the API.
+     */
+    fun replayAnimation() {
+        updateSelectedAnimationSession { session ->
+            // Nothing to replay without a document: the counter would only ask the preview
+            // to reload something that is not there.
+            if (session.html == null) session else session.copy(replayToken = session.replayToken + 1)
+        }
+    }
+
+    /** The panel reports a render failure; the preview shows it where the user is looking. */
+    fun reportAnimationRenderFailure(reason: String) {
+        updateSelectedAnimationSession {
+            it.copy(
+                phase = AnimationPhase.FAILED,
+                error = "页面渲染失败：$reason",
+                // The HTML is kept: a render failure is not a reason to throw away a
+                // document the user may still want to read as source.
+            )
+        }
+    }
+
+    /**
+     * Stores the rendered frame the detail view captured, so the list can show it.
+     *
+     * Addressed by session id rather than "the selected one": the capture is asynchronous and
+     * the user may have moved to another record (or deleted this one) before it lands. Only a
+     * settled success owns a picture — a generation in flight would otherwise attach a frame of
+     * the *previous* document to the new run.
+     */
+    fun saveAnimationSnapshot(sessionId: Long, png: ByteArray) {
+        updateAnimationSession(sessionId) { current ->
+            if (current.phase != AnimationPhase.READY) current else current.copy(snapshot = png)
+        }
+    }
+
+    /**
+     * Caps the record list, dropping the oldest entries.
+     *
+     * Each record holds its whole document ([ANIMATION_MAX_HTML_CHARS] is 2 MB), the tail of its
+     * reasoning and now a PNG of the result, and nothing ever removed one except the user's own
+     * delete — so a long session of generating animations grew the process without limit. The
+     * list is a way back to recent work, not an archive: the newest [ANIMATION_MAX_SESSIONS] are
+     * kept and the oldest fall off, which is the same shape the detection history already uses
+     * (50 entries) and the balance of "still findable" against "not unbounded".
+     *
+     * [keep] is never dropped even when it is the oldest: the user may have that record open,
+     * and evicting what is on screen would blank the panel on the next frame. When [keep] is not
+     * among the newest, it is carried alongside them, so the list can hold one more than the cap
+     * in that one case — an open record is worth one extra slot.
+     */
+    private fun trimAnimationSessions(
+        sessions: List<AnimationSession>,
+        keep: Long?,
+    ): List<AnimationSession> {
+        if (sessions.size <= ANIMATION_MAX_SESSIONS) return sessions
+        val head = sessions.take(ANIMATION_MAX_SESSIONS).toMutableList()
+        if (keep != null && head.none { it.sessionId == keep }) {
+            sessions.firstOrNull { it.sessionId == keep }?.let { kept ->
+                head[head.lastIndex] = kept
+            }
+        }
+        return head
+    }
+
+    /** Sends the selected session's draft as one animation request. */
+    fun startAnimationGeneration() {
+        val session = _uiState.value.animation.selected ?: return
+        launchAnimationGeneration(session)
+    }
+
+    /**
+     * Ticks or unticks one model for the next 开始生成.
+     *
+     * 勾选只在本供应商的目录里有效（勾选状态在换供应商时整体清掉）。单选的 [model] 跟随
+     * 勾选集合：始终是目录顺序里第一个被勾中的模型，一个都没勾时为空——界面上的
+     * 「开始生成」一律按整个勾选集合启动，所以选的顺序不影响谁先跑（目录顺序为准）。
+     */
+    fun toggleAnimationModel(model: String) {
+        _uiState.update { state ->
+            val animation = state.animation
+            if (!animation.models.contains(model)) return@update state
+            val ticked = if (animation.selectedModels.contains(model)) {
+                animation.selectedModels - model
+            } else {
+                animation.selectedModels + model
+            }
+            state.copy(
+                animation = animation.copy(
+                    selectedModels = ticked,
+                    model = animation.models.firstOrNull { ticked.contains(it) },
+                ),
+            )
+        }
+    }
+
+    /** Starts one independent generation for every checked model in catalogue order. */
+    fun startSelectedAnimationTests(supplierId: String) {
+        // Validate the supplier before touching anything: clearing the ticks and then reporting
+        // "该供应商已不存在" would make the user re-tick every model to retry. The single-test
+        // path ([startAnimationTest]) applies the same check.
+        if (resolveAnimationSupplierName(supplierId) == null) {
+            showMessage("该供应商已不存在，无法进行动画测试", isError = true)
+            return
+        }
+        val animation = _uiState.value.animation
+        val ticked = animation.models.filter { it in animation.selectedModels }
+        if (ticked.isEmpty()) {
+            showMessage("请先勾选要测试的模型", isError = true)
+            return
+        }
+        ticked.forEach { model -> startAnimationTest(supplierId, model, autoStart = true) }
+        val first = _uiState.value.animation.sessions
+            .firstOrNull { it.supplierId == supplierId && it.model == ticked.first() }
+        first?.sessionId?.let(::selectAnimationSession)
+        _uiState.update { state ->
+            state.copy(animation = state.animation.copy(selectedModels = emptyList()))
+        }
+    }
+
+    private fun launchAnimationGeneration(session: AnimationSession) {
+        if (session.phase == AnimationPhase.GENERATING) return
+        val prompt = session.draftPrompt.trim()
+        if (prompt.isEmpty()) {
+            updateAnimationSession(session.sessionId) {
+                it.copy(error = "提示词不能为空，请先填写再生成")
+            }
+            return
+        }
+        // A pasted megabyte is an accident, not a longer question: refuse it here, where the
+        // blank check already lives, rather than spending the budget and the session's memory
+        // on it (see [ANIMATION_MAX_PROMPT_CHARS]).
+        if (prompt.length > ANIMATION_MAX_PROMPT_CHARS) {
+            updateAnimationSession(session.sessionId) {
+                it.copy(
+                    error = "提示词最长 $ANIMATION_MAX_PROMPT_CHARS 个字符" +
+                        "（当前 ${prompt.length}），请删减后再生成",
+                )
+            }
+            return
+        }
+        // Animation and fingerprint detection have independent sessions and may run together.
+        val sessionId = session.sessionId
+        // 动画测试之间现在互相并行（批量、跨供应商都是用户明确要的），新会话不再取代正在
+        // 跑的旧会话；归属仍由每个会话自己的 requestId 把关，回答只写进自己的会话。
+        animationRequestSequence++
+        val requestId = animationRequestSequence
+        updateAnimationSession(sessionId) {
+            it.copy(
+                phase = AnimationPhase.GENERATING,
+                submittedPrompt = prompt,
+                requestId = requestId,
+                error = null,
+                // The previous attempt's counters go with it: leaving them would show the
+                // new run starting at the old run's character count.
+                streamingText = null,
+                receivedChars = 0,
+                reasoningText = null,
+                reasoningChars = 0,
+                startedAt = clock(),
+                settledAt = null,
+                // A fresh generation starts on the preview side so the result lands
+                // where the user is looking; the old HTML stays until it is replaced.
+                view = AnimationView.PREVIEW,
+                // This is the user's own attempt, not a retry of one: the counter restarts
+                // and any notice from the previous generation goes with it.
+                attempt = 1,
+                retryNotice = null,
+                // The old HTML deliberately stays (a regeneration that fails must leave the
+                // previous result readable), but its picture must not: the row shows the
+                // snapshot, and keeping it would attribute the old frame to the run now
+                // starting. A fresh capture replaces it once this document renders.
+                snapshot = null,
+            )
+        }
+        // 顺序不能反：Unconfined 调度下（单测）协程会在 launch 里同步跑完，若先注册
+        // invokeOnCompletion 再放进 map，回调触发时条目还没进去，remove 是空操作，完成
+        // 态的作业永远留在 map 里，awaitIdle 的 join 循环就会空转。先入册、后挂回调，
+        // 回调里再校验身份，防止误删同一会话后来的新作业。
+        val job = viewModelScope.launch {
+            generateAnimation(sessionId, requestId, session.supplierId, session.model, prompt)
+        }
+        animationJobs[sessionId] = job
+        job.invokeOnCompletion {
+            if (animationJobs[sessionId] === job) animationJobs.remove(sessionId)
+        }
+    }
+
+    /** Cancels the in-flight generation; the card says so and the record stays in the list. */
+    fun cancelAnimationGeneration() {
+        val session = _uiState.value.animation.selected ?: return
+        if (session.phase != AnimationPhase.GENERATING) return
+        // 只取消这一个会话的作业：批量测试时其他会话的请求不受影响。
+        cancelAnimationJob(session.sessionId)
+        updateAnimationSession(session.sessionId) { current ->
+            current.copy(
+                phase = if (current.html != null) AnimationPhase.READY else AnimationPhase.FAILED,
+                requestId = null,
+                // The cancelled request's partial document goes with it; a previous
+                // successful result is untouched and keeps being shown.
+                streamingText = null,
+                receivedChars = 0,
+                reasoningText = null,
+                reasoningChars = 0,
+                settledAt = clock(),
+                // The retry that was waiting when this was cancelled must not leave its notice
+                // behind: the generation is over, and "正在重试" on a cancelled record would
+                // claim a request that is no longer coming.
+                attempt = 1,
+                retryNotice = null,
+                error = if (current.html != null) {
+                    "已取消重新生成；当前显示的是上一次成功的结果"
+                } else {
+                    "已取消生成"
+                },
+            )
+        }
+    }
+
+    /**
+     * Cancels one session's job, if it still has one.
+     *
+     * 并发按会话各管各的作业后，失效也只作用于目标会话：归属校验读的是该会话自己的
+     * requestId，把会话移出列表（或把 requestId 置空）后，迟到的那半路回调自己就写不进
+     * 去了，不需要再动全局序号。
+     */
+    private fun cancelAnimationJob(sessionId: Long) {
+        animationJobs.remove(sessionId)?.cancel()
+    }
+
+    /**
+     * Refuses a supplier the user marked "禁止测试：只拉模型，不发测试请求".
+     *
+     * The flag is a promise about this app's own behaviour, not a hint: the supplier list
+     * in 模型测试 enforces it before any socket opens ([TesterViewModel] marks the run
+     * SKIPPED), and the other two paths that spend the same key have to hold the same line
+     * or the setting is only true on one of the screens. Nothing here is a *failure* of the
+     * supplier — it is the user's own policy — so the reason names the switch to clear.
+     *
+     * The caller passes the supplier it is about to use, read from the store at that moment:
+     * the switch is edited on another page, so a cached copy would miss a flag just turned on
+     * (spending a request the user forbade) and keep refusing one just turned off.
+     */
+    private fun refuseIfPullOnly(
+        supplier: com.relaytester.app.core.model.SupplierProfile,
+    ): Boolean {
+        if (!supplier.isTestingDisabled) return false
+        showMessage("该供应商已设为仅拉取模型，不发送测试请求；请先在模型测试页取消该设置", isError = true)
+        return true
+    }
+
+    private suspend fun generateAnimation(
+        sessionId: Long,
+        requestId: Long,
+        supplierId: String,
+        model: String,
+        prompt: String,
+    ) {
+        val prepared = withContext(ioDispatcher) {
+            val supplier = suppliers().firstOrNull { it.id == supplierId }
+            if (supplier == null) {
+                null
+            } else {
+                val apiKey = supplier.apiKeySecretId
+                    ?.let { secretId -> secretStore.get(secretId) }
+                    .orEmpty()
+                supplier to apiKey
+            }
+        }
+        if (prepared == null) {
+            failAnimation(sessionId, requestId, "供应商配置已不存在")
+            return
+        }
+        val (supplier, apiKey) = prepared
+        // 禁止测试：只拉模型，不发测试请求 — the same policy the round start and the 模型测试
+        // page hold. Read from the supplier just loaded, for the reason in [refuseIfPullOnly].
+        if (supplier.isTestingDisabled) {
+            failAnimation(
+                sessionId,
+                requestId,
+                "该供应商已设为仅拉取模型，不发送测试请求；请先在模型测试页取消该设置",
+            )
+            return
+        }
+        if (apiKey.isBlank()) {
+            failAnimation(sessionId, requestId, "该供应商没有可用的 API Key")
+            return
+        }
+        // Retried here rather than inside the network layer, because what may be retried
+        // depends on how far this generation got: see [startAnimationAttempt].
+        var attempt = 1
+        while (true) {
+            val outcome = startAnimationAttempt(
+                sessionId = sessionId,
+                requestId = requestId,
+                supplier = supplier,
+                apiKey = apiKey,
+                model = model,
+                prompt = prompt,
+            )
+            // Nothing that arrives after a replacement or a cancel may act on this generation
+            // — including the decision to retry, which would otherwise re-send a request the
+            // user has already abandoned.
+            if (!animationStillCurrent(sessionId, requestId)) return
+            when (outcome) {
+                is AnimationAttempt.Done -> return
+                is AnimationAttempt.Cancelled -> return
+                is AnimationAttempt.Retryable -> {
+                    if (attempt > ANIMATION_MAX_RETRIES) {
+                        failAnimation(sessionId, requestId, outcome.message)
+                        return
+                    }
+                    // The retry is announced before the wait, so the panel says what is
+                    // happening for the whole delay instead of appearing to stall.
+                    updateAnimationSession(sessionId) { current ->
+                        if (current.requestId != requestId) {
+                            current
+                        } else {
+                            current.copy(
+                                attempt = attempt + 1,
+                                retryNotice = "${outcome.message}；正在重试（第 ${attempt + 1} 次，" +
+                                    "共 ${ANIMATION_MAX_RETRIES + 1} 次）",
+                            )
+                        }
+                    }
+                    // Linear backoff, not zero: these failures are a dropped link or a busy
+                    // upstream, and an immediate re-send is what makes both worse. Injected so
+                    // a test does not have to sit through it (see [animationRetryDelay]).
+                    animationRetryDelay(ANIMATION_RETRY_DELAY_MS * attempt)
+                    if (!animationStillCurrent(sessionId, requestId)) return
+                    attempt++
+                    // Reset what the abandoned attempt left on screen. Its partial document
+                    // and its reasoning belong to a request that is no longer running, and
+                    // leaving them would make the retry look like it resumed rather than
+                    // restarted — the counter in particular would never return to zero.
+                    updateAnimationSession(sessionId) { current ->
+                        if (current.requestId != requestId) {
+                            current
+                        } else {
+                            current.copy(
+                                streamingText = null,
+                                receivedChars = 0,
+                                reasoningText = null,
+                                reasoningChars = 0,
+                                // 「正在重试」的提示到这里的使命已经结束：新的一次尝试开始了，
+                                // 提示再挂着，用户就会以为还在等（用户实测到的正是这个——
+                                // 第 2 次尝试都开始吐字了，"网络连接失败；正在重试"还钉在
+                                // 屏幕上）。次数本身不用清：attempt 记录的是"这是第几次"，
+                                // 状态行里的「第 2 次尝试」说的是事实；归零发生在这一次
+                                // 生成彻底结束时（成功、取消、失败都会写回 attempt = 1），
+                                // 下一次网络中断从第 2 次重新计起。
+                                retryNotice = null,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /** What one attempt at an animation generation decided. */
+    private sealed interface AnimationAttempt {
+        /** The attempt produced a verdict — success or a failure that retrying cannot fix. */
+        class Done : AnimationAttempt
+
+        /** The request was superseded or cancelled while it ran. Nothing may be written. */
+        class Cancelled : AnimationAttempt
+
+        /** A transient failure before any usable text arrived: worth one more try. */
+        class Retryable(val message: String) : AnimationAttempt
+    }
+
+    /**
+     * Runs one animation attempt and decides whether it is worth repeating.
+     *
+     * Only a failure that is both transient ([isTransient]) **and** arrived before any usable
+     * text is retryable:
+     *  - transient, because authentication, quota and "no such model" are properties of the
+     *    request itself — re-sending spends a second full budget to be refused identically;
+     *  - before any usable text, because the caller is billed and made to wait for each
+     *    attempt. A dropped connection in the middle of a 30 000-character document is exactly
+     *    the case worth repeating; a finished document that merely failed to parse is not, and
+     *    re-running it would discard work that had already succeeded.
+     *
+     * This is the answer to "思考一半就显示网络连接失败，没有自动重试吗": a connection lost while
+     * the model was still thinking produced no document at all, so it qualifies, and the panel
+     * now shows the retry instead of a dead end.
+     */
+    private suspend fun startAnimationAttempt(
+        sessionId: Long,
+        requestId: Long,
+        supplier: com.relaytester.app.core.model.SupplierProfile,
+        apiKey: String,
+        model: String,
+        prompt: String,
+    ): AnimationAttempt {
+        // What this attempt produced, read back after it settles. Held here rather than in the
+        // session so a retry decides on this attempt's own output, not on state the previous
+        // one left behind.
+        var answerChars = 0
+        // Measured on a real relay (2026-10-10): its gateway cuts a stream after ~121 s, so a
+        // model still thinking at that point is disconnected with reasoning on the wire and no
+        // answer text at all. The panel must name that cause instead of implying the model
+        // answered nothing — the two failures look identical in a body of zero text.
+        var reasoningChars = 0
+        val result = try {
+            relayApi.completeTextStreaming(
+                profile = supplier,
+                apiKey = apiKey,
+                model = model,
+                prompt = prompt,
+                maxTokens = ANIMATION_MAX_TOKENS,
+                timeoutSeconds = ANIMATION_TIMEOUT_SECONDS,
+                // The document is shown being written rather than behind a bare spinner:
+                // the answer is a large HTML+SVG document that takes a while, and watching
+                // it arrive says the request is alive and what it is spending tokens on.
+                onProgress = { partial ->
+                    // Recorded for this attempt's own verdict, not read back from the session:
+                    // a retry has to judge *its* output, and the session still holds the
+                    // cleared counters the retry just reset.
+                    answerChars = partial.length
+                    updateAnimationSession(sessionId) { current ->
+                        if (current.requestId != requestId) {
+                            current
+                        } else {
+                            // Tail only: the end of the document is the interesting part, and
+                            // holding the whole answer would copy the entire response into the
+                            // UI state on every delta. The network layer already bounds the text.
+                            // The full length is kept separately — that is what the header
+                            // counts, and the tail's own length would report 4 000 for a
+                            // finished 12 000-character document.
+                            current.copy(
+                                streamingText = partial.takeLast(ANIMATION_STREAM_TAIL_CHARS),
+                                receivedChars = partial.length,
+                            )
+                        }
+                    }
+                },
+                // 思考过程单独一条通道：推理模型可能在写第一个字符之前就把预算全花在思考
+                // 上，这段时间若不显示，面板就是一句「等待响应…」，与请求卡死无从区分。
+                // 它进的是 reasoningText，绝不进 html——思考不是答案。
+                //
+                // 网络层给的是**这一片**而不是累计值（理由见 completeTextStreaming：推理
+                // 可以长到 38 000 token，逐片复制累计串是二次开销），所以累计在这里做。
+                // 之前这里直接把分片当累计值写入，于是思考框永远只显示最后一个分片——屏幕
+                // 上是「吧。」「嗯，但为了」这种残句，正是用户报的那个 bug。
+                onReasoning = { fragment ->
+                    reasoningChars += fragment.length
+                    updateAnimationSession(sessionId) { current ->
+                        if (current.requestId != requestId) {
+                            current
+                        } else {
+                            // 显示只留尾部（和正文同一条规则）；计数单独累加，长度不受
+                            // 截断影响。
+                            //
+                            // 读者上滑回看时必须停止修剪。takeLast 是**滑动**窗口：读到
+                            // 某一行时新来的分片把前面的字挤掉，屏幕上的滚动位置没动，
+                            // 底下的文字却整体前移了——设备实测到的就是框停在同一个像素
+                            // 位置、内容前进了约五十行。保持窗口起点不动，追加只发生在
+                            // 末尾，正在读的那一行才停在原处。
+                            val grown = (current.reasoningText ?: "") + fragment
+                            current.copy(
+                                reasoningText = if (current.reasoningHeld) {
+                                    grown
+                                } else {
+                                    grown.takeLast(ANIMATION_STREAM_TAIL_CHARS)
+                                },
+                                reasoningChars = current.reasoningChars + fragment.length,
+                            )
+                        }
+                    }
+                },
+                // 不限制思考：动画测试要看的就是模型在无人干预时的表现，所以这里不发任何
+                // 关闭/压低推理的字段，让它自己决定花多少预算在思考上。
+                //
+                // 代价是实测过的，写在这里以免以后被当成 bug：同一提示词下
+                // deepseek-v4.1-flash 在 300 秒里写了 33 079 字思考、正文 0 字，被上游
+                // 自己的 300 秒上限掐断；MiniMax-M2.7-highspeed 思考 44 145 字、正文 0 字。
+                // 也就是说开启思考时，能不能出正文取决于模型本身，而不取决于本应用的
+                // 边界值——所以这里的做法不是"把超时调够"，而是把边界放到足够宽
+                // （ANIMATION_MAX_TOKENS / ANIMATION_TIMEOUT_SECONDS），让模型自由发挥，
+                // 面板会把思考过程实时显示出来，用户能直接看到它在做什么。
+                //
+                // 断连抢救：上游掐断连接时，已经收到的字节不再被异常吞掉——读到哪里算
+                // 哪里，按「流已结束」交还；是否构成完整文档由下面的解析规则决定，而解析
+                // 失败本身也进了重试预算（见 Success 分支）。这样「思考 4 分钟后上游断开」
+                // 的三种结局都是最有利的一种：文档已写完→直接出结果；文档写了一半→自动
+                // 重试；空手而归→照旧重试。
+                salvageOnDisconnect = true,
+            )
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            // A thrown error never carries an ApiResult, so its transience is judged from the
+            // message the same way the network layer would classify it: anything reaching here
+            // is an unexpected throw, so it is reported rather than retried.
+            failAnimation(sessionId, requestId, error.message ?: "动画生成失败")
+            return AnimationAttempt.Done()
+        }
+        // Ownership check before anything is written: a replaced session or request must not
+        // be repainted by an answer that belongs to the one before it.
+        if (!animationStillCurrent(sessionId, requestId)) return AnimationAttempt.Cancelled()
+        return when (result) {
+            is ApiResult.Success -> {
+                // fold 的两个 lambda 都返回 Unit，重试决定必须落在捕获变量里带出去——
+                // 在 onFailure 里直接 return 只会退出 lambda，解析失败就会静默变成「不再
+                // 重试」，恰好是这次要拆掉的死局。
+                var decision: AnimationAttempt = AnimationAttempt.Done()
+                val document = parseAnimationDocument(
+                    raw = result.value,
+                    // The completion path returns text only, so a stop reason is not
+                    // available here. An answer that fills the whole ceiling is the one
+                    // signal that it was cut off rather than ended by the model.
+                    truncated = result.value.length >= ANIMATION_MAX_TOKENS * TRUNCATION_CHARS_PER_TOKEN,
+                )
+                document.fold(
+                    onSuccess = { parsed ->
+                        updateAnimationSession(sessionId) { current ->
+                            if (current.requestId != requestId) {
+                                current
+                            } else {
+                                current.copy(
+                                    phase = AnimationPhase.READY,
+                                    requestId = null,
+                                    html = parsed.html,
+                                    // The finished animation replaces the generation
+                                    // view: the partial text has done its job.
+                                    streamingText = null,
+                                    receivedChars = 0,
+                                    reasoningText = null,
+                                    reasoningChars = 0,
+                                    settledAt = clock(),
+                                    // The HTML is bound to the prompt that produced it, so
+                                    // editing the draft afterwards cannot claim it.
+                                    htmlPrompt = prompt,
+                                    error = null,
+                                    view = AnimationView.PREVIEW,
+                                    replayToken = current.replayToken + 1,
+                                    attempt = 1,
+                                    retryNotice = null,
+                                )
+                            }
+                        }
+                    },
+                    onFailure = { error ->
+                        val kind = (error as? AnimationUnusable)?.kind
+                        val detail = (error as? AnimationUnusable)?.message
+                            ?: error.message
+                            ?: "返回内容无法预览"
+                        // 「已收到 N 字符」只有在中断的场合才有意义：一个完整的回答被解析
+                        // 拒绝时（例如整篇是散文），字数帮不上忙；而一份没有结束标签的
+                        // 文档配上字数，用户立刻知道是断在中途而不是模型拒绝了。
+                        val message = if (answerChars > 0 && kind == AnimationFailure.NOT_A_DOCUMENT) {
+                            "$detail（已收到 $answerChars 字符，多为上游中断）"
+                        } else {
+                            detail
+                        }
+                        if (kind == AnimationFailure.NOT_A_DOCUMENT) {
+                            // 上游在输出中途断开、或整篇没给出文档，都属于「再发一次很可能
+                            // 不一样」的失败——和空响应的瞬断一样进重试预算，而不是当场
+                            // 终局。这正是用户截图里的死局：流被掐断后已收到的半篇文档按
+                            // 「EOF 即答案」返回，解析不过，旧逻辑直接把它钉死在失败上。
+                            // TRUNCATED 除外：那是打满了 max_tokens 的系统性截断，重发
+                            // 一模一样的请求只会把同样的账单再付一遍。
+                            decision = AnimationAttempt.Retryable(message)
+                        } else {
+                            failAnimation(sessionId, requestId, message)
+                        }
+                    },
+                )
+                decision
+            }
+            is ApiResult.Failure -> {
+                val message = if (result.error.isMissingAnswerText()) {
+                    blankAnimationReason(reasoningChars)
+                } else {
+                    result.error.message.ifBlank { "动画生成失败" }
+                }
+                if (
+                    (result.error.kind.isTransient() || result.error.isMissingAnswerText()) &&
+                        answerChars == 0
+                ) {
+                    // Nothing usable arrived and the failure is one that a second identical
+                    // request can plausibly get past. Left unsettled on purpose: the retry
+                    // writes its own notice, and reporting this one as a failure would flash
+                    // an error the user is not meant to act on.
+                    AnimationAttempt.Retryable(message)
+                } else {
+                    failAnimation(sessionId, requestId, message)
+                    AnimationAttempt.Done()
+                }
+            }
+        }
+    }
+
+    /**
+     * Why an animation attempt produced no answer text.
+     *
+     * Two different failures arrive here with the same empty body, and naming the wrong one
+     * sends the user in the wrong direction ("the model refused" vs "the relay cut the
+     * stream"). Reasoning on the wire with no answer means the model was still thinking when
+     * the connection ended, which is what a relay gateway's fixed wall-clock cap looks like:
+     * measured 2026-10-10 on a real relay, its gateway drops the stream at ~121 s and the
+     * body ends mid-thinking with no `[DONE]`, no `finish_reason` and no error frame.
+     * Re-sending is the right advice there, because the second attempt may finish thinking
+     * inside the window; a body with nothing on either channel is the upstream giving
+     * nothing at all.
+     */
+    private fun blankAnimationReason(reasoningChars: Int): String =
+        if (reasoningChars > 0) {
+            "$NO_ANSWER_TEXT_MESSAGE；上游在思考阶段中断（已收到思考 $reasoningChars 字符，" +
+                "正文 0 字符），多为中转网关的时长上限，可重试"
+        } else {
+            NO_ANSWER_TEXT_MESSAGE
+        }
+
+    private fun animationStillCurrent(sessionId: Long, requestId: Long): Boolean {
+        val current = _uiState.value.animation.sessions.firstOrNull { it.sessionId == sessionId }
+            ?: return false
+        return current.requestId == requestId
+    }
+
+    /**
+     * Records a failure without discarding a preview that already worked.
+     *
+     * A regeneration that fails must leave the previous animation viewable: the user asked
+     * for a new one, not for the old one to be destroyed.
+     */
+    private fun failAnimation(sessionId: Long, requestId: Long, reason: String) {
+        updateAnimationSession(sessionId) { current ->
+            // A failure can arrive for a request that was already superseded; only the live
+            // request may write. A null requestId means the record was already settled, which
+            // is exactly the case a late failure must not reopen.
+            if (current.requestId != requestId) {
+                current
+            } else {
+                current.copy(
+                    phase = if (current.html != null) AnimationPhase.READY else AnimationPhase.FAILED,
+                    requestId = null,
+                    // A failed request's partial document is discarded, not left on
+                    // screen: half a page is not a preview, and keeping it would let a
+                    // failure look like a result that merely stopped moving.
+                    streamingText = null,
+                    receivedChars = 0,
+                    reasoningText = null,
+                    reasoningChars = 0,
+                    settledAt = clock(),
+                    // The generation is over: the retry counter and any "正在重试" notice go
+                    // with it, so the record does not claim a request still on the wire. The
+                    // reason that ended it is in [error], which is what the panel shows.
+                    attempt = 1,
+                    retryNotice = null,
+                    error = if (current.html != null) {
+                        "$reason；仍显示上一次成功的结果"
+                    } else {
+                        reason
+                    },
+                )
+            }
+        }
+    }
 
     private fun updateResult(model: String, transform: (ModelFingerprintResult) -> ModelFingerprintResult) {
         _uiState.update { state ->
@@ -1331,83 +2464,147 @@ class FingerprintViewModel(
         challenge: FingerprintChallenge,
         /** The whole round's slots, so a finished answer is cached in its own place. */
         slots: List<FingerprintChallenge>,
+        /**
+         * Round-ownership check for retry paths: false the moment the round the request
+         * belongs to has been replaced. A stale request still gets its answer back — the
+         * caller decides what to do with it — but none of this method's writes land.
+         */
+        stillCurrent: (() -> Boolean)? = null,
     ): ChallengeProgress {
-        updateProgress(index) {
-            it.copy(
-                state = ChallengeState.REQUESTING,
-                answer = "",
-                error = null,
-                receivedNumbers = 0,
-            )
-        }
-        val result = try {
-            relayApi.completeTextStreaming(
-                profile = supplier,
-                apiKey = apiKey,
-                model = model,
-                prompt = challenge.prompt,
-                maxTokens = CHALLENGE_MAX_TOKENS,
-                timeoutSeconds = CHALLENGE_TIMEOUT_SECONDS,
-            ) { partial ->
-                // Only the count is published, and only when it grew: re-counting the
-                // same text would republish identical state several times a second and
-                // recompose the whole card for nothing.
-                val numbers = NumberFeatures.parseNumbers(partial).size
-                updateProgress(index) { entry ->
-                    if (entry.state != ChallengeState.REQUESTING || numbers <= entry.receivedNumbers) {
-                        entry
+        val current = { stillCurrent?.invoke() != false }
+        var attempt = 1
+        while (true) {
+            if (current()) {
+                updateProgress(index) {
+                    it.copy(
+                        state = ChallengeState.REQUESTING,
+                        answer = "",
+                        error = null,
+                        receivedNumbers = 0,
+                        // 第一位是「第一次发送」：重发进去的是第二次，状态词才会自称重试。
+                        retrying = attempt > 1,
+                    )
+                }
+            }
+            // 这一轮尝试落在思考通道上的字数。它不参与判分，但一次空白回答是「模型只想不写」
+            // 还是「上游什么都没给」，只有它能分开（见 [blankAnswerReason]）。
+            var reasoningChars = 0
+            val result = try {
+                relayApi.completeTextStreaming(
+                    profile = supplier,
+                    apiKey = apiKey,
+                    model = model,
+                    prompt = challenge.prompt,
+                    maxTokens = CHALLENGE_MAX_TOKENS,
+                    timeoutSeconds = CHALLENGE_TIMEOUT_SECONDS,
+                    // 思考分片只数长度，不留下文本：三题检测没有地方显示它，但「只出思考、
+                    // 没有正文」的失败要说得清（见 [blankAnswerReason]）。
+                    onReasoning = { fragment -> reasoningChars += fragment.length },
+                    onProgress = { partial ->
+                        // Only the count is published, and only when it grew: re-counting the
+                        // same text would republish identical state several times a second and
+                        // recompose the whole card for nothing.
+                        val numbers = NumberFeatures.parseNumbers(partial).size
+                        if (!current()) return@completeTextStreaming
+                        updateProgress(index) { entry ->
+                            if (entry.state != ChallengeState.REQUESTING || numbers <= entry.receivedNumbers) {
+                                entry
+                            } else {
+                                entry.copy(receivedNumbers = numbers)
+                            }
+                        }
+                    },
+                )
+            } catch (error: CancellationException) {
+                // A cancelled round is not a failed answer.
+                throw error
+            } catch (error: Throwable) {
+                // One challenge's unexpected failure stays that challenge's failure. Letting
+                // it escape would cancel its parallel siblings and take the rest of the
+                // batch with it, so the user would lose three models to one bad request.
+                val rejected = ChallengeProgress(
+                    challenge = challenge,
+                    state = ChallengeState.REJECTED,
+                    error = error.message ?: "请求异常",
+                )
+                if (current()) {
+                    updateProgress(index) { rejected }
+                    cacheAnswer(model, index, slots, rejected)
+                }
+                return rejected
+            }
+            if (result is ApiResult.Failure &&
+                result.error.isMissingAnswerText() &&
+                current() &&
+                attempt < CHALLENGE_MAX_ATTEMPTS
+            ) {
+                // 空白回答不结题：它是上游自己的硬币，不是这次请求的属性，所以同一题再问一次
+                // （见 [CHALLENGE_MAX_ATTEMPTS]）。过期的一轮不再发第二次——那张卡已经没人看，
+                // 再花掉的是一次真实请求。
+                attempt++
+                continue
+            }
+            val progress = when (result) {
+                is ApiResult.Success -> {
+                    val numbers = NumberFeatures.parseNumbers(result.value).size
+                    val minimum = challengeFloor(challenge.expectedCount)
+                    if (numbers < minimum) {
+                        ChallengeProgress(
+                            challenge = challenge,
+                            state = ChallengeState.REJECTED,
+                            answer = result.value,
+                            parsedNumbers = numbers,
+                            error = "有效数字不足（$numbers/$minimum）",
+                        )
                     } else {
-                        entry.copy(receivedNumbers = numbers)
+                        ChallengeProgress(
+                            challenge = challenge,
+                            state = ChallengeState.RECEIVED,
+                            answer = result.value,
+                            parsedNumbers = numbers,
+                        )
                     }
                 }
-            }
-        } catch (error: CancellationException) {
-            // A cancelled round is not a failed answer.
-            throw error
-        } catch (error: Throwable) {
-            // One challenge's unexpected failure stays that challenge's failure. Letting
-            // it escape would cancel its parallel siblings and take the rest of the
-            // batch with it, so the user would lose three models to one bad request.
-            val rejected = ChallengeProgress(
-                challenge = challenge,
-                state = ChallengeState.REJECTED,
-                error = error.message ?: "请求异常",
-            )
-            updateProgress(index) { rejected }
-            cacheAnswer(model, index, slots, rejected)
-            return rejected
-        }
-        val progress = when (result) {
-            is ApiResult.Success -> {
-                val numbers = NumberFeatures.parseNumbers(result.value).size
-                val minimum = challengeFloor(challenge.expectedCount)
-                if (numbers < minimum) {
-                    ChallengeProgress(
-                        challenge = challenge,
-                        state = ChallengeState.REJECTED,
-                        answer = result.value,
-                        parsedNumbers = numbers,
-                        error = "有效数字不足（$numbers/$minimum）",
-                    )
-                } else {
-                    ChallengeProgress(
-                        challenge = challenge,
-                        state = ChallengeState.RECEIVED,
-                        answer = result.value,
-                        parsedNumbers = numbers,
-                    )
-                }
-            }
 
-                  is ApiResult.Failure -> ChallengeProgress(
-                challenge = challenge,
-                state = ChallengeState.REJECTED,
-                error = result.error.message,
-            )
+                is ApiResult.Failure -> ChallengeProgress(
+                    challenge = challenge,
+                    state = ChallengeState.REJECTED,
+                    // 空白的理由要看思考通道说了什么；别的失败照原样上报。
+                    error = if (result.error.isMissingAnswerText()) {
+                        blankAnswerReason(reasoningChars, attempt)
+                    } else {
+                        result.error.message
+                    },
+                )
+            }
+            // A superseded request returns its answer for the caller to discard, but writes
+            // none of it: the progress list and the cache now describe a different round.
+            if (!current()) return progress
+            updateProgress(index) { progress }
+            cacheAnswer(model, index, slots, progress)
+            return progress
         }
-        updateProgress(index) { progress }
-        cacheAnswer(model, index, slots, progress)
-        return progress
+    }
+
+    /**
+     * What to say when the asks came back with no answer text at all.
+     *
+     * 两种空长得一模一样，只有这里分得开：一种是想思考模型把整段思路写完了就停下——真实供应商
+     * 实测过「8192 的预算全部花在 reasoning_tokens、正文 0 字符、finish_reason: length」，模型把
+     * 任务做进了思考通道；另一种是流里两条通道都没有文字，那是上游什么都没给。前一种要说清是
+     * 模型自己这么做的，用户才知道「稍后重试或换模型」；后一种保持上游的原话。两种都带上自动
+     * 重发的结论，因为那确实花掉了第二次请求。
+     *
+     * [attempts] 为 1 时说明自动重发根本没跑（过期的一轮不再发，见 [requestChallenge]），
+     * 那就没有重试可报，只报失败本身。
+     */
+    private fun blankAnswerReason(reasoningChars: Int, attempts: Int): String {
+        val retried = if (attempts > 1) "（自动重试 ${attempts - 1} 次仍未取得）" else ""
+        return if (reasoningChars > 0) {
+            "模型只输出了思考内容、没有给出正文$retried"
+        } else {
+            "$NO_ANSWER_TEXT_MESSAGE$retried"
+        }
     }
 
     /** Scores the manual answers; the same validity rule applies as for API answers. */
@@ -1503,6 +2700,14 @@ class FingerprintViewModel(
     }
 
     fun cancelRun() {
+        // The retry keys are taken before the invalidation: their slots are the ones a
+        // cancelled re-ask left as REQUESTING in the cache, and the reset below has to
+        // know which ones to hand back to the retryable set.
+        val pendingRetryKeys = retryJobs.keys.toList()
+        // Retries are cancelled together with the round: 取消 means stop everything this
+        // panel is sending, and the epoch bump keeps a request that was already answered
+        // from writing into the round the user just stopped.
+        invalidateRound()
         // The handle is deliberately kept: the cancelled job may still be finishing its
         // cleanup, and until it really completes a new round must not start, or the dying
         // one could write its finale over the new one's state.
@@ -1520,7 +2725,33 @@ class FingerprintViewModel(
                 },
             )
         }
+        // A cancelled retry's REQUESTING placeholder would hide the slot from
+        // [retryableFrom] forever — REQUESTING is "someone is on it", and nobody is any
+        // more. Hand the slots back unanswered so 取消后重新检测 stays reachable.
+        if (pendingRetryKeys.isNotEmpty()) {
+            setRoundAnswers(resetRequestingSlots(roundAnswers, pendingRetryKeys))
+        }
         abandonUnfinishedRows("已取消")
+    }
+
+    /**
+     * Turns the REQUESTING placeholders left by cancelled retries back into unanswered
+     * slots, keyed by the retries' own (model, question).
+     */
+    private fun resetRequestingSlots(
+        answers: Map<String, List<ChallengeProgress>>,
+        keys: Collection<Pair<String, Int>>,
+    ): Map<String, List<ChallengeProgress>> {
+        if (keys.isEmpty()) return answers
+        val next = answers.toMutableMap()
+        for ((model, index) in keys) {
+            val slots = next[model]?.toMutableList() ?: continue
+            if (index in slots.indices && slots[index].state == ChallengeState.REQUESTING) {
+                slots[index] = ChallengeProgress(slots[index].challenge)
+            }
+            next[model] = slots
+        }
+        return next
     }
 
     /**
@@ -1884,7 +3115,7 @@ class FingerprintViewModel(
     /** Downloads the detection package a check found and makes it the one the panel scores with. */
     fun installBankUpdate() {
         val manifest = _uiState.value.availableBankUpdate ?: return
-        if (bankUpdateBusy()) return
+        if (refuseWhileBankJobBusy()) return
         // Before the field is reassigned: an entry check left running could republish the
         // offer for the very package this install is about to make current.
         standDownBackgroundCheck()
@@ -1935,7 +3166,7 @@ class FingerprintViewModel(
      * shows up on the card as a button rather than as a second snackbar.
      */
     fun removeInstalledPackage() {
-        if (bankUpdateBusy()) return
+        if (refuseWhileBankJobBusy()) return
         // Same reason as the install: the removal's own trailing check is the one whose
         // result should stand.
         standDownBackgroundCheck()
@@ -1995,6 +3226,32 @@ class FingerprintViewModel(
     }
 
     /**
+     * Refuses a bank-package action that cannot start right now, saying why.
+     *
+     * [bankUpdateBusy] is the predicate the three package actions share; this is its
+     * reporting form. It exists because the same window is reachable from the UI as
+     * "enabled": the card's own `busy` flag is `isCheckingBankUpdate || isInstallingBank ||
+     * isRunning` and does **not** include `isLoading`, so during the startup store read the
+     * 「删除检测包」/「下载检测包」 buttons are live while [bankUpdateBusy] would refuse them —
+     * a tap that quietly does nothing, which reads as a broken button.
+     */
+    private fun refuseWhileBankJobBusy(): Boolean {
+        if (!bankUpdateBusy()) return false
+        val state = _uiState.value
+        // 说清是哪一种占用：换包/检查包与「三题检测在跑」要采取的动作不同（前者等几秒，
+        // 后者要么等要么先取消）。启动读只是还没就绪，首屏自己写着「正在加载」，不再弹错。
+        if (!state.isLoading) {
+            val reason = when {
+                state.isInstallingBank -> "检测包正在更新，请稍候再试"
+                state.isCheckingBankUpdate -> "正在检查检测包更新，请稍候再试"
+                else -> "检测正在进行，请稍候再试"
+            }
+            showMessage(reason, isError = true)
+        }
+        return true
+    }
+
+    /**
      * True when the panel must not start another bank job.
      *
      * A round in flight wins: swapping the bank underneath it would leave it scoring
@@ -2014,14 +3271,36 @@ class FingerprintViewModel(
     }
 
     companion object {
-        /** Upstream prompts ask for ~300 integers; 8192 covers that with headroom. */
-        const val CHALLENGE_MAX_TOKENS = 8192
+        /** The challenge needs room for both a long reasoning trace and its numeric answer. */
+        const val CHALLENGE_MAX_TOKENS = 32_768
 
         /**
-         * Upstream allows 250 s per answer. Relays that buffer a long completion can
-         * legitimately need well over a minute, so this stays close to that ceiling.
+         * The request timeout is an idle-read watchdog, not a whole-call deadline. Relays that
+         * buffer a long completion can legitimately need well over a minute.
          */
         const val CHALLENGE_TIMEOUT_SECONDS = 240
+
+        /**
+         * How many times one challenge is sent before a blank answer is accepted as the verdict.
+         *
+         * Measured on a real supplier, not reasoned about: a thinking model sometimes spends
+         * the whole [CHALLENGE_MAX_TOKENS] budget inside its reasoning channel and stops
+         * (`finish_reason: length`, `reasoning_tokens` = the full ceiling, zero characters of
+         * answer) — one blank in four identical asks of the same question, and the same
+         * question re-sent produced a usable answer every other time. The blank is the
+         * upstream's own coin toss, so a second ask is a real chance rather than the same
+         * rejection paid for twice: at the measured rate it turns an every-fourth failure
+         * into an every-sixteenth one, and the card says a retry is running while it does.
+         *
+         * Two, not more: each ask can cost the full token budget on the model's side, so the
+         * bound has to stay small enough that a user is never paying for a loop. A question
+         * that comes back blank twice is left for the user's own 「重试」 button.
+         *
+         * No backoff between the two: the animation path's delay exists for a dropped link or
+         * a busy upstream, and this failure is neither — the model answered, it just answered
+         * nothing — so waiting would only postpone the round the other two questions share.
+         */
+        const val CHALLENGE_MAX_ATTEMPTS = 2
 
         const val ANSWER_SLOTS = 3
 

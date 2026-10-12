@@ -8,12 +8,16 @@ import com.relaytester.app.core.model.BalanceTemplateHeader
 import com.relaytester.app.core.model.RelayProtocol
 import com.relaytester.app.core.model.SupplierProfile
 import com.relaytester.app.core.model.TestSettings
+import com.relaytester.app.core.model.TestError
 import com.relaytester.app.core.network.BalanceApi
+import com.relaytester.app.core.network.NO_ANSWER_TEXT_MESSAGE
 import com.relaytester.app.core.network.RelayApi
+import com.relaytester.app.core.network.isMissingAnswerText
 import com.relaytester.app.core.network.redactSecrets
 import java.io.IOException
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -49,6 +53,29 @@ class NetworkErrorHandlingTest {
         val error = api.errorForThrowable(IOException("connection reset"))
 
         assertEquals(ErrorKind.NETWORK, error.kind)
+    }
+
+    @Test
+    fun `only the blank-answer sentence is recognised as a blank answer`() {
+        // 「上游 200 但没有正文」是对同一道题再问一次就能修的那一个失败——真实供应商实测
+        // 四次同题请求里有一次整段思考烧完 8192 的预算、正文 0 字符。指纹检测的自动重发
+        // 就挂在这次识别上，所以识别面必须恰好等于这一句：多认一句会为一类「重发也一样」
+        // 的失败白花一次请求，少认一句则回到今天这个死局。
+        assertTrue(
+            TestError(ErrorKind.INVALID_RESPONSE, NO_ANSWER_TEXT_MESSAGE).isMissingAnswerText(),
+        )
+        // 同一种错误类型，但话术说的是协议不对：重发同样的请求只会再被拒一次。
+        assertFalse(
+            TestError(ErrorKind.INVALID_RESPONSE, "上游返回 Chat 格式；请把协议切换为 Chat")
+                .isMissingAnswerText(),
+        )
+        // 别的类型即使措辞撞上也不算：分类本身是判定的一部分。
+        assertFalse(TestError(ErrorKind.TIMEOUT, NO_ANSWER_TEXT_MESSAGE).isMissingAnswerText())
+        // 带后缀的变体（例如未来给空白追加说明）不在这条契约里，宁可漏认也不能错认。
+        assertFalse(
+            TestError(ErrorKind.INVALID_RESPONSE, "$NO_ANSWER_TEXT_MESSAGE（已截断）")
+                .isMissingAnswerText(),
+        )
     }
 
     // ---- Redacting the key a site hands back ------------------------------
